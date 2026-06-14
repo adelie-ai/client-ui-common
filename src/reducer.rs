@@ -327,6 +327,18 @@ pub enum Effect {
     ReceiveChunk(String),
     /// Finalize a streaming response in the chat view.
     CompleteStreaming(String),
+    /// Run the actual send-prompt RPC for an accepted [`UiMessage::SubmitPrompt`].
+    /// The reducer has already drawn the user's bubble optimistically and gated
+    /// the send; the client's executor only performs the transport call (folding
+    /// in the staged model override it owns) and feeds the ack back as
+    /// [`UiMessage::PromptSent`] — or [`UiMessage::SendFailed`] on error.
+    /// `system_refinement` is the voice-derived per-turn system-prompt shaping
+    /// for the open conversation's `Adele:` level (`None` = no refinement).
+    SendPrompt {
+        conversation_id: String,
+        prompt: String,
+        system_refinement: Option<String>,
+    },
     /// Apply (or clear, with `None`) the model-picker selection.
     SetModelSelection(Option<api::ConversationModelSelectionView>),
     /// Replace the model-picker's available models.
@@ -435,6 +447,16 @@ impl std::fmt::Debug for Effect {
             Effect::AddUserMessage(c) => f.debug_tuple("AddUserMessage").field(c).finish(),
             Effect::ReceiveChunk(c) => f.debug_tuple("ReceiveChunk").field(c).finish(),
             Effect::CompleteStreaming(c) => f.debug_tuple("CompleteStreaming").field(c).finish(),
+            Effect::SendPrompt {
+                conversation_id,
+                prompt,
+                system_refinement,
+            } => f
+                .debug_struct("SendPrompt")
+                .field("conversation_id", conversation_id)
+                .field("prompt", prompt)
+                .field("system_refinement", system_refinement)
+                .finish(),
             Effect::SetModelSelection(s) => f.debug_tuple("SetModelSelection").field(s).finish(),
             Effect::SetModels(m) => f.debug_tuple("SetModels").field(m).finish(),
             Effect::SetDefaultModel(m) => f.debug_tuple("SetDefaultModel").field(m).finish(),
@@ -676,6 +698,74 @@ impl WindowState {
                     Effect::SetConversations(convs),
                     Effect::EnsureActiveConversation,
                 ]
+            }
+            UiMessage::SubmitPrompt { prompt } => {
+                // Single send-decision point (Phase-2): gate, draw the user's
+                // bubble optimistically, choose the per-turn refinement, and emit
+                // the RPC effect. The connection gate + the staged model override
+                // stay client-side (transport concerns the core doesn't own).
+                //
+                // Block a second send while a reply is still in flight (TUI-7):
+                // the single streaming buffer renders one turn at a time, so
+                // interleaving would cross-wire the request-id claim. The composer
+                // text is preserved client-side; surface why.
+                if self.is_streaming() {
+                    return vec![Effect::SetStatusText(
+                        "A reply is still streaming — wait for it to finish (your text is \
+                         preserved)"
+                            .to_string(),
+                    )];
+                }
+                // Nothing to send, or no open conversation to send into: ignore
+                // silently (the composer keeps its text; the action is gated
+                // upstream too, so this is a belt-and-braces no-op).
+                if prompt.is_empty() {
+                    return vec![];
+                }
+                let Some(conversation_id) = self.current_conversation_id.clone() else {
+                    return vec![];
+                };
+                // Optimistic local echo of our own send (#1): draw the user bubble
+                // now so the turn feels instant. The daemon assigns the real id
+                // when it persists the turn; the echoed-back `UserMessageAdded` is
+                // de-duped by request_id, so an empty id here is correct.
+                if let Some(conv) = self.current_conversation.as_mut() {
+                    conv.messages.push(ChatMessage {
+                        id: String::new(),
+                        role: "user".to_string(),
+                        content: prompt.clone(),
+                    });
+                }
+                // Per the conversation's `Adele:` level (#80) carry a system
+                // refinement so the reply is shaped for speech (OnDemand → brief;
+                // Always → speakable but full; Disabled → none). Decided here so
+                // the whole send decision is one tested place.
+                let system_refinement = refinement_for_send(self).map(str::to_string);
+                vec![Effect::SendPrompt {
+                    conversation_id,
+                    prompt,
+                    system_refinement,
+                }]
+            }
+            UiMessage::SendFailed {
+                conversation_id,
+                prompt,
+            } => {
+                // The send RPC failed (TUI-2): roll the optimistic user bubble
+                // back out, but only when it is still the tail of the conversation
+                // it was added to — the user may have switched conversations, or
+                // another message (e.g. an inline note) may have landed after it.
+                // The client refills its composer and surfaces the error.
+                if let Some(conv) = self.current_conversation.as_mut()
+                    && conv.id == conversation_id
+                    && conv
+                        .messages
+                        .last()
+                        .is_some_and(|m| m.role == "user" && m.content == prompt)
+                {
+                    conv.messages.pop();
+                }
+                vec![]
             }
             UiMessage::PromptSent {
                 task_id: _,
@@ -1333,6 +1423,165 @@ mod tests {
             conversation_id: "c1".to_string(),
         });
         assert_eq!(state.pending_conversation_id.as_deref(), Some("c1"));
+    }
+
+    // --- SubmitPrompt / SendFailed: the core-owned send decision ----------
+
+    #[test]
+    fn submit_prompt_draws_the_bubble_and_emits_send_prompt() {
+        let mut state = WindowState {
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+        });
+        // Optimistic user bubble drawn into the open transcript...
+        let conv = state.current_conversation.as_ref().unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].role, "user");
+        assert_eq!(conv.messages[0].content, "hello");
+        // ...and the RPC effect emitted for the client to run. Adele is Disabled
+        // by default, so no voice refinement rides along.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SendPrompt { conversation_id, prompt, system_refinement }]
+                    if conversation_id == "c1" && prompt == "hello" && system_refinement.is_none()
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn submit_prompt_carries_the_voice_refinement_when_adele_is_on() {
+        let mut state = WindowState {
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.apply(UiMessage::SetAdeleOutput {
+            conversation_id: "c1".to_string(),
+            level: AdeleOutput::OnDemand,
+        });
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "hi".to_string(),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SendPrompt { system_refinement: Some(r), .. }] if !r.is_empty()
+            ),
+            "an OnDemand conversation must carry a speech refinement: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn submit_prompt_is_blocked_while_a_reply_is_streaming() {
+        // TUI-7: a second send is refused mid-stream — no bubble, no RPC, just a
+        // status line explaining why (the client keeps the composer text).
+        let mut state = mid_stream_state("c1", "c1");
+        let before = state.current_conversation.as_ref().unwrap().messages.len();
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "second".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetStatusText(_)]),
+            "{effects:?}"
+        );
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            before,
+            "a blocked send must not append a bubble"
+        );
+    }
+
+    #[test]
+    fn submit_prompt_empty_is_a_silent_noop() {
+        let mut state = WindowState {
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: String::new(),
+        });
+        assert!(effects.is_empty());
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn send_failed_rolls_back_the_matching_optimistic_tail() {
+        let mut state = WindowState {
+            current_conversation: Some(detail("c1", vec![msg("user", "doomed")])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "doomed".to_string(),
+        });
+        assert!(effects.is_empty());
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "the optimistic user bubble must be rolled back"
+        );
+    }
+
+    #[test]
+    fn send_failed_leaves_another_conversations_tail_intact() {
+        // The user switched conversations between submit and the failure; the now
+        // open conversation's transcript must not be touched (TUI-2).
+        let mut state = WindowState {
+            current_conversation: Some(detail("c2", vec![msg("user", "different")])),
+            current_conversation_id: Some("c2".to_string()),
+            ..Default::default()
+        };
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "doomed".to_string(),
+        });
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            1,
+            "the other conversation's transcript stays intact"
+        );
+    }
+
+    #[test]
+    fn send_failed_does_not_pop_a_non_matching_tail() {
+        // Something landed after the optimistic append (e.g. an inline note): only
+        // an exact matching tail is rolled back, never an unrelated last message.
+        let mut state = WindowState {
+            current_conversation: Some(detail(
+                "c1",
+                vec![msg("user", "doomed"), msg("assistant", "(an aside)")],
+            )),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "doomed".to_string(),
+        });
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            2,
+            "a non-matching tail must not be popped"
+        );
     }
 
     // --- GTK-2: in-flight stream vs conversation switch -------------------

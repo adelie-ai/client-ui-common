@@ -126,6 +126,25 @@ pub enum UiMessage {
         /// mid-stream.
         conversation_id: String,
     },
+    /// The user asked to send `prompt` into the currently-open conversation
+    /// (Enter / dictation). The reducer is the single decision point: it gates
+    /// the send (rejects while a reply is still streaming, TUI-7), draws the
+    /// user's bubble optimistically into the open transcript, and — when
+    /// accepted — emits [`Effect::SendPrompt`] carrying the conversation, the
+    /// prompt, and the voice-derived `system_refinement` for the client's
+    /// executor to run as the actual RPC. The connection gate and the staged
+    /// model override stay client-side (transport concerns the core doesn't own).
+    SubmitPrompt {
+        prompt: String,
+    },
+    /// The send RPC for an optimistically-appended `prompt` failed: roll the
+    /// optimistic user bubble back out of `conversation_id`'s transcript (only
+    /// when it is still the tail of that conversation). The client refills its
+    /// composer with the text and surfaces the error — both view concerns.
+    SendFailed {
+        conversation_id: String,
+        prompt: String,
+    },
     /// Available (connection, model) pairs, fetched once on connect.
     /// Empty list means the picker should hide (e.g. D-Bus transport).
     ModelsLoaded(Vec<api::ModelListing>),
@@ -336,6 +355,18 @@ impl std::fmt::Debug for UiMessage {
                 .debug_struct("PromptSent")
                 .field("task_id", task_id)
                 .field("conversation_id", conversation_id)
+                .finish(),
+            UiMessage::SubmitPrompt { prompt } => f
+                .debug_struct("SubmitPrompt")
+                .field("prompt", prompt)
+                .finish(),
+            UiMessage::SendFailed {
+                conversation_id,
+                prompt,
+            } => f
+                .debug_struct("SendFailed")
+                .field("conversation_id", conversation_id)
+                .field("prompt", prompt)
                 .finish(),
             UiMessage::ModelsLoaded(v) => f.debug_tuple("ModelsLoaded").field(v).finish(),
             UiMessage::DefaultModelLoaded(v) => {
