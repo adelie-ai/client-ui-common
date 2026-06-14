@@ -66,8 +66,9 @@ pub struct WindowState {
 
 impl WindowState {
     /// Whether `You:` (voice input) is Enabled for `conversation` (issue #80).
-    /// `false` when it was never set (default Disabled).
-    fn voice_in_for(&self, conversation: &str) -> bool {
+    /// `false` when it was never set (default Disabled). Part of the shared
+    /// public API: clients render per-conversation voice state from it.
+    pub fn voice_in_for(&self, conversation: &str) -> bool {
         self.conversation_voice_in
             .get(conversation)
             .copied()
@@ -85,8 +86,9 @@ impl WindowState {
     }
 
     /// The `Adele:` (voice output) level for `conversation` (issue #80).
-    /// `Disabled` when it was never set (default).
-    fn adele_output_for(&self, conversation: &str) -> AdeleOutput {
+    /// `Disabled` when it was never set (default). Part of the shared public
+    /// API: clients render per-conversation voice state from it.
+    pub fn adele_output_for(&self, conversation: &str) -> AdeleOutput {
         self.conversation_adele_output
             .get(conversation)
             .copied()
@@ -107,8 +109,8 @@ impl WindowState {
     /// Always` OR (`Adele == OnDemand` AND `You == Enabled`). The gate the
     /// reply-narration path consults — keyed by the *originating*
     /// conversation (GTK-2); `Disabled` never narrates. Delegates to the shared
-    /// gate (desktop-assistant#274).
-    fn narrate_for(&self, conversation: &str) -> bool {
+    /// gate (desktop-assistant#274). Part of the shared public API.
+    pub fn narrate_for(&self, conversation: &str) -> bool {
         self.adele_output_for(conversation)
             .narrates_reply(self.voice_in_for(conversation))
     }
@@ -129,7 +131,8 @@ impl WindowState {
     /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`) — keyed
     /// by the *call's* conversation (GTK-4). `Disabled` downgrades the aside
     /// to inline text. Delegates to the shared gate (desktop-assistant#274).
-    fn say_this_spoken_for(&self, conversation: &str) -> bool {
+    /// Part of the shared public API.
+    pub fn say_this_spoken_for(&self, conversation: &str) -> bool {
         self.adele_output_for(conversation).speaks_aside()
     }
 
