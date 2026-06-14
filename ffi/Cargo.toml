@@ -1,0 +1,47 @@
+[package]
+name = "client-ui-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Native C-ABI core for C/C++ Adelie clients: owns the client-ui-common reducer + a client-common Connector, runs RPC effects, and pushes view-effects out as JSON over a C callback."
+
+# A C dynamic library: `libadele_client_core.so`. The header is generated to
+# `include/adele_client_core.h` by `build.rs` (cbindgen) for the C++ consumer
+# (adele-kde's CMake) to include.
+[lib]
+name = "adele_client_core"
+# `cdylib` is the C-ABI artifact adele-kde links; `rlib` lets the unit tests
+# (and any future Rust consumer) build against the crate.
+crate-type = ["cdylib", "rlib"]
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]
+# The shared view-agnostic reducer (WindowState/Effect/UiMessage) + its
+# re-exports (AdeleOutput, ContextUsageView, SelectedModel, the signal->message
+# map, the voice-mode client-tool registrations).
+client-ui-common = { path = ".." }
+
+# Protocol TYPES (api::client conversation views, SignalEvent, Command /
+# CommandResult, the model/task/scratchpad views).
+desktop-assistant-api-model = { path = "../../desktop-assistant/crates/api-model" }
+
+# The actual transport. Default features keep the `dbus` transport on — KDE's
+# canonical path is `TransportMode::Dbus` (the org.desktopAssistant bridge); UDS
+# and WS are also reachable through the same `Connector`.
+desktop-assistant-client-common = { path = "../../desktop-assistant/crates/client-common" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }
