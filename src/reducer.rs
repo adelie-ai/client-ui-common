@@ -187,6 +187,23 @@ impl WindowState {
     pub fn streaming_is_active_for_view(&self) -> bool {
         self.pending_stream_is_active()
     }
+
+    /// Drop all in-flight streaming state *without* finalizing it — the
+    /// connection-teardown path (TUI-8). Unlike the [`UiMessage::Disconnected`]
+    /// reducer arm (which appends a `[Connection lost]` stub to the originating
+    /// conversation before clearing), this simply discards the partial: the link
+    /// died, so the buffer must not linger as a frozen partial and the ack
+    /// sentinel must not mis-claim the first post-reconnect stream. Part of the
+    /// shared public API for view clients that own their connection lifecycle
+    /// outside the reducer (the TUI drives reconnect from its run loop, not from
+    /// a `Disconnected` message).
+    pub fn reset_streaming_state(&mut self) {
+        self.pending_request_id = None;
+        self.pending_conversation_id = None;
+        self.streaming_buffer.clear();
+        self.say_this_spoken_this_turn = false;
+        self.pending_turn_external = false;
+    }
 }
 
 /// The system refinement to attach on the next send, or `None` (issue #80),
@@ -1372,6 +1389,50 @@ mod tests {
         let state = mid_stream_state("c1", "c2");
         assert!(state.is_streaming());
         assert!(!state.streaming_is_active_for_view());
+    }
+
+    /// TUI-8: `reset_streaming_state` drops the in-flight stream without
+    /// finalizing it — no frozen partial, no lingering pending id, and (unlike
+    /// the `Disconnected` arm) it does NOT append a `[Connection lost]` stub to
+    /// the open conversation. It also clears the ack sentinel so the next
+    /// post-reconnect stream can't be mis-claimed.
+    #[test]
+    fn reset_streaming_state_discards_the_partial_without_finalizing() {
+        let mut state = mid_stream_state("c1", "c1");
+        let before = state.current_conversation.as_ref().unwrap().messages.len();
+
+        state.reset_streaming_state();
+
+        assert!(!state.is_streaming(), "the pending stream must be cleared");
+        assert_eq!(state.streaming_buffer(), "", "the partial must be dropped");
+        // The emptied buffer is what makes the view's render guard inert
+        // (`!buffer.is_empty() && active`): with no originating conversation
+        // recorded, `streaming_is_active_for_view()` is vacuously true, so it's
+        // the empty buffer — not the guard — that stops the partial painting.
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            before,
+            "reset must NOT append a [Connection lost] stub (that's Disconnected's job)"
+        );
+    }
+
+    /// After a reset clears the ack sentinel, a chunk for a brand-new stream
+    /// must not be claimed by the dead turn (the TUI-8 mis-claim guard).
+    #[test]
+    fn reset_streaming_state_prevents_misclaim_of_the_next_stream() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.reset_streaming_state();
+
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "post-reconnect-req".to_string(),
+            chunk: "someone else's chunk".to_string(),
+        });
+
+        assert!(
+            effects.is_empty(),
+            "a chunk with nothing pending is ignored"
+        );
+        assert_eq!(state.streaming_buffer(), "", "and nothing is buffered");
     }
 
     /// GTK-2 acceptance: `StreamComplete` after a switch finalizes the
