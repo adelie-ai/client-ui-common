@@ -1,3 +1,11 @@
+[workspace]
+# The pure reducer (this root package) + the native C-ABI core that wraps it.
+# The reducer stays transport-free and wasm-clean (built with `-p
+# client-ui-common --target wasm32`); the `ffi` member is native-only (it pulls
+# the `client-common` transport + tokio) and is what `adele-kde` links against.
+members = ["ffi"]
+resolver = "2"
+
 [package]
 name = "client-ui-common"
 version = "0.1.0"
