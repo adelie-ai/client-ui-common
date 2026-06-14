@@ -57,12 +57,30 @@ struct StreamState {
     external: bool,
 }
 
+/// One open conversation's view-model: its loaded detail today; its own
+/// streaming buffer and composer draft in later steps. Splitting the former
+/// flat `current_conversation: Option<ConversationDetail>` into a keyed
+/// `ConversationModel` is the first half of the per-conversation model the
+/// clients render — [`WindowState::open`] keys these by conversation id so a
+/// conversation's state is found by identity, not by "whichever detail happens
+/// to be cached".
+#[derive(Debug, Clone)]
+struct ConversationModel {
+    detail: ConversationDetail,
+}
+
 /// Shared mutable state for the window.
 #[derive(Default)]
 pub struct WindowState {
     pub conversations: Vec<ConversationSummary>,
     pub current_conversation_id: Option<String>,
-    pub current_conversation: Option<ConversationDetail>,
+    /// The open conversations' view-models, keyed by conversation id. For this
+    /// phase the map holds exactly the conversation named by
+    /// `current_conversation_id` (single-open behavior preserved); the keyed
+    /// shape is what lets per-conversation state grow without a flat field per
+    /// concern. Private — view clients read it through
+    /// [`current_conversation`](Self::current_conversation).
+    open: HashMap<String, ConversationModel>,
     /// In-flight streaming reply, or `None` when no turn is streaming. See
     /// [`StreamState`]: collapsing the former five `pending_*`/`streaming_buffer`
     /// fields into one optional record makes the half-set intermediate states
@@ -232,6 +250,42 @@ impl WindowState {
     /// a `Disconnected` message).
     pub fn reset_streaming_state(&mut self) {
         self.stream = None;
+    }
+
+    /// The currently-open conversation's loaded detail, or `None` when nothing
+    /// is open (or its detail hasn't loaded yet). Read-only accessor for view
+    /// clients — replaces the former public `current_conversation` field now
+    /// that the detail lives in the keyed [`open`](Self::open) map. Part of the
+    /// shared public API.
+    pub fn current_conversation(&self) -> Option<&ConversationDetail> {
+        let id = self.current_conversation_id.as_deref()?;
+        self.open.get(id).map(|c| &c.detail)
+    }
+
+    /// Mutable access to the open conversation's detail — e.g. to append an
+    /// optimistic user bubble or roll one back. `None` when nothing is open.
+    /// Part of the shared public API.
+    pub fn current_conversation_mut(&mut self) -> Option<&mut ConversationDetail> {
+        let id = self.current_conversation_id.clone()?;
+        self.open.get_mut(&id).map(|c| &mut c.detail)
+    }
+
+    /// Make `detail`'s conversation the single open one, dropping any
+    /// previously-open conversation. The single-open invariant for this phase:
+    /// `open` holds exactly the conversation named by `current_conversation_id`.
+    fn set_open_conversation(&mut self, detail: ConversationDetail) {
+        self.open.clear();
+        self.open
+            .insert(detail.id.clone(), ConversationModel { detail });
+    }
+
+    /// Seed the open conversation directly — for a client whose connect-time
+    /// load path doesn't route through `apply(ConversationLoaded)` (e.g. the
+    /// TUI's `load_conversation`). Makes `detail`'s conversation current and
+    /// caches its detail. Part of the shared public API.
+    pub fn open_conversation(&mut self, detail: ConversationDetail) {
+        self.current_conversation_id = Some(detail.id.clone());
+        self.set_open_conversation(detail);
     }
 }
 
@@ -581,10 +635,7 @@ impl WindowState {
                     // covering both the cached-detail reconnect and the
                     // not-yet-cached path before its `ConversationLoaded` lands.
                     effects.push(Effect::SubscribeConversations(vec![id.clone()]));
-                    let detail_cached = self
-                        .current_conversation
-                        .as_ref()
-                        .is_some_and(|c| c.id == id);
+                    let detail_cached = self.current_conversation().is_some_and(|c| c.id == id);
                     if detail_cached {
                         effects.push(Effect::ReloadConversation(id));
                     } else {
@@ -597,8 +648,8 @@ impl WindowState {
                 let id = detail.id.clone();
                 let filtered = filter_messages(&detail, self.debug_enabled);
                 let selection = detail.model_selection.clone();
-                self.current_conversation = Some(detail);
                 self.current_conversation_id = Some(id.clone());
+                self.set_open_conversation(detail);
                 let mut effects = vec![
                     Effect::SetModelSelection(selection),
                     Effect::LoadConversationIntoChat(filtered),
@@ -650,7 +701,7 @@ impl WindowState {
                 } else {
                     let id = detail.id.clone();
                     let filtered = filter_messages(&detail, self.debug_enabled);
-                    self.current_conversation = Some(detail);
+                    self.set_open_conversation(detail);
                     vec![
                         Effect::LoadConversationIntoChat(filtered),
                         Effect::SidePaneSetScratchpad(Vec::new()),
@@ -673,7 +724,7 @@ impl WindowState {
                 let is_active = self.current_conversation_id.as_deref() == Some(&id);
                 if is_active {
                     self.current_conversation_id = None;
-                    self.current_conversation = None;
+                    self.open.clear();
                 }
                 let convs = self.conversations.clone();
                 let mut effects = vec![Effect::SetConversations(convs)];
@@ -751,7 +802,7 @@ impl WindowState {
                 // now so the turn feels instant. The daemon assigns the real id
                 // when it persists the turn; the echoed-back `UserMessageAdded` is
                 // de-duped by request_id, so an empty id here is correct.
-                if let Some(conv) = self.current_conversation.as_mut() {
+                if let Some(conv) = self.current_conversation_mut() {
                     conv.messages.push(ChatMessage {
                         id: String::new(),
                         role: "user".to_string(),
@@ -778,7 +829,7 @@ impl WindowState {
                 // it was added to — the user may have switched conversations, or
                 // another message (e.g. an inline note) may have landed after it.
                 // The client refills its composer and surfaces the error.
-                if let Some(conv) = self.current_conversation.as_mut()
+                if let Some(conv) = self.current_conversation_mut()
                     && conv.id == conversation_id
                     && conv
                         .messages
@@ -847,7 +898,7 @@ impl WindowState {
                         say_this_spoken_this_turn: false,
                         external: true,
                     });
-                    if let Some(ref mut conv) = self.current_conversation {
+                    if let Some(conv) = self.current_conversation_mut() {
                         conv.messages.push(ChatMessage {
                             // Locally-adopted external turn: no server id yet
                             // (the event carries none). Empty is the sanctioned
@@ -975,7 +1026,7 @@ impl WindowState {
                 let narrate = !said_via_tool && !was_external && self.narrate_for(&origin);
 
                 // The streaming conversation is the one in view: finalize it.
-                if let Some(ref mut conv) = self.current_conversation {
+                if let Some(conv) = self.current_conversation_mut() {
                     conv.messages.push(ChatMessage {
                         // Locally-finalized reply: no server id in hand (empty
                         // placeholder); the next reload reconciles.
@@ -1054,7 +1105,7 @@ impl WindowState {
                             // Also clear the cached detail's selection so a
                             // later `ModelsLoaded` doesn't re-apply the stale
                             // dangling selection, contradicting this toast.
-                            if let Some(ref mut conv) = self.current_conversation {
+                            if let Some(conv) = self.current_conversation_mut() {
                                 conv.model_selection = None;
                             }
                         }
@@ -1300,7 +1351,7 @@ impl WindowState {
                     let is_active = self.is_active_conversation(&stream.conversation_id);
                     if is_active && !stream.buffer.is_empty() {
                         let full = format!("{}\n\n[Connection lost]", stream.buffer);
-                        if let Some(ref mut conv) = self.current_conversation {
+                        if let Some(conv) = self.current_conversation_mut() {
                             conv.messages.push(ChatMessage {
                                 // Local connection-lost stub: no server id
                                 // (empty placeholder).
@@ -1373,6 +1424,17 @@ mod tests {
         /// The in-flight stream is an adopted external turn.
         fn stream_external(&self) -> bool {
             self.stream.as_ref().is_some_and(|s| s.external)
+        }
+
+        /// Test builder: open `detail`'s conversation — make it current and
+        /// insert it into the open map. Mirrors the old
+        /// `current_conversation: Some(detail)` + `current_conversation_id:
+        /// Some(id)` literal pair now that detail lives behind the keyed map.
+        fn with_open(mut self, detail: ConversationDetail) -> Self {
+            self.current_conversation_id = Some(detail.id.clone());
+            self.open
+                .insert(detail.id.clone(), ConversationModel { detail });
+            self
         }
     }
 
@@ -1474,15 +1536,14 @@ mod tests {
     #[test]
     fn submit_prompt_draws_the_bubble_and_emits_send_prompt() {
         let mut state = WindowState {
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "hello".to_string(),
         });
         // Optimistic user bubble drawn into the open transcript...
-        let conv = state.current_conversation.as_ref().unwrap();
+        let conv = state.current_conversation().unwrap();
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.messages[0].role, "user");
         assert_eq!(conv.messages[0].content, "hello");
@@ -1501,10 +1562,9 @@ mod tests {
     #[test]
     fn submit_prompt_carries_the_voice_refinement_when_adele_is_on() {
         let mut state = WindowState {
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         state.apply(UiMessage::SetAdeleOutput {
             conversation_id: "c1".to_string(),
             level: AdeleOutput::OnDemand,
@@ -1526,7 +1586,7 @@ mod tests {
         // TUI-7: a second send is refused mid-stream — no bubble, no RPC, just a
         // status line explaining why (the client keeps the composer text).
         let mut state = mid_stream_state("c1", "c1");
-        let before = state.current_conversation.as_ref().unwrap().messages.len();
+        let before = state.current_conversation().unwrap().messages.len();
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "second".to_string(),
         });
@@ -1535,7 +1595,7 @@ mod tests {
             "{effects:?}"
         );
         assert_eq!(
-            state.current_conversation.as_ref().unwrap().messages.len(),
+            state.current_conversation().unwrap().messages.len(),
             before,
             "a blocked send must not append a bubble"
         );
@@ -1544,43 +1604,29 @@ mod tests {
     #[test]
     fn submit_prompt_empty_is_a_silent_noop() {
         let mut state = WindowState {
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: String::new(),
         });
         assert!(effects.is_empty());
-        assert!(
-            state
-                .current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty()
-        );
+        assert!(state.current_conversation().unwrap().messages.is_empty());
     }
 
     #[test]
     fn send_failed_rolls_back_the_matching_optimistic_tail() {
         let mut state = WindowState {
-            current_conversation: Some(detail("c1", vec![msg("user", "doomed")])),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![msg("user", "doomed")]));
         let effects = state.apply(UiMessage::SendFailed {
             conversation_id: "c1".to_string(),
             prompt: "doomed".to_string(),
         });
         assert!(effects.is_empty());
         assert!(
-            state
-                .current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
+            state.current_conversation().unwrap().messages.is_empty(),
             "the optimistic user bubble must be rolled back"
         );
     }
@@ -1590,16 +1636,15 @@ mod tests {
         // The user switched conversations between submit and the failure; the now
         // open conversation's transcript must not be touched (TUI-2).
         let mut state = WindowState {
-            current_conversation: Some(detail("c2", vec![msg("user", "different")])),
-            current_conversation_id: Some("c2".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c2", vec![msg("user", "different")]));
         state.apply(UiMessage::SendFailed {
             conversation_id: "c1".to_string(),
             prompt: "doomed".to_string(),
         });
         assert_eq!(
-            state.current_conversation.as_ref().unwrap().messages.len(),
+            state.current_conversation().unwrap().messages.len(),
             1,
             "the other conversation's transcript stays intact"
         );
@@ -1610,19 +1655,18 @@ mod tests {
         // Something landed after the optimistic append (e.g. an inline note): only
         // an exact matching tail is rolled back, never an unrelated last message.
         let mut state = WindowState {
-            current_conversation: Some(detail(
-                "c1",
-                vec![msg("user", "doomed"), msg("assistant", "(an aside)")],
-            )),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail(
+            "c1",
+            vec![msg("user", "doomed"), msg("assistant", "(an aside)")],
+        ));
         state.apply(UiMessage::SendFailed {
             conversation_id: "c1".to_string(),
             prompt: "doomed".to_string(),
         });
         assert_eq!(
-            state.current_conversation.as_ref().unwrap().messages.len(),
+            state.current_conversation().unwrap().messages.len(),
             2,
             "a non-matching tail must not be popped"
         );
@@ -1639,10 +1683,9 @@ mod tests {
                 buffer: "partial ".to_string(),
                 ..Default::default()
             }),
-            current_conversation_id: Some(current.to_string()),
-            current_conversation: Some(detail(current, vec![msg("user", "hi")])),
             ..Default::default()
         }
+        .with_open(detail(current, vec![msg("user", "hi")]))
     }
 
     /// GTK-2 acceptance: a chunk arriving after the user switched away keeps
@@ -1696,7 +1739,7 @@ mod tests {
     #[test]
     fn reset_streaming_state_discards_the_partial_without_finalizing() {
         let mut state = mid_stream_state("c1", "c1");
-        let before = state.current_conversation.as_ref().unwrap().messages.len();
+        let before = state.current_conversation().unwrap().messages.len();
 
         state.reset_streaming_state();
 
@@ -1707,7 +1750,7 @@ mod tests {
         // recorded, `streaming_is_active_for_view()` is vacuously true, so it's
         // the empty buffer — not the guard — that stops the partial painting.
         assert_eq!(
-            state.current_conversation.as_ref().unwrap().messages.len(),
+            state.current_conversation().unwrap().messages.len(),
             before,
             "reset must NOT append a [Connection lost] stub (that's Disconnected's job)"
         );
@@ -1748,7 +1791,7 @@ mod tests {
                 .any(|e| matches!(e, Effect::CompleteStreaming(_))),
             "a background completion must not finalize into the open chat: {effects:?}"
         );
-        let current = state.current_conversation.as_ref().unwrap();
+        let current = state.current_conversation().unwrap();
         assert!(
             current.messages.iter().all(|m| m.content != "the answer"),
             "the reply must not be appended to the wrong conversation"
@@ -1823,7 +1866,7 @@ mod tests {
                 .any(|e| matches!(e, Effect::CompleteStreaming(_))),
             "the truncated background stream must not render into c2: {effects:?}"
         );
-        let current = state.current_conversation.as_ref().unwrap();
+        let current = state.current_conversation().unwrap();
         assert!(
             current
                 .messages
@@ -1956,17 +1999,16 @@ mod tests {
                 buffer: "partial".to_string(),
                 ..Default::default()
             }),
-            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![msg("user", "hi")]));
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-real".to_string(),
             full_response: "the answer".to_string(),
         });
         assert!(!state.is_streaming());
         assert!(state.streaming_buffer().is_empty());
-        let conv = state.current_conversation.as_ref().unwrap();
+        let conv = state.current_conversation().unwrap();
         assert_eq!(conv.messages.last().unwrap().role, "assistant");
         assert_eq!(conv.messages.last().unwrap().content, "the answer");
         assert!(
@@ -2015,10 +2057,9 @@ mod tests {
                 buffer: "half a thought".to_string(),
                 ..Default::default()
             }),
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::Disconnected {
             reason: "socket closed".to_string(),
         });
@@ -2026,8 +2067,7 @@ mod tests {
         assert!(state.streaming_buffer().is_empty());
         // The partial response is committed to the conversation with the marker.
         let last = state
-            .current_conversation
-            .as_ref()
+            .current_conversation()
             .unwrap()
             .messages
             .last()
@@ -2078,7 +2118,6 @@ mod tests {
         let mut state = WindowState {
             current_conversation_id: Some("new".to_string()),
             // No cached detail for "new" — it was just created.
-            current_conversation: None,
             ..Default::default()
         };
         let convs = vec![summary("new", "New Conversation", false)];
@@ -2107,10 +2146,9 @@ mod tests {
     #[test]
     fn conversations_loaded_for_cached_active_reloads_not_fresh_load() {
         let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![msg("user", "hi")]));
         let convs = vec![summary("c1", "one", false)];
         let effects = state.apply(UiMessage::ConversationsLoaded(convs));
         assert!(
@@ -2163,10 +2201,9 @@ mod tests {
     fn conversation_list_changed_triggers_a_list_refetch_only() {
         let mut state = WindowState {
             conversations: vec![summary("c1", "one", false)],
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::ConversationListChanged {
             conversation_id: "c2".to_string(),
         });
@@ -2178,7 +2215,7 @@ mod tests {
         // open conversation — that waits for the refetch result.
         assert_eq!(state.conversations.len(), 1);
         assert_eq!(state.current_conversation_id.as_deref(), Some("c1"));
-        assert!(state.current_conversation.is_some());
+        assert!(state.current_conversation().is_some());
     }
 
     /// Issue #1: the refetch result repaints ONLY the sidebar (and re-syncs the
@@ -2191,10 +2228,9 @@ mod tests {
     fn conversation_list_refetched_repaints_sidebar_without_disturbing_open_chat() {
         let mut state = WindowState {
             conversations: vec![summary("c1", "one", false)],
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![msg("user", "hi")]));
         // A sibling client added "c2" and renamed "c1".
         let fresh = vec![
             summary("c1", "one renamed", false),
@@ -2231,8 +2267,7 @@ mod tests {
         assert_eq!(state.current_conversation_id.as_deref(), Some("c1"));
         assert!(
             state
-                .current_conversation
-                .as_ref()
+                .current_conversation()
                 .is_some_and(|c| c.messages.len() == 1),
             "the open conversation's cached detail must be preserved verbatim"
         );
@@ -2242,17 +2277,16 @@ mod tests {
     fn deleting_active_conversation_clears_chat_and_re_ensures_active() {
         let mut state = WindowState {
             conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::ConversationDeleted {
             id: "c1".to_string(),
         });
         assert_eq!(state.conversations.len(), 1);
         assert_eq!(state.conversations[0].id, "c2");
         assert!(state.current_conversation_id.is_none());
-        assert!(state.current_conversation.is_none());
+        assert!(state.current_conversation().is_none());
         assert!(
             matches!(
                 effects.as_slice(),
@@ -2275,10 +2309,9 @@ mod tests {
     fn deleting_conversation_prunes_its_voice_maps() {
         let mut state = WindowState {
             conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
-            current_conversation_id: Some("c2".to_string()),
-            current_conversation: Some(detail("c2", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c2", vec![]));
         // Both conversations carry voice settings.
         state.conversation_voice_in.insert("c1".to_string(), true);
         state
@@ -2384,10 +2417,9 @@ mod tests {
     fn deleting_inactive_conversation_only_refreshes_sidebar() {
         let mut state = WindowState {
             conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::ConversationDeleted {
             id: "c2".to_string(),
         });
@@ -2449,10 +2481,7 @@ mod tests {
         );
         let effects = state.apply(UiMessage::ConversationLoaded(d));
         // The cached (unfiltered) conversation keeps all 4 messages...
-        assert_eq!(
-            state.current_conversation.as_ref().unwrap().messages.len(),
-            4
-        );
+        assert_eq!(state.current_conversation().unwrap().messages.len(), 4);
         // ...but the chat view receives only user + non-empty assistant.
         match effects.as_slice() {
             [
@@ -2628,10 +2657,9 @@ mod tests {
         let mut conv = detail("c1", vec![]);
         conv.model_selection = Some(selection("work", "claude"));
         let mut state = WindowState {
-            current_conversation: Some(conv),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(conv);
         let effects = state.apply(UiMessage::ModelsLoaded(vec![listing("work", "claude")]));
         match effects.as_slice() {
             [
@@ -2671,10 +2699,9 @@ mod tests {
         // picker-preserving ReloadConversation over a fresh LoadConversation
         // (GTK-10).
         let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![msg("user", "earlier")])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![msg("user", "earlier")]));
         let effects = state.apply(UiMessage::ConversationsLoaded(vec![summary(
             "c1", "first", false,
         )]));
@@ -2753,7 +2780,7 @@ mod tests {
         d.model_selection = Some(selection("work", "claude"));
         let effects = state.apply(UiMessage::ConversationReloaded(d));
         assert!(
-            state.current_conversation.is_some(),
+            state.current_conversation().is_some(),
             "cache must be updated"
         );
         assert!(
@@ -2820,10 +2847,9 @@ mod tests {
         let mut conv = detail("c1", vec![]);
         conv.model_selection = Some(selection("old", "gone"));
         let mut state = WindowState {
-            current_conversation: Some(conv),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(conv);
         let warning = api::ConversationWarning::DanglingModelSelection {
             previous_selection: selection("old", "gone"),
             fallback_to: selection("work", "claude"),
@@ -2836,8 +2862,7 @@ mod tests {
         // re-apply the stale dangling selection, contradicting the toast.
         assert!(
             state
-                .current_conversation
-                .as_ref()
+                .current_conversation()
                 .unwrap()
                 .model_selection
                 .is_none()
@@ -2856,10 +2881,9 @@ mod tests {
         let mut conv = detail("c1", vec![]);
         conv.model_selection = Some(selection("old", "gone"));
         let mut state = WindowState {
-            current_conversation: Some(conv),
-            current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_open(conv);
         let warning = api::ConversationWarning::DanglingModelSelection {
             previous_selection: selection("old", "gone"),
             fallback_to: selection("work", "claude"),
@@ -2872,8 +2896,7 @@ mod tests {
         // selection — only surface the advisory toast.
         assert!(
             state
-                .current_conversation
-                .as_ref()
+                .current_conversation()
                 .unwrap()
                 .model_selection
                 .is_some()
@@ -2975,7 +2998,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             ..Default::default()
         });
-        state.current_conversation = Some(detail("c1", vec![]));
+        state.set_open_conversation(detail("c1", vec![]));
         state.apply(UiMessage::StreamComplete {
             request_id: "req".to_string(),
             full_response: full_response.to_string(),
@@ -3071,10 +3094,9 @@ mod tests {
     #[test]
     fn external_user_message_in_active_conversation_renders_bubble_and_adopts() {
         let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::UserMessageAdded {
             conversation_id: "c1".to_string(),
             request_id: "voice-req".to_string(),
@@ -3097,7 +3119,7 @@ mod tests {
             "an adopted turn must be flagged external so gtk does not also narrate it"
         );
         assert_eq!(
-            state.current_conversation.as_ref().unwrap().messages.len(),
+            state.current_conversation().unwrap().messages.len(),
             1,
             "the user message must be cached so a reload keeps it"
         );
@@ -3146,7 +3168,7 @@ mod tests {
     fn adopted_external_turn_streams_reply_without_gtk_narration() {
         // Adele=Always would normally narrate every reply.
         let mut state = state_with(false, AdeleOutput::Always);
-        state.current_conversation = Some(detail("c1", vec![]));
+        state.set_open_conversation(detail("c1", vec![]));
         state.apply(UiMessage::UserMessageAdded {
             conversation_id: "c1".to_string(),
             request_id: "voice-req".to_string(),
@@ -3177,10 +3199,9 @@ mod tests {
     #[test]
     fn external_turn_for_background_conversation_is_ignored() {
         let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::UserMessageAdded {
             conversation_id: "c2".to_string(),
             request_id: "bg-req".to_string(),
@@ -3203,10 +3224,9 @@ mod tests {
     #[test]
     fn external_turn_ignored_while_own_turn_in_flight() {
         let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
             ..Default::default()
-        };
+        }
+        .with_open(detail("c1", vec![]));
         state.stream = Some(StreamState {
             request_id: Some("mine".to_string()),
             conversation_id: "c1".to_string(),
@@ -3267,7 +3287,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             ..Default::default()
         });
-        state.current_conversation = Some(detail("c1", vec![]));
+        state.set_open_conversation(detail("c1", vec![]));
 
         // The model speaks an aside mid-turn.
         let aside = state.apply(say_this_call("c1", "the spoken answer"));
