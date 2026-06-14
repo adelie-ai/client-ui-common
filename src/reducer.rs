@@ -8,12 +8,9 @@
 //! without a live GTK context.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{
-    ChatMessage, Connector, ConversationDetail, ConversationSummary,
-};
+use desktop_assistant_api_model::client::{ChatMessage, ConversationDetail, ConversationSummary};
 
 use adele_voice_client_common::AdeleOutput;
 
@@ -272,9 +269,11 @@ fn say_this_text(arguments: &serde_json::Value) -> Option<String> {
 /// Effects are emitted in the exact order the legacy `handle_ui_message`
 /// performed them, so the observable behavior is identical.
 pub enum Effect {
-    /// Stash the freshly connected connector in the window's client cell.
-    SetClient(Arc<Connector>),
-    /// Clear the client cell (on disconnect).
+    /// Clear the client cell (on disconnect). There is no `SetClient`
+    /// counterpart: per this crate's design rule the reducer holds no transport
+    /// handle, so the client installs its own connector when it connects; the
+    /// reducer only signals teardown, which it drives from a `Disconnected`
+    /// signal.
     ClearClient,
     /// Set the bottom status-bar text verbatim.
     SetStatusText(String),
@@ -419,14 +418,12 @@ pub enum Effect {
     },
 }
 
-// Manual `Debug` (can't derive: `Connector` is not `Debug`, mirroring
-// `UiMessage`). Only `SetClient` needs special handling — it prints a marker
-// instead of the opaque connector; every other variant forwards its fields so
-// test panic messages stay informative.
+// Manual `Debug` (retained from when `Effect::SetClient` carried the
+// non-`Debug` `Connector`; that variant is gone, but the explicit impl keeps
+// test panic messages forwarding each variant's fields verbatim).
 impl std::fmt::Debug for Effect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Effect::SetClient(_) => f.debug_tuple("SetClient").field(&"<connector>").finish(),
             Effect::ClearClient => f.write_str("ClearClient"),
             Effect::SetStatusText(t) => f.debug_tuple("SetStatusText").field(t).finish(),
             Effect::SetSendSensitive(b) => f.debug_tuple("SetSendSensitive").field(b).finish(),
@@ -516,13 +513,6 @@ impl WindowState {
     /// effects into widget calls.
     pub fn apply(&mut self, msg: UiMessage) -> Vec<Effect> {
         match msg {
-            UiMessage::ClientReady(connector) => {
-                // The connection_manager handed us a freshly connected
-                // connector. Stash it so the rest of the UI can issue RPCs;
-                // this arrives before `ConversationsLoaded`, which relies on
-                // the client cell.
-                vec![Effect::SetClient(connector)]
-            }
             UiMessage::ConversationsLoaded(convs) => {
                 self.conversations = convs.clone();
                 let mut effects = vec![
