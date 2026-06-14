@@ -10,12 +10,14 @@
 //! Design rules that make that possible:
 //! - **No view types and no widgets.** Nothing here references ratatui, gtk4,
 //!   glib, or Qt.
-//! - **No transport handle in the model.** The reducer never holds a
+//! - **No transport handle in the model.** The reducer never holds or carries a
 //!   `Connector`/client; every daemon round-trip is an [`Effect`] the client's
-//!   runner performs and reports back as a [`UiMessage`]. (The `Arc<Connector>`
-//!   carried by a couple of variants is an inert handle the reducer never
-//!   dereferences.) That single rule keeps the UI responsive — no inline `await`
-//!   blocking a draw loop — by construction.
+//!   runner performs and reports back as a [`UiMessage`]. The client owns its
+//!   connector directly (installing it on connect); the reducer only signals
+//!   teardown via [`Effect::ClearClient`] when a `Disconnected` signal arrives.
+//!   That keeps the UI responsive — no inline `await` blocking a draw loop — by
+//!   construction, and keeps this crate free of the native transport tail so it
+//!   compiles to `wasm32-unknown-unknown` for the web client (#377).
 //!
 //! Voice types ([`AdeleOutput`] and its narration gates) are *consumed* from the
 //! voice crates, never owned here — so the daemon repo stays voice-free.

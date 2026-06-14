@@ -11,22 +11,22 @@ warnings = "deny"
 all = "deny"
 
 [dependencies]
-# Protocol TYPES consumed (voice-free) from desktop-assistant. `default-features
-# = false` drops client-common's D-Bus (zbus) transport feature — the shared core
-# needs only the wire types (SignalEvent, ConversationDetail/Summary, ChatMessage),
-# never the transport itself (RPCs are expressed as `Effect`s the client runs).
+# The shared client core consumes only wasm-clean TYPES — never a transport.
+# Wire types, the `SignalEvent` stream, and the client-facing conversation views
+# (`api::client`) all come from desktop-assistant's `api-model`, which compiles
+# to wasm32; `AdeleOutput` + its refinement gates come from
+# `adele-voice-client-common` with the native `chunker` feature off. RPCs are
+# expressed as `Effect`s the client runs, so no transport crate is needed here
+# — which is what lets this crate (and the UIs that embed it) target wasm.
 #
-# NOTE: client-consumption dependency-SOURCING (git vs path vs `[patch]`) is being
-# resolved separately so `client-common` isn't duplicated in a client's build graph
-# (which would split `SignalEvent` into two incompatible types). These path-deps
-# are for standalone build/test of THIS crate; the clients' wiring follows.
-desktop-assistant-client-common = { path = "../desktop-assistant/crates/client-common", default-features = false }
+# Blocked-by: desktop-assistant#387 (api-model wasm-clean: SignalEvent +
+# api::client) and voice#116 (optional chunker → wasm-clean AdeleOutput). Until
+# both land on their repos' main, build against those branches.
+#
+# NOTE: client-consumption dependency-SOURCING (git vs path vs `[patch]`) is
+# still being resolved so `api-model` isn't duplicated in a client's build graph.
 desktop-assistant-api-model = { path = "../desktop-assistant/crates/api-model" }
-
-# Voice-output POLICY type (`AdeleOutput`) + its narration gates — owned by the
-# voice crates, merely consumed here. This is why the crate lives OUTSIDE the
-# desktop-assistant workspace: the daemon repo stays voice-free.
-adele-voice-client-common = { path = "../voice/crates/client-voice" }
+adele-voice-client-common = { path = "../voice/crates/client-voice", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

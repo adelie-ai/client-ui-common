@@ -1,28 +1,18 @@
 //! The UI message type (`UiMessage`), the daemon-signal->message map, and the
 //! interactive-purpose default extractor — the reducer's *input* side, lifted
 //! from adele-gtk's `async_bridge.rs`. Pure: no GTK and no transport calls (the
-//! glib/tokio bridge that produces these messages stays client-side). The
-//! `Arc<Connector>` payloads are inert handles the reducer never dereferences.
-
-use std::sync::Arc;
+//! glib/tokio bridge that produces these messages stays client-side), and — per
+//! this crate's design rule — no transport handle in the model. The wire types
+//! and the signal stream come from `api-model` (wasm-clean), never from the
+//! native transport crate.
 
 use adele_voice_client_common::AdeleOutput;
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{Connector, SignalEvent};
+use desktop_assistant_api_model::SignalEvent;
 
 /// Messages sent from async tasks back to the GTK main thread.
 pub enum UiMessage {
-    /// A freshly connected [`Connector`] handed off to the GTK main thread.
-    /// `Arc<Connector>` is `Send`, so this rides the same channel as
-    /// every other UI message (replacing the former dedicated `InternalMsg`
-    /// channel). Sent by `connection_manager` immediately after `Connected`
-    /// and before `ConversationsLoaded`, so the window's client cell is
-    /// populated before any handler that needs it runs. The `Connector` owns
-    /// the transport (`connector.client()`) and the signal stream; the window
-    /// shares this same handle wherever it previously held an
-    /// `Arc<TransportClient>`.
-    ClientReady(Arc<Connector>),
-    ConversationsLoaded(Vec<desktop_assistant_client_common::ConversationSummary>),
+    ConversationsLoaded(Vec<api::client::ConversationSummary>),
     /// A *list-only* re-fetch of the conversation list, triggered by
     /// [`UiMessage::ConversationListChanged`] (a conversation was
     /// created/renamed/deleted/(un)archived elsewhere — #1). Unlike
@@ -30,14 +20,14 @@ pub enum UiMessage {
     /// (and re-syncs the selection); it deliberately does NOT reload the open
     /// conversation's chat or touch the model picker, so a sibling-client change
     /// never disturbs what the user is reading/typing.
-    ConversationListRefetched(Vec<desktop_assistant_client_common::ConversationSummary>),
-    ConversationLoaded(desktop_assistant_client_common::ConversationDetail),
+    ConversationListRefetched(Vec<api::client::ConversationSummary>),
+    ConversationLoaded(api::client::ConversationDetail),
     /// A conversation that is *already open* was re-fetched (on reconnect, or
     /// after a debug/personality refresh). The window refreshes the cached
     /// detail + chat but, unlike [`ConversationLoaded`], does NOT reset the
     /// model picker — the user's selection (sent or unsent) must survive a
     /// reconnect (issue #72).
-    ConversationReloaded(desktop_assistant_client_common::ConversationDetail),
+    ConversationReloaded(api::client::ConversationDetail),
     ConversationCreated {
         id: String,
     },
@@ -226,16 +216,12 @@ pub enum UiMessage {
     },
 }
 
-// Manual `Debug` (can't derive: `Connector` is not `Debug`). Only
-// `ClientReady` needs special handling — it prints a marker instead of the
-// opaque connector; every other variant forwards its fields as before so
-// the test panic messages stay informative.
+// Manual `Debug` (retained from when a variant carried the non-`Debug`
+// `Connector`; that handle is gone, but the explicit impl keeps test panic
+// messages forwarding each variant's fields verbatim).
 impl std::fmt::Debug for UiMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UiMessage::ClientReady(_) => {
-                f.debug_tuple("ClientReady").field(&"<connector>").finish()
-            }
             UiMessage::ConversationsLoaded(v) => {
                 f.debug_tuple("ConversationsLoaded").field(v).finish()
             }
