@@ -18,6 +18,10 @@
  */
 typedef struct Core Core;
 
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
 /*
  Create a core instance. `callback` receives view-event JSON strings;
  `user_data` is passed back to it verbatim (carry your C++ `this` here).
@@ -99,5 +103,9 @@ void adele_core_set_voice_in(Core *core, const char *conversation_id, bool enabl
  C strings.
  */
 void adele_core_set_adele_output(Core *core, const char *conversation_id, const char *level);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #endif  /* ADELE_CLIENT_CORE_H */
