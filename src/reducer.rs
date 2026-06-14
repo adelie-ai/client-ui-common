@@ -163,6 +163,30 @@ impl WindowState {
             None => true,
         }
     }
+
+    /// The accumulated text of the in-flight streaming reply, or empty when no
+    /// stream is buffering. Read-only accessor for view clients — the TUI
+    /// renders the partial reply from it; the field stays private so only
+    /// `apply` mutates it. Part of the shared public API.
+    pub fn streaming_buffer(&self) -> &str {
+        &self.streaming_buffer
+    }
+
+    /// Whether a streamed reply is currently in flight (the `request_id` slot is
+    /// occupied). A view's submit path gates on this so a second prompt can't be
+    /// sent while a turn streams. Part of the shared public API.
+    pub fn is_streaming(&self) -> bool {
+        self.pending_request_id.is_some()
+    }
+
+    /// Whether the in-flight stream (if any) belongs to the conversation
+    /// currently in view — the render guard a view consults before painting the
+    /// streaming buffer, so a backgrounded turn's chunks never bleed into a
+    /// conversation the user switched to (GTK-2). Public wrapper over the private
+    /// `pending_stream_is_active`. Part of the shared public API.
+    pub fn streaming_is_active_for_view(&self) -> bool {
+        self.pending_stream_is_active()
+    }
 }
 
 /// The system refinement to attach on the next send, or `None` (issue #80),
@@ -1326,6 +1350,28 @@ mod tests {
             state.streaming_buffer, "partial more",
             "the chunk must still accumulate for the originating conversation"
         );
+    }
+
+    /// The public streaming accessors (consumed by view clients like the TUI)
+    /// reflect the private pending-stream state across the key transitions.
+    #[test]
+    fn streaming_accessors_reflect_pending_state() {
+        // Fresh: nothing streaming, empty buffer.
+        let state = WindowState::default();
+        assert!(!state.is_streaming());
+        assert_eq!(state.streaming_buffer(), "");
+
+        // A stream pinned to c1, viewed from c1: streaming, buffered, in view.
+        let state = mid_stream_state("c1", "c1");
+        assert!(state.is_streaming());
+        assert_eq!(state.streaming_buffer(), "partial ");
+        assert!(state.streaming_is_active_for_view());
+
+        // The same stream after switching to c2: still streaming and buffering,
+        // but NOT active for the view — the render guard must hold.
+        let state = mid_stream_state("c1", "c2");
+        assert!(state.is_streaming());
+        assert!(!state.streaming_is_active_for_view());
     }
 
     /// GTK-2 acceptance: `StreamComplete` after a switch finalizes the
