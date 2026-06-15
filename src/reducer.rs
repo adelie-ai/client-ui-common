@@ -34,14 +34,12 @@ struct StreamState {
     /// `None` here is what `is_some()` on the old `pending_request_id` sentinel
     /// string expressed — there is no longer a magic `"__pending__"` value.
     request_id: Option<String>,
-    /// The conversation this stream belongs to, captured **at send time** from
-    /// `PromptSent` (GTK-2, "the stream knows its conversation"). Chunk
-    /// rendering, completion, narration, and the chat status line are keyed off
-    /// this — never off whichever conversation happens to be open when an event
-    /// arrives.
-    conversation_id: String,
-    /// The accumulated reply text. Belongs to the originating conversation and
-    /// re-seeds the view if the user switches back to it mid-stream.
+    /// The accumulated reply text. Belongs to the conversation whose model holds
+    /// this stream and re-seeds the view if the user switches back to it
+    /// mid-stream. (The owning conversation is the [`open`](WindowState::open)
+    /// map key now — Phase-2 Step-2b-ii — so the stream no longer carries a
+    /// redundant `conversation_id` of its own; "the stream knows its
+    /// conversation" via where it lives.)
     buffer: String,
     /// Set when a `say_this` aside is *spoken* for this turn; suppresses the
     /// duplicate full-reply narration at `StreamComplete` so the user doesn't
@@ -60,10 +58,12 @@ struct StreamState {
 /// One conversation's view-model — all of its per-conversation state in one
 /// place, keyed by conversation id in [`WindowState::open`] so it's found by
 /// identity. Holds the loaded transcript (`detail`, optional so a model can
-/// outlive its transcript), the `You:`/`Adele:` voice settings, and the unsent
-/// composer draft. The composer narrowing (#2) + the voice settings used to live
-/// as flat side-maps on `WindowState`; folding them here is the per-conversation
-/// consolidation (`stream` is the one piece still tracked at window level).
+/// outlive its transcript), the `You:`/`Adele:` voice settings, the unsent
+/// composer draft, and the in-flight streaming reply. The composer narrowing
+/// (#2), the voice settings, and (Phase-2 Step-2b-ii) the `stream` used to live
+/// as flat side-maps / a window-level field on `WindowState`; folding them here
+/// is the per-conversation consolidation — every conversation now owns its own
+/// stream, so several can stream concurrently in the background.
 #[derive(Debug, Clone, Default)]
 struct ConversationModel {
     /// The loaded conversation transcript + metadata, or `None` when this model
@@ -80,6 +80,13 @@ struct ConversationModel {
     /// The unsent composer draft for this conversation (the composer narrowing,
     /// #2) — empty when there is no draft.
     composer: String,
+    /// This conversation's in-flight streaming reply, or `None` when no turn is
+    /// streaming for it (Phase-2 Step-2b-ii). Folding `stream` per-conversation
+    /// (it formerly lived as a single `WindowState::stream`) lets several
+    /// conversations stream at once: a backgrounded conversation accumulates its
+    /// own partial here while the open one renders live, and switching back
+    /// re-seeds the buffered prefix. See [`StreamState`].
+    stream: Option<StreamState>,
 }
 
 /// Shared mutable state for the window.
@@ -96,12 +103,6 @@ pub struct WindowState {
     /// visited conversation. Private — view clients read it through
     /// [`current_conversation`](Self::current_conversation).
     open: HashMap<String, ConversationModel>,
-    /// In-flight streaming reply, or `None` when no turn is streaming. See
-    /// [`StreamState`]: collapsing the former five `pending_*`/`streaming_buffer`
-    /// fields into one optional record makes the half-set intermediate states
-    /// unrepresentable, and ties every stream event to its originating
-    /// conversation (GTK-2) by construction.
-    stream: Option<StreamState>,
     pub debug_enabled: bool,
 }
 
@@ -191,64 +192,90 @@ impl WindowState {
         self.current_conversation_id.as_deref() == Some(conversation)
     }
 
-    /// Whether the in-flight stream (if any) belongs to the conversation
-    /// currently open in the chat view (GTK-2). With no recorded originating
-    /// conversation (legacy/defensive) the stream is treated as active,
-    /// preserving the pre-GTK-2 behavior.
-    fn pending_stream_is_active(&self) -> bool {
-        match &self.stream {
-            Some(stream) => self.is_active_conversation(&stream.conversation_id),
-            None => true,
+    /// The in-flight stream of the *currently open* conversation, if any. The
+    /// view always renders the current conversation, so this is what the public
+    /// streaming accessors read from. A backgrounded conversation's stream lives
+    /// on its own model and is reached via [`route_stream`](Self::route_stream).
+    fn current_stream(&self) -> Option<&StreamState> {
+        let id = self.current_conversation_id.as_deref()?;
+        self.open.get(id).and_then(|m| m.stream.as_ref())
+    }
+
+    /// Route a stream event carrying `request_id` to the conversation whose model
+    /// owns that stream, returning its id (Phase-2 Step-2b-ii). Now that every
+    /// conversation owns its stream, chunk/complete/error events — which carry
+    /// only the daemon `request_id` — must find their originating conversation by
+    /// it: the claimed-id match is unambiguous; a still-`__pending__` stream
+    /// claims the first event it sees, but only when it is the *unique* pending
+    /// stream (with several pending at once an unmatched id is ambiguous, so it is
+    /// left unrouted — in practice the echoed `UserMessageAdded`, which carries
+    /// the conversation id, claims each real id before the first chunk). `None`
+    /// when no conversation's stream owns the id.
+    fn route_stream(&self, request_id: &str) -> Option<String> {
+        // 1. Unambiguous: a stream whose real id is already claimed.
+        if let Some((id, _)) = self.open.iter().find(|(_, m)| {
+            m.stream.as_ref().and_then(|s| s.request_id.as_deref()) == Some(request_id)
+        }) {
+            return Some(id.clone());
+        }
+        // 2. Otherwise the unique `__pending__` stream claims this id. More than
+        //    one pending stream makes an unmatched id ambiguous — leave it.
+        let mut pending = self
+            .open
+            .iter()
+            .filter(|(_, m)| m.stream.as_ref().is_some_and(|s| s.request_id.is_none()));
+        match (pending.next(), pending.next()) {
+            (Some((id, _)), None) => Some(id.clone()),
+            _ => None,
         }
     }
 
-    /// Whether `request_id` is the stream this state is rendering — the claimed
-    /// id, or *any* id while still in the `__pending__` window (`request_id` not
-    /// yet claimed; the first frame claims it). `false` when no stream is in
-    /// flight. Mirrors the old `pending_request_id == Some(id) ||
-    /// pending_request_id == Some("__pending__")`.
-    fn stream_matches(&self, request_id: &str) -> bool {
-        match &self.stream {
-            Some(s) => s.request_id.is_none() || s.request_id.as_deref() == Some(request_id),
-            None => false,
-        }
-    }
-
-    /// The accumulated text of the in-flight streaming reply, or empty when no
-    /// stream is buffering. Read-only accessor for view clients — the TUI
-    /// renders the partial reply from it; the field stays private so only
-    /// `apply` mutates it. Part of the shared public API.
+    /// The accumulated text of the *open* conversation's in-flight streaming
+    /// reply, or empty when it has no stream buffering. Read-only accessor for
+    /// view clients — the TUI renders the partial reply from it; the field stays
+    /// private so only `apply` mutates it. The view always renders the current
+    /// conversation, so a backgrounded conversation's partial never leaks here.
+    /// Part of the shared public API.
     pub fn streaming_buffer(&self) -> &str {
-        self.stream.as_ref().map_or("", |s| s.buffer.as_str())
+        self.current_stream().map_or("", |s| s.buffer.as_str())
     }
 
-    /// Whether a streamed reply is currently in flight (the `request_id` slot is
-    /// occupied). A view's submit path gates on this so a second prompt can't be
-    /// sent while a turn streams. Part of the shared public API.
+    /// Whether *any* conversation has a streamed reply in flight (not just the
+    /// open one) — a coarse "a turn is streaming somewhere" indicator. Part of
+    /// the shared public API; its `-> bool` shape and any-conversation semantics
+    /// are unchanged from when a single stream lived at window level, so view
+    /// clients need no change. The per-conversation send gate (TUI-7) keys off
+    /// the *target* conversation instead (see the `SubmitPrompt` arm), so a send
+    /// to a non-streaming conversation is allowed while another streams.
     pub fn is_streaming(&self) -> bool {
-        self.stream.is_some()
+        self.open.values().any(|m| m.stream.is_some())
     }
 
-    /// Whether the in-flight stream (if any) belongs to the conversation
-    /// currently in view — the render guard a view consults before painting the
-    /// streaming buffer, so a backgrounded turn's chunks never bleed into a
-    /// conversation the user switched to (GTK-2). Public wrapper over the private
-    /// `pending_stream_is_active`. Part of the shared public API.
+    /// Whether the *open* conversation has an in-flight stream — the render guard
+    /// a view consults before painting the streaming buffer, so a backgrounded
+    /// turn's chunks never bleed into the conversation the user is looking at
+    /// (GTK-2). With per-conversation streams this is simply "does the current
+    /// conversation own a stream": the buffer it would paint is that stream's, so
+    /// a background stream (on another model) is invisible to the view by
+    /// construction. Part of the shared public API.
     pub fn streaming_is_active_for_view(&self) -> bool {
-        self.pending_stream_is_active()
+        self.current_stream().is_some()
     }
 
-    /// Drop all in-flight streaming state *without* finalizing it — the
-    /// connection-teardown path (TUI-8). Unlike the [`UiMessage::Disconnected`]
-    /// reducer arm (which appends a `[Connection lost]` stub to the originating
-    /// conversation before clearing), this simply discards the partial: the link
-    /// died, so the buffer must not linger as a frozen partial and the ack
-    /// sentinel must not mis-claim the first post-reconnect stream. Part of the
-    /// shared public API for view clients that own their connection lifecycle
-    /// outside the reducer (the TUI drives reconnect from its run loop, not from
-    /// a `Disconnected` message).
+    /// Drop *every* conversation's in-flight streaming state *without* finalizing
+    /// it — the connection-teardown path (TUI-8). Unlike the
+    /// [`UiMessage::Disconnected`] reducer arm (which appends a `[Connection
+    /// lost]` stub to each originating conversation before clearing), this simply
+    /// discards the partials: the link died, so no buffer must linger as a frozen
+    /// partial and no ack sentinel must mis-claim the first post-reconnect stream.
+    /// With several conversations possibly streaming at once it walks them all.
+    /// Part of the shared public API for view clients that own their connection
+    /// lifecycle outside the reducer (the TUI drives reconnect from its run loop,
+    /// not from a `Disconnected` message).
     pub fn reset_streaming_state(&mut self) {
-        self.stream = None;
+        for model in self.open.values_mut() {
+            model.stream = None;
+        }
     }
 
     /// The currently-open conversation's loaded detail, or `None` when nothing
@@ -267,6 +294,17 @@ impl WindowState {
     pub fn current_conversation_mut(&mut self) -> Option<&mut ConversationDetail> {
         let id = self.current_conversation_id.clone()?;
         self.open.get_mut(&id).and_then(|c| c.detail.as_mut())
+    }
+
+    /// Mutable access to `conversation`'s in-flight stream, if it has one
+    /// (Phase-2 Step-2b-ii). `None` when that conversation isn't modeled or has
+    /// no stream. The reducer routes a stream event to its owning conversation
+    /// (via [`route_stream`](Self::route_stream)) and reaches its stream through
+    /// this.
+    fn stream_of_mut(&mut self, conversation: &str) -> Option<&mut StreamState> {
+        self.open
+            .get_mut(conversation)
+            .and_then(|m| m.stream.as_mut())
     }
 
     /// Switch the open conversation to `detail`'s, caching its transcript and
@@ -715,23 +753,22 @@ impl WindowState {
                     Effect::RefreshSidePaneTasks,
                     Effect::FetchScratchpad(id),
                 ];
-                // A stream may still be in flight for another (or this)
-                // conversation (GTK-2). Deliberately do NOT clear the pending
-                // stream here — it keeps buffering for its originating
-                // conversation — but reconcile the view:
-                if self.stream.is_some() {
-                    if self.pending_stream_is_active() {
-                        // Switched (back) to the streaming conversation: the
-                        // fresh load wiped the partial reply from the view, so
-                        // re-seed the buffered prefix.
-                        if !self.streaming_buffer().is_empty() {
-                            effects.push(Effect::ReceiveChunk(self.streaming_buffer().to_string()));
-                        }
-                    } else {
-                        // Switched away: the streaming turn's status line
-                        // belongs to the old conversation and must not linger.
-                        effects.push(Effect::ClearChatStatus);
+                // A stream may still be in flight for the now-open conversation
+                // and/or one we left (GTK-2). Each lives on its own model, so
+                // none is cleared here — they keep buffering for their own
+                // conversations — but reconcile the view:
+                if self.current_stream().is_some() {
+                    // Switched (back) to a streaming conversation: the fresh load
+                    // wiped its partial reply from the view, so re-seed the
+                    // buffered prefix.
+                    if !self.streaming_buffer().is_empty() {
+                        effects.push(Effect::ReceiveChunk(self.streaming_buffer().to_string()));
                     }
+                } else if self.is_streaming() {
+                    // Switched away from a streaming conversation to one that
+                    // isn't streaming: that turn's status line belongs to the
+                    // conversation we left and must not linger over this one.
+                    effects.push(Effect::ClearChatStatus);
                 }
                 effects
             }
@@ -823,11 +860,14 @@ impl WindowState {
                 // the RPC effect. The connection gate + the staged model override
                 // stay client-side (transport concerns the core doesn't own).
                 //
-                // Block a second send while a reply is still in flight (TUI-7):
-                // the single streaming buffer renders one turn at a time, so
-                // interleaving would cross-wire the request-id claim. The composer
-                // text is preserved client-side; surface why.
-                if self.is_streaming() {
+                // Block a second send while a reply is still in flight *for the
+                // conversation we're sending into* (TUI-7). Each conversation owns
+                // its own stream now (Phase-2 Step-2b-ii), so a send to a
+                // different, idle conversation is allowed while another streams —
+                // interleaving only cross-wires the request-id claim *within* one
+                // conversation's single stream slot. The composer text is
+                // preserved client-side; surface why.
+                if self.current_stream().is_some() {
                     return vec![Effect::SetStatusText(
                         "A reply is still streaming — wait for it to finish (your text is \
                          preserved)"
@@ -905,13 +945,16 @@ impl WindowState {
                 // against this id, not against whatever conversation is open when
                 // it arrives. This client initiated the turn, so it owns reply
                 // narration (`external: false`) and no aside has been spoken yet.
-                self.stream = Some(StreamState {
+                // The stream lives on its OWN conversation's model now (Phase-2
+                // Step-2b-ii), so it keeps streaming independently if the user
+                // switches away — and another conversation may stream alongside.
+                let stream = StreamState {
                     request_id: None,
-                    conversation_id,
                     buffer: String::new(),
                     say_this_spoken_this_turn: false,
                     external: false,
-                });
+                };
+                self.open.entry(conversation_id).or_default().stream = Some(stream);
                 vec![]
             }
             UiMessage::UserMessageAdded {
@@ -920,35 +963,36 @@ impl WindowState {
                 content,
             } => {
                 // Case 1 — this client's own send, echoed back (#1). We drew the
-                // user bubble optimistically at send time and set "__pending__";
-                // claim the real request_id now (it precedes the first chunk) and
-                // render nothing more. This also resolves the stream's request_id
-                // earlier and more reliably than the claim-on-first-chunk fallback.
-                if let Some(stream) = &mut self.stream
+                // user bubble optimistically at send time and set "__pending__"
+                // on this conversation's own stream (Phase-2 Step-2b-ii); claim
+                // the real request_id now (it precedes the first chunk) and render
+                // nothing more. This also resolves the stream's request_id earlier
+                // and more reliably than the claim-on-first-chunk fallback.
+                if let Some(stream) = self.stream_of_mut(&conversation_id)
                     && stream.request_id.is_none()
-                    && stream.conversation_id == conversation_id
                 {
                     stream.request_id = Some(request_id);
                     return vec![];
                 }
                 // Case 2 — a turn this client did NOT initiate (a voice turn, or
                 // another client on the same account) for the conversation in
-                // view, with no gtk turn already occupying the single in-flight
-                // slot. Adopt it into the pending slot so the existing
-                // chunk/completion path streams the reply live, and draw the
-                // user's bubble now. Marked external so its reply is NOT narrated
-                // here — the originator (e.g. the voice daemon) already speaks it.
-                // A turn for a background conversation, or one arriving while our
-                // own turn is in flight, is left to the reload-on-switch path (the
-                // daemon persists it).
-                if self.stream.is_none() && self.is_active_conversation(&conversation_id) {
-                    self.stream = Some(StreamState {
+                // view, with no turn already occupying *that conversation's*
+                // in-flight slot. Adopt it onto the conversation's stream so the
+                // existing chunk/completion path streams the reply live, and draw
+                // the user's bubble now. Marked external so its reply is NOT
+                // narrated here — the originator (e.g. the voice daemon) already
+                // speaks it. A turn for a background conversation, or one arriving
+                // while that conversation's own turn is in flight, is left to the
+                // reload-on-switch path (the daemon persists it).
+                if self.current_stream().is_none() && self.is_active_conversation(&conversation_id)
+                {
+                    let stream = StreamState {
                         request_id: Some(request_id),
-                        conversation_id,
                         buffer: String::new(),
                         say_this_spoken_this_turn: false,
                         external: true,
-                    });
+                    };
+                    self.open.entry(conversation_id).or_default().stream = Some(stream);
                     if let Some(conv) = self.current_conversation_mut() {
                         conv.messages.push(ChatMessage {
                             // Locally-adopted external turn: no server id yet
@@ -968,11 +1012,17 @@ impl WindowState {
                 request_id,
                 message,
             } => {
-                // Show only for the in-flight stream AND only while its
-                // originating conversation is the one in view (GTK-2): a
-                // background turn's status must not paint over another
-                // conversation's chat.
-                if self.stream_matches(&request_id) && self.pending_stream_is_active() {
+                // Route the status to its owning conversation and show it only
+                // when that conversation is the one in view (GTK-2). With several
+                // streams in flight (Phase-2 Step-2b-ii) routing keeps a
+                // backgrounded turn's status off the open chat even when the open
+                // conversation has its OWN `__pending__` stream: a claimed-id
+                // match wins over the pending fallback, so the background status
+                // routes to its own (background) conversation, not the viewed one.
+                if self.route_stream(&request_id).as_deref()
+                    == self.current_conversation_id.as_deref()
+                    && self.current_stream().is_some()
+                {
                     vec![Effect::SetChatStatus(message)]
                 } else {
                     vec![]
@@ -1000,24 +1050,29 @@ impl WindowState {
                 }
             }
             UiMessage::StreamChunk { request_id, chunk } => {
-                let Some(stream) = &mut self.stream else {
+                // Route the chunk to the conversation whose stream owns this id
+                // (Phase-2 Step-2b-ii): the claimed-id match, or the unique
+                // `__pending__` stream that claims it now. No owner → stray chunk,
+                // ignored.
+                let Some(origin) = self.route_stream(&request_id) else {
+                    return vec![];
+                };
+                let Some(stream) = self.stream_of_mut(&origin) else {
                     return vec![];
                 };
                 // Claim the real id on the first frame of a `__pending__` stream.
                 if stream.request_id.is_none() {
                     stream.request_id = Some(request_id.clone());
                 }
-                if stream.request_id.as_deref() != Some(&request_id) {
-                    return vec![];
-                }
                 let first_chunk = stream.buffer.is_empty();
-                // Always accumulate — the buffer belongs to the stream's
-                // originating conversation (GTK-2) and is what re-seeds the view
-                // if the user switches back mid-stream...
+                // Always accumulate — the buffer belongs to its own conversation
+                // (GTK-2) and is what re-seeds the view if the user switches back
+                // mid-stream...
                 stream.buffer.push_str(&chunk);
-                let origin = stream.conversation_id.clone();
                 // ...but only render into the chat when that conversation is the
-                // one in view.
+                // one in view. A backgrounded conversation's chunk accumulates on
+                // its model and emits no render Effect (so it can stream
+                // concurrently without disturbing the open conversation).
                 if !self.is_active_conversation(&origin) {
                     return vec![];
                 }
@@ -1032,24 +1087,20 @@ impl WindowState {
                 request_id,
                 full_response,
             } => {
-                let Some(stream) = &mut self.stream else {
+                // Route the completion to the conversation whose stream owns this
+                // id (Phase-2 Step-2b-ii). No owner → unrelated completion,
+                // ignored. Take ONLY this conversation's stream — any other
+                // conversation still streaming is left untouched.
+                let Some(origin) = self.route_stream(&request_id) else {
                     return vec![];
                 };
-                if stream.request_id.is_none() {
-                    stream.request_id = Some(request_id.clone());
-                }
-                if stream.request_id.as_deref() != Some(&request_id) {
+                let Some(stream) = self.open.get_mut(&origin).and_then(|m| m.stream.take()) else {
                     return vec![];
-                }
-                // The stream belongs to its originating conversation (GTK-2),
-                // recorded at send time — judge everything below against it, not
-                // against whichever conversation is open right now.
-                let origin = stream.conversation_id.clone();
+                };
                 let said_via_tool = stream.say_this_spoken_this_turn;
                 // An adopted external turn (a voice turn, or another client) is
                 // narrated by its originator — gtk must not also speak it.
                 let was_external = stream.external;
-                self.stream = None;
                 let is_active = self.is_active_conversation(&origin);
 
                 if !is_active {
@@ -1101,17 +1152,21 @@ impl WindowState {
                 effects
             }
             UiMessage::StreamError { request_id, error } => {
-                let Some(stream) = &mut self.stream else {
+                // Route the error to the conversation whose stream owns this id
+                // (Phase-2 Step-2b-ii). No owner → unrelated error, ignored. Clear
+                // ONLY this conversation's stream — any other still streaming is
+                // left untouched.
+                let Some(origin) = self.route_stream(&request_id) else {
                     return vec![];
                 };
-                if stream.request_id.is_none() {
-                    stream.request_id = Some(request_id.clone());
-                }
-                if stream.request_id.as_deref() != Some(&request_id) {
+                if self
+                    .open
+                    .get_mut(&origin)
+                    .and_then(|m| m.stream.take())
+                    .is_none()
+                {
                     return vec![];
                 }
-                let origin = stream.conversation_id.clone();
-                self.stream = None;
                 let is_active = self.is_active_conversation(&origin);
                 // Only clear the chat status line if the failed stream's
                 // conversation is the one in view (GTK-2); a background turn's
@@ -1290,13 +1345,12 @@ impl WindowState {
                         // A backgrounded call's aside is never voiced — it
                         // downgrades to an inline note so it isn't lost.
                         Some(text) if is_active && self.say_this_spoken_for(&conversation_id) => {
-                            // If this spoken aside belongs to the in-flight turn,
-                            // mark it so StreamComplete doesn't ALSO read the full
-                            // reply aloud — the model already chose its spoken form
-                            // (avoids the double-speak: aside, then whole reply).
-                            if let Some(stream) = &mut self.stream
-                                && stream.conversation_id == conversation_id
-                            {
+                            // If this spoken aside belongs to the call's in-flight
+                            // turn, mark *that conversation's* stream so its
+                            // StreamComplete doesn't ALSO read the full reply aloud
+                            // — the model already chose its spoken form (avoids the
+                            // double-speak: aside, then whole reply).
+                            if let Some(stream) = self.stream_of_mut(&conversation_id) {
                                 stream.say_this_spoken_this_turn = true;
                             }
                             vec![
@@ -1396,26 +1450,36 @@ impl WindowState {
                 ];
 
                 // Finalize any in-progress streaming buffer — but only into the
-                // conversation it actually belongs to (GTK-2). If the streaming
-                // conversation was backgrounded when the link dropped, the
-                // truncated "[Connection lost]" buffer must NOT be appended to
-                // whatever conversation happens to be open; it's simply dropped
-                // (the partial reply was never persisted daemon-side anyway).
-                if let Some(stream) = self.stream.take() {
-                    let is_active = self.is_active_conversation(&stream.conversation_id);
-                    if is_active && !stream.buffer.is_empty() {
-                        let full = format!("{}\n\n[Connection lost]", stream.buffer);
-                        if let Some(conv) = self.current_conversation_mut() {
-                            conv.messages.push(ChatMessage {
-                                // Local connection-lost stub: no server id
-                                // (empty placeholder).
-                                id: String::new(),
-                                role: "assistant".to_string(),
-                                content: full.clone(),
-                            });
-                        }
-                        effects.push(Effect::CompleteStreaming(full));
+                // conversation it actually belongs to (GTK-2). Every conversation
+                // owns its own stream now (Phase-2 Step-2b-ii), so several may be
+                // in flight: drop them ALL (none may linger as a frozen partial or
+                // later mis-claim a post-reconnect id), and append the truncated
+                // "[Connection lost]" stub only to the *open* conversation's
+                // stream — a backgrounded stream's partial was never persisted
+                // daemon-side, so it is simply discarded.
+                let active_stream = self
+                    .current_conversation_id
+                    .clone()
+                    .and_then(|id| self.open.get_mut(&id))
+                    .and_then(|m| m.stream.take());
+                // Clear every remaining (backgrounded) stream without finalizing.
+                for model in self.open.values_mut() {
+                    model.stream = None;
+                }
+                if let Some(stream) = active_stream
+                    && !stream.buffer.is_empty()
+                {
+                    let full = format!("{}\n\n[Connection lost]", stream.buffer);
+                    if let Some(conv) = self.current_conversation_mut() {
+                        conv.messages.push(ChatMessage {
+                            // Local connection-lost stub: no server id
+                            // (empty placeholder).
+                            id: String::new(),
+                            role: "assistant".to_string(),
+                            content: full.clone(),
+                        });
                     }
+                    effects.push(Effect::CompleteStreaming(full));
                 }
                 effects
             }
@@ -1457,27 +1521,63 @@ mod tests {
     use super::*;
 
     /// Test-only accessors mirroring the former free-standing `pending_*` /
-    /// `streaming_buffer` fields, now that they live behind [`StreamState`]. A
+    /// `streaming_buffer` fields, now that the stream lives per-conversation on
+    /// each [`ConversationModel`] (Phase-2 Step-2b-ii). The single-stream tests
+    /// assert against *the* in-flight stream regardless of which conversation
+    /// holds it, so these find the unique one (and panic if a test accidentally
+    /// leaves two in flight — the concurrent-stream tests use the
+    /// conversation-scoped [`stream_of`](Self::stream_of) accessor instead). A
     /// `__pending__` stream — request reserved but the daemon id not yet claimed
     /// — reads as `stream_request_id() == None` + `stream_unclaimed() == true`.
     impl WindowState {
-        /// The claimed daemon request id, or `None` (no stream, or still in the
-        /// `__pending__` window).
+        /// The unique in-flight stream across all open conversations, or `None`.
+        /// Panics if more than one conversation is streaming (a single-stream
+        /// test invariant; concurrent tests use [`stream_of`](Self::stream_of)).
+        fn any_stream(&self) -> Option<&StreamState> {
+            let mut it = self.open.values().filter_map(|m| m.stream.as_ref());
+            let first = it.next();
+            assert!(
+                it.next().is_none(),
+                "any_stream() expects at most one in-flight stream; use stream_of() for concurrent"
+            );
+            first
+        }
+        /// The stream on `conversation`'s model, if any — the conversation-scoped
+        /// accessor the concurrent-stream tests use.
+        fn stream_of(&self, conversation: &str) -> Option<&StreamState> {
+            self.open.get(conversation).and_then(|m| m.stream.as_ref())
+        }
+        /// The claimed daemon request id of the unique in-flight stream, or `None`
+        /// (no stream, or still in the `__pending__` window).
         fn stream_request_id(&self) -> Option<&str> {
-            self.stream.as_ref().and_then(|s| s.request_id.as_deref())
+            self.any_stream().and_then(|s| s.request_id.as_deref())
         }
-        /// The originating conversation of the in-flight stream, if any.
+        /// The originating conversation of the unique in-flight stream, if any —
+        /// the `open` map key of the model that holds it (the owning conversation
+        /// is now identified by where the stream lives, not a field on it).
+        /// Panics if more than one conversation is streaming (single-stream test
+        /// invariant), mirroring [`any_stream`](Self::any_stream).
         fn stream_conversation_id(&self) -> Option<&str> {
-            self.stream.as_ref().map(|s| s.conversation_id.as_str())
+            let mut it = self
+                .open
+                .iter()
+                .filter(|(_, m)| m.stream.is_some())
+                .map(|(id, _)| id.as_str());
+            let first = it.next();
+            assert!(
+                it.next().is_none(),
+                "stream_conversation_id() expects one stream"
+            );
+            first
         }
-        /// A stream is in flight but its real id is not yet claimed (the old
-        /// `pending_request_id == Some("__pending__")`).
+        /// A (unique) stream is in flight but its real id is not yet claimed (the
+        /// old `pending_request_id == Some("__pending__")`).
         fn stream_unclaimed(&self) -> bool {
-            self.stream.as_ref().is_some_and(|s| s.request_id.is_none())
+            self.any_stream().is_some_and(|s| s.request_id.is_none())
         }
-        /// The in-flight stream is an adopted external turn.
+        /// The unique in-flight stream is an adopted external turn.
         fn stream_external(&self) -> bool {
-            self.stream.as_ref().is_some_and(|s| s.external)
+            self.any_stream().is_some_and(|s| s.external)
         }
 
         /// Test builder: open `detail`'s conversation — make it current and
@@ -1485,14 +1585,20 @@ mod tests {
         /// `current_conversation: Some(detail)` + `current_conversation_id:
         /// Some(id)` literal pair now that detail lives behind the keyed map.
         fn with_open(mut self, detail: ConversationDetail) -> Self {
-            self.current_conversation_id = Some(detail.id.clone());
-            self.open.insert(
-                detail.id.clone(),
-                ConversationModel {
-                    detail: Some(detail),
-                    ..Default::default()
-                },
-            );
+            let id = detail.id.clone();
+            self.current_conversation_id = Some(id.clone());
+            self.open.entry(id).or_default().detail = Some(detail);
+            self
+        }
+
+        /// Test builder: pin `stream` onto `conversation`'s model (creating the
+        /// model if absent). Replaces the old `WindowState { stream: Some(..),
+        /// .. }` struct literal now that the stream lives per-conversation.
+        fn with_stream(mut self, conversation: &str, stream: StreamState) -> Self {
+            self.open
+                .entry(conversation.to_string())
+                .or_default()
+                .stream = Some(stream);
             self
         }
     }
@@ -1551,15 +1657,19 @@ mod tests {
 
     #[test]
     fn prompt_sent_sets_pending_sentinel_and_clears_buffer() {
+        // A prior stream left a partial buffer on c1; PromptSent for c1 must
+        // start the new turn from a clean slate (a fresh __pending__ stream).
         let mut state = WindowState {
-            // A prior stream left a partial buffer; PromptSent must start the new
-            // turn from a clean slate.
-            stream: Some(StreamState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        }
+        .with_stream(
+            "c1",
+            StreamState {
                 buffer: "leftover".to_string(),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
+            },
+        );
         let effects = state.apply(UiMessage::PromptSent {
             task_id: "ack-1".to_string(),
             conversation_id: "c1".to_string(),
@@ -1811,18 +1921,20 @@ mod tests {
 
     // --- GTK-2: in-flight stream vs conversation switch -------------------
 
-    /// Pin a pending stream originating in `from`, viewed from `current`.
+    /// Pin a (claimed) in-flight stream onto conversation `from`'s model, viewed
+    /// from `current`. When `from != current` both models exist in `open`: `from`
+    /// holds the backgrounded stream, `current` is the open transcript.
     fn mid_stream_state(from: &str, current: &str) -> WindowState {
-        WindowState {
-            stream: Some(StreamState {
-                request_id: Some("req-real".to_string()),
-                conversation_id: from.to_string(),
-                buffer: "partial ".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .with_open(detail(current, vec![msg("user", "hi")]))
+        WindowState::default()
+            .with_stream(
+                from,
+                StreamState {
+                    request_id: Some("req-real".to_string()),
+                    buffer: "partial ".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_open(detail(current, vec![msg("user", "hi")]))
     }
 
     /// GTK-2 acceptance: a chunk arriving after the user switched away keeps
@@ -1839,10 +1951,18 @@ mod tests {
             !effects.iter().any(|e| matches!(e, Effect::ReceiveChunk(_))),
             "a background stream's chunk must not render into the open conversation: {effects:?}"
         );
+        // The chunk accumulates into the ORIGINATING conversation's own stream
+        // (c1), not the open one — `streaming_buffer()` reads the open (c2)
+        // conversation, which isn't streaming, so it stays empty.
         assert_eq!(
-            state.streaming_buffer(),
+            state.stream_of("c1").unwrap().buffer,
             "partial more",
             "the chunk must still accumulate for the originating conversation"
+        );
+        assert_eq!(
+            state.streaming_buffer(),
+            "",
+            "the open conversation (c2) isn't streaming, so the view buffer stays empty"
         );
     }
 
@@ -2031,17 +2151,383 @@ mod tests {
         );
     }
 
+    // --- Concurrent per-conversation streams (Phase-2 Step-2b-ii) --------
+
+    /// Two conversations streaming at once: `c1` is backgrounded (its claimed
+    /// stream has a buffered prefix), `c2` is the open conversation and also
+    /// streaming. The capability the per-conversation fold unlocks.
+    fn two_streams_state() -> WindowState {
+        WindowState::default()
+            .with_stream(
+                "c1",
+                StreamState {
+                    request_id: Some("req-c1".to_string()),
+                    buffer: "c1 partial ".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_stream(
+                "c2",
+                StreamState {
+                    request_id: Some("req-c2".to_string()),
+                    buffer: "c2 partial ".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_open(detail("c2", vec![msg("user", "hi from c2")]))
+    }
+
+    /// A chunk for the BACKGROUNDED conversation accumulates into its own model
+    /// and emits no render Effect into the open conversation — the core enabler
+    /// of background streaming.
+    #[test]
+    fn concurrent_chunk_for_background_conversation_accumulates_silently() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-c1".to_string(),
+            chunk: "more c1".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "a backgrounded conversation's chunk must emit no view Effect: {effects:?}"
+        );
+        assert_eq!(
+            state.stream_of("c1").unwrap().buffer,
+            "c1 partial more c1",
+            "the chunk must accumulate into c1's own stream"
+        );
+        // The open conversation's stream is untouched, and what the view reads
+        // back is still c2's partial.
+        assert_eq!(state.stream_of("c2").unwrap().buffer, "c2 partial ");
+        assert_eq!(state.streaming_buffer(), "c2 partial ");
+    }
+
+    /// A chunk for the OPEN conversation renders live while the other streams in
+    /// the background — the two never cross-wire.
+    #[test]
+    fn concurrent_chunk_for_open_conversation_renders_and_does_not_touch_other() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-c2".to_string(),
+            chunk: "more c2".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::ReceiveChunk(c)] if c == "more c2"),
+            "the open conversation's chunk renders live (non-first, no status clear): {effects:?}"
+        );
+        assert_eq!(state.stream_of("c2").unwrap().buffer, "c2 partial more c2");
+        assert_eq!(
+            state.stream_of("c1").unwrap().buffer,
+            "c1 partial ",
+            "the backgrounded conversation's stream must be undisturbed"
+        );
+    }
+
+    /// Switching TO a backgrounded streaming conversation re-seeds ITS partial
+    /// (not the one we left) — its buffered prefix returns to the view.
+    #[test]
+    fn switching_to_other_streaming_conversation_reseeds_its_own_partial() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::ConversationLoaded(detail("c1", vec![])));
+        let seed = effects
+            .iter()
+            .position(|e| matches!(e, Effect::ReceiveChunk(c) if c == "c1 partial "));
+        let load = effects
+            .iter()
+            .position(|e| matches!(e, Effect::LoadConversationIntoChat(_)));
+        assert!(
+            seed.is_some(),
+            "switching to c1 must re-seed c1's buffered partial: {effects:?}"
+        );
+        assert!(
+            load < seed,
+            "the seed must render after the load: {effects:?}"
+        );
+        // Both streams keep buffering — neither was finalized by the switch.
+        assert!(state.stream_of("c1").is_some());
+        assert!(state.stream_of("c2").is_some());
+        // The view now reads c1's partial.
+        assert_eq!(state.streaming_buffer(), "c1 partial ");
+    }
+
+    /// Completing ONE stream finalizes only its conversation; the other keeps
+    /// streaming undisturbed.
+    #[test]
+    fn completing_one_stream_leaves_the_other_streaming() {
+        let mut state = two_streams_state();
+        // Complete the OPEN conversation's (c2) stream.
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-c2".to_string(),
+            full_response: "c2 done".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(c) if c == "c2 done")),
+            "the open conversation's completion must finalize into the view: {effects:?}"
+        );
+        assert!(state.stream_of("c2").is_none(), "c2's stream is cleared");
+        assert_eq!(
+            state.stream_of("c1").unwrap().buffer,
+            "c1 partial ",
+            "c1 must still be streaming, undisturbed"
+        );
+        assert!(
+            state.is_streaming(),
+            "a turn (c1) is still in flight somewhere"
+        );
+    }
+
+    /// Completing the BACKGROUNDED stream touches nothing in the open chat (no
+    /// CompleteStreaming for the conversation not in view) and leaves the open
+    /// conversation's stream intact.
+    #[test]
+    fn completing_background_stream_does_not_touch_open_conversation() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-c1".to_string(),
+            full_response: "c1 done".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "a backgrounded completion must not render into the open chat: {effects:?}"
+        );
+        assert!(state.stream_of("c1").is_none(), "c1's stream is cleared");
+        assert_eq!(
+            state.stream_of("c2").unwrap().buffer,
+            "c2 partial ",
+            "the open conversation's stream must be untouched"
+        );
+        // The open conversation's transcript must not have gained c1's reply.
+        assert!(
+            state
+                .current_conversation()
+                .unwrap()
+                .messages
+                .iter()
+                .all(|m| m.content != "c1 done"),
+            "c1's reply must not leak into c2's transcript"
+        );
+    }
+
+    /// Erroring one stream surfaces its error but leaves the other streaming.
+    #[test]
+    fn erroring_one_stream_leaves_the_other_streaming() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::StreamError {
+            request_id: "req-c1".to_string(),
+            error: "c1 boom".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetStatusText(t) if t == "Error: c1 boom")),
+            "the error must surface on the global status line: {effects:?}"
+        );
+        // c1 was backgrounded, so its failure must NOT clear the open chat status.
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::ClearChatStatus)),
+            "a backgrounded stream's error must not blank the open conversation's chat: {effects:?}"
+        );
+        assert!(state.stream_of("c1").is_none(), "c1's stream is cleared");
+        assert_eq!(
+            state.stream_of("c2").unwrap().buffer,
+            "c2 partial ",
+            "c2 must still be streaming, undisturbed"
+        );
+    }
+
+    /// TUI-7 relaxed for per-conversation streams: a second send to a DIFFERENT,
+    /// idle conversation is allowed while another streams in the background.
+    #[test]
+    fn second_send_to_idle_conversation_is_allowed_while_another_streams() {
+        // c1 streams in the background; c3 (idle) is the open conversation.
+        let mut state = WindowState::default()
+            .with_stream(
+                "c1",
+                StreamState {
+                    request_id: Some("req-c1".to_string()),
+                    buffer: "c1 partial ".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_open(detail("c3", vec![]));
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello c3".to_string(),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SendPrompt { conversation_id, prompt, .. }]
+                    if conversation_id == "c3" && prompt == "hello c3"
+            ),
+            "a send to an idle conversation must be allowed while another streams: {effects:?}"
+        );
+        // The optimistic bubble landed in c3, and c1 keeps streaming.
+        assert_eq!(state.current_conversation().unwrap().messages.len(), 1);
+        assert_eq!(state.stream_of("c1").unwrap().buffer, "c1 partial ");
+    }
+
+    /// TUI-7 preserved: a second send to the SAME conversation that is already
+    /// streaming is still blocked — its single stream slot renders one turn at a
+    /// time.
+    #[test]
+    fn second_send_to_the_streaming_conversation_is_still_blocked() {
+        // c1 streams AND is the open conversation: a send into it is refused.
+        let mut state = WindowState::default()
+            .with_stream(
+                "c1",
+                StreamState {
+                    request_id: Some("req-c1".to_string()),
+                    buffer: "c1 partial ".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_open(detail("c1", vec![msg("user", "first")]));
+        let before = state.current_conversation().unwrap().messages.len();
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "second".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetStatusText(_)]),
+            "a send into the already-streaming open conversation must be blocked: {effects:?}"
+        );
+        assert_eq!(
+            state.current_conversation().unwrap().messages.len(),
+            before,
+            "a blocked send must not append a bubble"
+        );
+    }
+
+    /// Multi-stream TUI-8: a disconnect drops EVERY conversation's in-flight
+    /// stream. The open conversation gets a `[Connection lost]` stub; the
+    /// backgrounded one's partial is simply discarded (it was never persisted).
+    #[test]
+    fn disconnect_clears_all_streams_finalizing_only_the_open_one() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        // No stream survives anywhere.
+        assert!(
+            !state.is_streaming(),
+            "every stream must be cleared on disconnect"
+        );
+        assert!(state.stream_of("c1").is_none());
+        assert!(state.stream_of("c2").is_none());
+        // Exactly one [Connection lost] finalization — for the open conversation.
+        let completions: Vec<&str> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::CompleteStreaming(c) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            vec!["c2 partial \n\n[Connection lost]"],
+            "only the open conversation's partial is finalized with the marker: {effects:?}"
+        );
+        // The stub landed in c2's transcript; c1's truncated partial is gone.
+        let last = state
+            .current_conversation()
+            .unwrap()
+            .messages
+            .last()
+            .unwrap();
+        assert_eq!(last.content, "c2 partial \n\n[Connection lost]");
+    }
+
+    /// Reset (TUI-8 via the explicit accessor) drops EVERY conversation's stream
+    /// without finalizing, so neither can mis-claim the next post-reconnect id.
+    #[test]
+    fn reset_streaming_state_clears_every_conversation_stream() {
+        let mut state = two_streams_state();
+        state.reset_streaming_state();
+        assert!(!state.is_streaming());
+        assert!(state.stream_of("c1").is_none());
+        assert!(state.stream_of("c2").is_none());
+        // A post-reset chunk for either old id is unrouted (no stream owns it).
+        let e1 = state.apply(UiMessage::StreamChunk {
+            request_id: "req-c1".to_string(),
+            chunk: "zombie".to_string(),
+        });
+        let e2 = state.apply(UiMessage::StreamChunk {
+            request_id: "req-c2".to_string(),
+            chunk: "zombie".to_string(),
+        });
+        assert!(
+            e1.is_empty() && e2.is_empty(),
+            "no dead stream may be revived"
+        );
+    }
+
+    /// GTK-2 under concurrency: a backgrounded turn's `AssistantStatus` must NOT
+    /// paint the open conversation's chat status even when the open conversation
+    /// has its own `__pending__` stream — the claimed-id match routes the status
+    /// to its own (background) conversation, not the viewed one.
+    #[test]
+    fn background_assistant_status_does_not_paint_open_pending_conversation() {
+        // c1 streams (claimed) in the background; c2 is open with a __pending__
+        // stream of its own (id not yet claimed).
+        let mut state = WindowState::default()
+            .with_stream(
+                "c1",
+                StreamState {
+                    request_id: Some("req-c1".to_string()),
+                    buffer: "c1 partial ".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_stream("c2", StreamState::default())
+            .with_open(detail("c2", vec![]));
+        // A status for c1's background turn arrives.
+        let bg = state.apply(UiMessage::AssistantStatus {
+            request_id: "req-c1".to_string(),
+            message: "c1 searching...".to_string(),
+        });
+        assert!(
+            !bg.iter().any(|e| matches!(e, Effect::SetChatStatus(_))),
+            "the background turn's status must not paint c2's chat: {bg:?}"
+        );
+        // A status for c2's own (still-pending) turn DOES paint — it routes to c2
+        // as the unique pending stream.
+        let own = state.apply(UiMessage::AssistantStatus {
+            request_id: "req-c2-not-yet-claimed".to_string(),
+            message: "c2 searching...".to_string(),
+        });
+        assert!(
+            own.iter()
+                .any(|e| matches!(e, Effect::SetChatStatus(m) if m == "c2 searching...")),
+            "the open conversation's own pending-turn status must paint: {own:?}"
+        );
+    }
+
+    /// Routing by id: with two claimed streams in flight, an unrelated request id
+    /// (matching neither) is ignored — it does not get mis-attributed to either.
+    #[test]
+    fn concurrent_chunk_for_unrelated_id_is_ignored() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-nobody".to_string(),
+            chunk: "noise".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "an unowned id must not render: {effects:?}"
+        );
+        assert_eq!(state.stream_of("c1").unwrap().buffer, "c1 partial ");
+        assert_eq!(state.stream_of("c2").unwrap().buffer, "c2 partial ");
+    }
+
     #[test]
     fn first_stream_chunk_claims_real_request_id_from_pending_sentinel() {
+        // A __pending__ stream (id not yet claimed) for the open conversation.
         let mut state = WindowState {
-            // A __pending__ stream (id not yet claimed) for the open conversation.
-            stream: Some(StreamState {
-                conversation_id: "c1".to_string(),
-                ..Default::default()
-            }),
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_stream("c1", StreamState::default());
         let effects = state.apply(UiMessage::StreamChunk {
             request_id: "req-real".to_string(),
             chunk: "hello".to_string(),
@@ -2060,15 +2546,17 @@ mod tests {
     #[test]
     fn subsequent_stream_chunk_appends_without_clearing_status() {
         let mut state = WindowState {
-            stream: Some(StreamState {
-                request_id: Some("req-real".to_string()),
-                conversation_id: "c1".to_string(),
-                buffer: "hello".to_string(),
-                ..Default::default()
-            }),
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_stream(
+            "c1",
+            StreamState {
+                request_id: Some("req-real".to_string()),
+                buffer: "hello".to_string(),
+                ..Default::default()
+            },
+        );
         let effects = state.apply(UiMessage::StreamChunk {
             request_id: "req-real".to_string(),
             chunk: " world".to_string(),
@@ -2084,15 +2572,17 @@ mod tests {
     #[test]
     fn stream_chunk_for_unrelated_request_id_is_ignored() {
         let mut state = WindowState {
-            stream: Some(StreamState {
-                request_id: Some("req-real".to_string()),
-                conversation_id: "c1".to_string(),
-                buffer: "hello".to_string(),
-                ..Default::default()
-            }),
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_stream(
+            "c1",
+            StreamState {
+                request_id: Some("req-real".to_string()),
+                buffer: "hello".to_string(),
+                ..Default::default()
+            },
+        );
         let effects = state.apply(UiMessage::StreamChunk {
             request_id: "some-other-req".to_string(),
             chunk: "noise".to_string(),
@@ -2107,15 +2597,12 @@ mod tests {
 
     #[test]
     fn assistant_status_matches_pending_sentinel_before_request_id_known() {
+        // __pending__ stream (id not yet claimed) for the open conversation.
         let mut state = WindowState {
-            // __pending__ stream (id not yet claimed) for the open conversation.
-            stream: Some(StreamState {
-                conversation_id: "c1".to_string(),
-                ..Default::default()
-            }),
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_stream("c1", StreamState::default());
         let effects = state.apply(UiMessage::AssistantStatus {
             request_id: "req-not-yet-claimed".to_string(),
             message: "Searching...".to_string(),
@@ -2128,15 +2615,15 @@ mod tests {
 
     #[test]
     fn stream_complete_claims_sentinel_appends_message_and_clears_pending() {
-        let mut state = WindowState {
-            stream: Some(StreamState {
-                conversation_id: "c1".to_string(),
-                buffer: "partial".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .with_open(detail("c1", vec![msg("user", "hi")]));
+        let mut state = WindowState::default()
+            .with_stream(
+                "c1",
+                StreamState {
+                    buffer: "partial".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_open(detail("c1", vec![msg("user", "hi")]));
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-real".to_string(),
             full_response: "the answer".to_string(),
@@ -2162,15 +2649,17 @@ mod tests {
     #[test]
     fn stream_error_clears_pending_and_sets_error_status() {
         let mut state = WindowState {
-            stream: Some(StreamState {
-                request_id: Some("req-real".to_string()),
-                conversation_id: "c1".to_string(),
-                buffer: "partial".to_string(),
-                ..Default::default()
-            }),
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
-        };
+        }
+        .with_stream(
+            "c1",
+            StreamState {
+                request_id: Some("req-real".to_string()),
+                buffer: "partial".to_string(),
+                ..Default::default()
+            },
+        );
         let effects = state.apply(UiMessage::StreamError {
             request_id: "req-real".to_string(),
             error: "boom".to_string(),
@@ -2185,16 +2674,16 @@ mod tests {
 
     #[test]
     fn disconnect_finalizes_in_progress_stream_with_connection_lost_marker() {
-        let mut state = WindowState {
-            stream: Some(StreamState {
-                request_id: Some("req-real".to_string()),
-                conversation_id: "c1".to_string(),
-                buffer: "half a thought".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .with_open(detail("c1", vec![]));
+        let mut state = WindowState::default()
+            .with_stream(
+                "c1",
+                StreamState {
+                    request_id: Some("req-real".to_string()),
+                    buffer: "half a thought".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::Disconnected {
             reason: "socket closed".to_string(),
         });
@@ -3119,9 +3608,8 @@ mod tests {
     /// A `StreamComplete` for `c1` carrying `full_response`, against a freshly
     /// pinned pending request — the reply-narration trigger.
     fn stream_complete_in(state: &mut WindowState, full_response: &str) -> Vec<Effect> {
-        state.stream = Some(StreamState {
+        state.open.entry("c1".to_string()).or_default().stream = Some(StreamState {
             request_id: Some("req".to_string()),
-            conversation_id: "c1".to_string(),
             ..Default::default()
         });
         state.cache_detail(detail("c1", vec![]));
@@ -3349,15 +3837,15 @@ mod tests {
     /// on reload).
     #[test]
     fn external_turn_ignored_while_own_turn_in_flight() {
-        let mut state = WindowState {
-            ..Default::default()
-        }
-        .with_open(detail("c1", vec![]));
-        state.stream = Some(StreamState {
-            request_id: Some("mine".to_string()),
-            conversation_id: "c1".to_string(),
-            ..Default::default()
-        });
+        let mut state = WindowState::default()
+            .with_open(detail("c1", vec![]))
+            .with_stream(
+                "c1",
+                StreamState {
+                    request_id: Some("mine".to_string()),
+                    ..Default::default()
+                },
+            );
         let effects = state.apply(UiMessage::UserMessageAdded {
             conversation_id: "c1".to_string(),
             request_id: "other".to_string(),
@@ -3408,9 +3896,8 @@ mod tests {
         // Always (and OnDemand+You) would otherwise narrate every reply.
         let mut state = state_with(true, AdeleOutput::Always);
         // Simulate an in-flight turn for the open conversation.
-        state.stream = Some(StreamState {
+        state.open.entry("c1".to_string()).or_default().stream = Some(StreamState {
             request_id: Some("req".to_string()),
-            conversation_id: "c1".to_string(),
             ..Default::default()
         });
         state.cache_detail(detail("c1", vec![]));
