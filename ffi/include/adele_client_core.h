@@ -104,6 +104,36 @@ void adele_core_set_voice_in(Core *core, const char *conversation_id, bool enabl
  */
 void adele_core_set_adele_output(Core *core, const char *conversation_id, const char *level);
 
+/*
+ Stage (or clear) a per-message model override for the next send. Empty
+ `connection_id`/`model_id` clears it (inherit the default); `effort` is
+ `"low"`/`"medium"`/`"high"` or empty (no effort hint).
+
+ # Safety
+ `core` must be a live handle; the string args must be null or valid C strings.
+ */
+void adele_core_select_model(Core *core,
+                             const char *connection_id,
+                             const char *model_id,
+                             const char *effort);
+
+/*
+ Request cancellation of a background task by id.
+
+ # Safety
+ `core` must be a live handle; `task_id` must be null or a valid C string.
+ */
+void adele_core_cancel_task(Core *core, const char *task_id);
+
+/*
+ Fetch a background task's log page; the result arrives later as a `task_logs`
+ view event.
+
+ # Safety
+ `core` must be a live handle; `task_id` must be null or a valid C string.
+ */
+void adele_core_fetch_task_logs(Core *core, const char *task_id);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
