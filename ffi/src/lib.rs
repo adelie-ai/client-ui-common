@@ -213,3 +213,54 @@ pub unsafe extern "C" fn adele_core_set_adele_output(
         level,
     });
 }
+
+/// Stage (or clear) a per-message model override for the next send. Empty
+/// `connection_id`/`model_id` clears it (inherit the default); `effort` is
+/// `"low"`/`"medium"`/`"high"` or empty (no effort hint).
+///
+/// # Safety
+/// `core` must be a live handle; the string args must be null or valid C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_select_model(
+    core: *mut Core,
+    connection_id: *const c_char,
+    model_id: *const c_char,
+    effort: *const c_char,
+) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::SelectModel {
+        connection_id: unsafe { cstr_to_string(connection_id) },
+        model_id: unsafe { cstr_to_string(model_id) },
+        effort: unsafe { cstr_to_string(effort) },
+    });
+}
+
+/// Request cancellation of a background task by id.
+///
+/// # Safety
+/// `core` must be a live handle; `task_id` must be null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_cancel_task(core: *mut Core, task_id: *const c_char) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::CancelTask(unsafe { cstr_to_string(task_id) }));
+}
+
+/// Fetch a background task's log page; the result arrives later as a `task_logs`
+/// view event.
+///
+/// # Safety
+/// `core` must be a live handle; `task_id` must be null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_fetch_task_logs(core: *mut Core, task_id: *const c_char) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::FetchTaskLogs(unsafe { cstr_to_string(task_id) }));
+}

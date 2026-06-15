@@ -115,6 +115,19 @@ pub enum Intent {
         conversation_id: String,
         level: AdeleOutput,
     },
+    /// Stage (or clear) a per-message model override, applied to the next send.
+    /// Empty `connection_id`/`model_id` clears it; `effort` is
+    /// "low"/"medium"/"high" or empty. The reducer keeps model selection
+    /// client-side, so the override lives in the actor, not `WindowState`.
+    SelectModel {
+        connection_id: String,
+        model_id: String,
+        effort: String,
+    },
+    /// Request cancellation of a background task by id.
+    CancelTask(String),
+    /// Fetch a background task's log page (delivered as a `TaskLogs` view event).
+    FetchTaskLogs(String),
 }
 
 /// The actor's single input channel.
@@ -135,12 +148,26 @@ fn ui(msg: UiMessage) -> CoreMsg {
     CoreMsg::Ui(Box::new(msg))
 }
 
+/// Parse a "low"/"medium"/"high" token into an [`api::EffortLevel`]; anything
+/// else (including empty) ⇒ `None` (no effort hint).
+fn parse_effort(s: &str) -> Option<api::EffortLevel> {
+    match s {
+        "low" => Some(api::EffortLevel::Low),
+        "medium" => Some(api::EffortLevel::Medium),
+        "high" => Some(api::EffortLevel::High),
+        _ => None,
+    }
+}
+
 /// The actor: owns the reducer state + the connector, runs effects.
 struct Engine {
     state: WindowState,
     connector: Option<Arc<Connector>>,
     self_tx: mpsc::UnboundedSender<CoreMsg>,
     sink: ViewSink,
+    /// Per-message model override staged by `SelectModel`, applied on the next
+    /// send. `None` ⇒ inherit the conversation / interactive-purpose default.
+    staged_override: Option<api::SendPromptOverride>,
 }
 
 impl Engine {
@@ -198,7 +225,28 @@ impl Engine {
                 conversation_id,
                 level,
             }),
+            Intent::SelectModel {
+                connection_id,
+                model_id,
+                effort,
+            } => self.set_model_override(connection_id, model_id, effort),
+            Intent::CancelTask(id) => self.spawn_cancel_task(id),
+            Intent::FetchTaskLogs(id) => self.spawn_fetch_task_logs(id),
         }
+    }
+
+    /// Stage (or clear) the per-message model override applied to the next send.
+    /// Empty connection/model clears it (inherit the conversation/purpose default).
+    fn set_model_override(&mut self, connection_id: String, model_id: String, effort: String) {
+        if connection_id.is_empty() || model_id.is_empty() {
+            self.staged_override = None;
+            return;
+        }
+        self.staged_override = Some(api::SendPromptOverride {
+            connection_id,
+            model_id,
+            effort: parse_effort(&effort),
+        });
     }
 
     /// Send-decision via the shared core. The reducer draws the optimistic user
@@ -422,13 +470,32 @@ impl Engine {
             )));
             return;
         };
+        let override_selection = self.staged_override.clone();
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
             let refinement = system_refinement.as_deref().unwrap_or("");
-            match conn
-                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
-                .await
-            {
+            // With a staged model override, send via the generic Commands channel
+            // (`send_prompt_full` carries BOTH the override and the refinement);
+            // otherwise use the Connector's refinement send, which also handles
+            // the no-Commands D-Bus prompt-fold fallback.
+            let result = if let Some(ov) = override_selection {
+                if let Some(cmds) = conn.client().as_commands() {
+                    cmds.send_prompt_full(
+                        &conversation_id,
+                        &prompt,
+                        Some(ov),
+                        refinement.to_string(),
+                    )
+                    .await
+                } else {
+                    conn.send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                        .await
+                }
+            } else {
+                conn.send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                    .await
+            };
+            match result {
                 Ok(task_id) => {
                     let _ = tx.send(ui(UiMessage::PromptSent {
                         task_id,
@@ -461,6 +528,53 @@ impl Engine {
                     .await
             {
                 tracing::warn!("SubscribeConversations failed: {e}");
+            }
+        });
+    }
+
+    fn spawn_cancel_task(&self, task_id: String) {
+        let Some(conn) = self.connector.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Some(cmds) = conn.client().as_commands()
+                && let Err(e) = cmds
+                    .send_command(api::Command::CancelBackgroundTask { id: task_id })
+                    .await
+            {
+                tracing::warn!("CancelBackgroundTask failed: {e}");
+            }
+        });
+    }
+
+    fn spawn_fetch_task_logs(&self, task_id: String) {
+        let Some(conn) = self.connector.clone() else {
+            return;
+        };
+        // The task-log page is a display-only fetch with no reducer state, so
+        // emit it straight to the view (the sink is thread-safe) rather than
+        // routing a new message through the reducer.
+        let sink = self.sink;
+        tokio::spawn(async move {
+            let Some(cmds) = conn.client().as_commands() else {
+                return;
+            };
+            match cmds
+                .send_command(api::Command::GetBackgroundTaskLogs {
+                    id: task_id.clone(),
+                    after_seq: None,
+                    limit: None,
+                })
+                .await
+            {
+                Ok(api::CommandResult::BackgroundTaskLogs { entries, .. }) => {
+                    sink.emit(&ViewEvent::TaskLogs {
+                        id: task_id,
+                        entries,
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("GetBackgroundTaskLogs failed: {e}"),
             }
         });
     }
@@ -578,6 +692,7 @@ impl Core {
             connector: None,
             self_tx: tx.clone(),
             sink,
+            staged_override: None,
         };
         runtime.spawn(engine.run(rx));
         Self {

@@ -195,6 +195,12 @@ pub enum ViewEvent {
     },
     /// A task reached a terminal state.
     TaskCompleted { id: String },
+    /// A fetched page of a background task's logs (response to a FetchTaskLogs
+    /// intent). Emitted directly by the executor, not via an `Effect`.
+    TaskLogs {
+        id: String,
+        entries: Vec<api::TaskLogEntry>,
+    },
     /// Replace the side pane's scratchpad notes.
     Scratchpad { notes: Vec<api::ScratchpadNoteView> },
     /// Recompute the side pane's per-conversation task view (the C++ side filters
