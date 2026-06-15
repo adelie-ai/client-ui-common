@@ -18,6 +18,16 @@ fn main() {
     println!("cargo:rerun-if-changed=src/view_event.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
+    // Give the cdylib a SONAME. Without it, a C/C++ consumer that links the
+    // produced `libadele_client_core.so` by path (e.g. adele-kde's
+    // `libadelecore.so` QML plugin) records the absolute build-tree path as its
+    // `DT_NEEDED`, so the installed plugin only resolves the core while this
+    // build tree exists. With a SONAME, the consumer records the bare name and
+    // its `$ORIGIN` RPATH resolves the co-installed copy — a self-contained,
+    // build-tree-independent install. `rustc-cdylib-link-arg` applies to the
+    // cdylib link only (ignored for the rlib).
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libadele_client_core.so");
+
     let config = cbindgen::Config::from_file(crate_dir.join("cbindgen.toml")).unwrap_or_default();
 
     match cbindgen::Builder::new()
