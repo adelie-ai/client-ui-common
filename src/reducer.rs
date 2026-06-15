@@ -57,17 +57,29 @@ struct StreamState {
     external: bool,
 }
 
-/// One open conversation's view-model: its loaded detail today; its own
-/// streaming buffer in a later step (the composer draft is tracked alongside
-/// the per-conversation voice state for now). Splitting the former
-/// flat `current_conversation: Option<ConversationDetail>` into a keyed
-/// `ConversationModel` is the first half of the per-conversation model the
-/// clients render — [`WindowState::open`] keys these by conversation id so a
-/// conversation's state is found by identity, not by "whichever detail happens
-/// to be cached".
-#[derive(Debug, Clone)]
+/// One conversation's view-model — all of its per-conversation state in one
+/// place, keyed by conversation id in [`WindowState::open`] so it's found by
+/// identity. Holds the loaded transcript (`detail`, optional so a model can
+/// outlive its transcript), the `You:`/`Adele:` voice settings, and the unsent
+/// composer draft. The composer narrowing (#2) + the voice settings used to live
+/// as flat side-maps on `WindowState`; folding them here is the per-conversation
+/// consolidation (`stream` is the one piece still tracked at window level).
+#[derive(Debug, Clone, Default)]
 struct ConversationModel {
-    detail: ConversationDetail,
+    /// The loaded conversation transcript + metadata, or `None` when this model
+    /// exists only to retain per-conversation state for a conversation whose
+    /// transcript isn't currently loaded — a backgrounded conversation whose
+    /// detail was evicted on switch-away to bound memory (it re-fetches on
+    /// switch-back), or one a voice/draft was set on before its detail loaded.
+    detail: Option<ConversationDetail>,
+    /// `You:` (voice input) Enabled for this conversation (issue #80); default
+    /// (Disabled) for a fresh model.
+    voice_in: bool,
+    /// `Adele:` (voice output) level for this conversation (issue #80).
+    adele_output: AdeleOutput,
+    /// The unsent composer draft for this conversation (the composer narrowing,
+    /// #2) — empty when there is no draft.
+    composer: String,
 }
 
 /// Shared mutable state for the window.
@@ -75,11 +87,13 @@ struct ConversationModel {
 pub struct WindowState {
     pub conversations: Vec<ConversationSummary>,
     pub current_conversation_id: Option<String>,
-    /// The open conversations' view-models, keyed by conversation id. For this
-    /// phase the map holds exactly the conversation named by
-    /// `current_conversation_id` (single-open behavior preserved); the keyed
-    /// shape is what lets per-conversation state grow without a flat field per
-    /// concern. Private — view clients read it through
+    /// Per-conversation view-models, keyed by conversation id. Retains a model
+    /// for every conversation the user has touched (its voice settings + unsent
+    /// draft), not just the open one — that's what lets per-conversation state
+    /// survive a switch. The *transcript* (`ConversationModel::detail`) is only
+    /// kept for the open conversation; switching away evicts the outgoing
+    /// transcript (its small state stays) so memory doesn't grow with every
+    /// visited conversation. Private — view clients read it through
     /// [`current_conversation`](Self::current_conversation).
     open: HashMap<String, ConversationModel>,
     /// In-flight streaming reply, or `None` when no turn is streaming. See
@@ -89,30 +103,6 @@ pub struct WindowState {
     /// conversation (GTK-2) by construction.
     stream: Option<StreamState>,
     pub debug_enabled: bool,
-    /// Per-conversation `You:` (voice input) state (issue #80), keyed by
-    /// conversation id. Default (absent key) is **Disabled** (type only). When
-    /// Enabled, the input bar shows a push-to-talk control and — combined with
-    /// `Adele == OnDemand` — gates reply narration. Per-conversation, so
-    /// enabling it in one conversation never affects another.
-    conversation_voice_in: HashMap<String, bool>,
-    /// Per-conversation `Adele:` (voice output) level (issue #80), keyed by
-    /// conversation id. Default (absent key) is **Disabled** (never speaks).
-    /// Set by the user (the dropdown) or the model (`request_voice` → OnDemand,
-    /// `stop_voice` → Disabled). Decides reply narration (with `You`), the
-    /// `say_this` gate, and the send-time `system_refinement`. Replaces phase-2's
-    /// two toggles (read-aloud == Always, voice-mode == OnDemand).
-    conversation_adele_output: HashMap<String, AdeleOutput>,
-    /// Per-conversation composer draft — the unsent text the user has typed for
-    /// each conversation, keyed by conversation id (absent = no draft). Lets a
-    /// conversation switch save the *outgoing* draft and restore the *incoming*
-    /// one, instead of one global composer widget bleeding a half-typed message
-    /// across conversations. The draft is plain data so the **model** owns it
-    /// (the composer narrowing, #2) — the client's native editor stays the live
-    /// editor and syncs to this at switch boundaries. A side map alongside the
-    /// per-conversation voice maps for now; a later consolidation may fold all
-    /// per-conversation state (detail, voice, draft, stream) into
-    /// [`ConversationModel`].
-    conversation_composer: HashMap<String, String>,
 }
 
 impl WindowState {
@@ -120,10 +110,7 @@ impl WindowState {
     /// `false` when it was never set (default Disabled). Part of the shared
     /// public API: clients render per-conversation voice state from it.
     pub fn voice_in_for(&self, conversation: &str) -> bool {
-        self.conversation_voice_in
-            .get(conversation)
-            .copied()
-            .unwrap_or(false)
+        self.open.get(conversation).is_some_and(|c| c.voice_in)
     }
 
     /// Whether `You:` (voice input) is Enabled for the *currently active*
@@ -140,9 +127,9 @@ impl WindowState {
     /// `Disabled` when it was never set (default). Part of the shared public
     /// API: clients render per-conversation voice state from it.
     pub fn adele_output_for(&self, conversation: &str) -> AdeleOutput {
-        self.conversation_adele_output
+        self.open
             .get(conversation)
-            .copied()
+            .map(|c| c.adele_output)
             .unwrap_or_default()
     }
 
@@ -271,7 +258,7 @@ impl WindowState {
     /// shared public API.
     pub fn current_conversation(&self) -> Option<&ConversationDetail> {
         let id = self.current_conversation_id.as_deref()?;
-        self.open.get(id).map(|c| &c.detail)
+        self.open.get(id).and_then(|c| c.detail.as_ref())
     }
 
     /// Mutable access to the open conversation's detail — e.g. to append an
@@ -279,16 +266,33 @@ impl WindowState {
     /// Part of the shared public API.
     pub fn current_conversation_mut(&mut self) -> Option<&mut ConversationDetail> {
         let id = self.current_conversation_id.clone()?;
-        self.open.get_mut(&id).map(|c| &mut c.detail)
+        self.open.get_mut(&id).and_then(|c| c.detail.as_mut())
     }
 
-    /// Make `detail`'s conversation the single open one, dropping any
-    /// previously-open conversation. The single-open invariant for this phase:
-    /// `open` holds exactly the conversation named by `current_conversation_id`.
-    fn set_open_conversation(&mut self, detail: ConversationDetail) {
-        self.open.clear();
-        self.open
-            .insert(detail.id.clone(), ConversationModel { detail });
+    /// Switch the open conversation to `detail`'s, caching its transcript and
+    /// making it current. Retention (#2): other conversations' models persist in
+    /// `open` (their voice settings + draft); only the *outgoing* conversation's
+    /// transcript is evicted (its small state stays), so memory doesn't grow with
+    /// every visited conversation — it re-fetches on switch-back.
+    fn switch_to(&mut self, detail: ConversationDetail) {
+        let incoming = detail.id.clone();
+        // Evict the outgoing conversation's transcript (its small state stays).
+        if let Some(outgoing) = self.current_conversation_id.clone()
+            && outgoing != incoming
+            && let Some(model) = self.open.get_mut(&outgoing)
+        {
+            model.detail = None;
+        }
+        self.current_conversation_id = Some(incoming.clone());
+        self.open.entry(incoming).or_default().detail = Some(detail);
+    }
+
+    /// Cache/refresh `detail`'s transcript *without* changing which conversation
+    /// is open — for a re-fetch of the already-open conversation (reconnect /
+    /// refresh). Preserves the model's per-conversation state.
+    fn cache_detail(&mut self, detail: ConversationDetail) {
+        let id = detail.id.clone();
+        self.open.entry(id).or_default().detail = Some(detail);
     }
 
     /// Seed the open conversation directly — for a client whose connect-time
@@ -296,8 +300,7 @@ impl WindowState {
     /// TUI's `load_conversation`). Makes `detail`'s conversation current and
     /// caches its detail. Part of the shared public API.
     pub fn open_conversation(&mut self, detail: ConversationDetail) {
-        self.current_conversation_id = Some(detail.id.clone());
-        self.set_open_conversation(detail);
+        self.switch_to(detail);
     }
 
     /// The saved composer draft for `conversation_id` — the unsent text the user
@@ -306,9 +309,9 @@ impl WindowState {
     /// conversation (the native editor is set from it, cursor at end). Part of
     /// the shared public API.
     pub fn composer_draft(&self, conversation_id: &str) -> &str {
-        self.conversation_composer
+        self.open
             .get(conversation_id)
-            .map_or("", String::as_str)
+            .map_or("", |c| c.composer.as_str())
     }
 
     /// Save (or clear) `conversation_id`'s composer draft. View clients call this
@@ -317,11 +320,18 @@ impl WindowState {
     /// `text` drops the entry, so the map only ever retains non-empty drafts.
     /// Part of the shared public API.
     pub fn set_composer_draft(&mut self, conversation_id: &str, text: String) {
-        if text.is_empty() {
-            self.conversation_composer.remove(conversation_id);
-        } else {
-            self.conversation_composer
-                .insert(conversation_id.to_string(), text);
+        // Save the draft on the conversation's model. An empty draft on an
+        // existing model just clears its composer (the model persists for its
+        // other state); an empty draft for an unmodeled conversation is a no-op.
+        match self.open.get_mut(conversation_id) {
+            Some(model) => model.composer = text,
+            None if !text.is_empty() => {
+                self.open
+                    .entry(conversation_id.to_string())
+                    .or_default()
+                    .composer = text;
+            }
+            None => {}
         }
     }
 }
@@ -685,8 +695,7 @@ impl WindowState {
                 let id = detail.id.clone();
                 let filtered = filter_messages(&detail, self.debug_enabled);
                 let selection = detail.model_selection.clone();
-                self.current_conversation_id = Some(id.clone());
-                self.set_open_conversation(detail);
+                self.switch_to(detail);
                 let mut effects = vec![
                     Effect::SetModelSelection(selection),
                     Effect::LoadConversationIntoChat(filtered),
@@ -738,7 +747,7 @@ impl WindowState {
                 } else {
                     let id = detail.id.clone();
                     let filtered = filter_messages(&detail, self.debug_enabled);
-                    self.set_open_conversation(detail);
+                    self.cache_detail(detail);
                     vec![
                         Effect::LoadConversationIntoChat(filtered),
                         Effect::SidePaneSetScratchpad(Vec::new()),
@@ -753,16 +762,14 @@ impl WindowState {
             }
             UiMessage::ConversationDeleted { id } => {
                 self.conversations.retain(|c| c.id != id);
-                // Prune the deleted conversation's per-conversation state (GTK-9):
-                // otherwise the maps grow unbounded and a later id reuse could
-                // inherit a stale `You:`/`Adele:` setting or composer draft.
-                self.conversation_voice_in.remove(&id);
-                self.conversation_adele_output.remove(&id);
-                self.conversation_composer.remove(&id);
+                // Prune the deleted conversation's model (GTK-9): its
+                // per-conversation state (voice settings, draft, any cached
+                // transcript) goes with it, so a later id reuse can't inherit a
+                // stale `You:`/`Adele:` setting or composer draft.
+                self.open.remove(&id);
                 let is_active = self.current_conversation_id.as_deref() == Some(&id);
                 if is_active {
                     self.current_conversation_id = None;
-                    self.open.clear();
                 }
                 let convs = self.conversations.clone();
                 let mut effects = vec![Effect::SetConversations(convs)];
@@ -850,7 +857,9 @@ impl WindowState {
                 // The send is committed: drop this conversation's saved composer
                 // draft so a later switch-away snapshot can't resurrect the
                 // just-sent text (the client clears its live composer widget too).
-                self.conversation_composer.remove(&conversation_id);
+                if let Some(model) = self.open.get_mut(&conversation_id) {
+                    model.composer.clear();
+                }
                 // Per the conversation's `Adele:` level (#80) carry a system
                 // refinement so the reply is shaped for speech (OnDemand → brief;
                 // Always → speakable but full; Disabled → none). Decided here so
@@ -1240,7 +1249,7 @@ impl WindowState {
                 // #80). Pure state change; the dropdown is the write source here
                 // (the user changed it), so no UI reflection is needed. Keyed by
                 // conversation so it never bleeds across them.
-                self.conversation_voice_in.insert(conversation_id, enabled);
+                self.open.entry(conversation_id).or_default().voice_in = enabled;
                 vec![]
             }
             UiMessage::SetAdeleOutput {
@@ -1251,8 +1260,7 @@ impl WindowState {
                 // (issue #80). Pure state change; the dropdown is the write
                 // source here (the user changed it), so no UI reflection is
                 // needed. Keyed by conversation so it never bleeds across them.
-                self.conversation_adele_output
-                    .insert(conversation_id, level);
+                self.open.entry(conversation_id).or_default().adele_output = level;
                 vec![]
             }
             UiMessage::ClientToolCall {
@@ -1336,8 +1344,10 @@ impl WindowState {
                     // result. `request_voice` / `stop_voice` take no arguments,
                     // so a junk payload is simply ignored — never a panic.
                     "request_voice" => {
-                        self.conversation_adele_output
-                            .insert(conversation_id.clone(), AdeleOutput::OnDemand);
+                        self.open
+                            .entry(conversation_id.clone())
+                            .or_default()
+                            .adele_output = AdeleOutput::OnDemand;
                         let mut effects = Vec::new();
                         if is_active {
                             effects.push(Effect::SetAdeleOutputDropdown(AdeleOutput::OnDemand));
@@ -1352,8 +1362,10 @@ impl WindowState {
                         effects
                     }
                     "stop_voice" => {
-                        self.conversation_adele_output
-                            .insert(conversation_id.clone(), AdeleOutput::Disabled);
+                        self.open
+                            .entry(conversation_id.clone())
+                            .or_default()
+                            .adele_output = AdeleOutput::Disabled;
                         let mut effects = Vec::new();
                         if is_active {
                             effects.push(Effect::SetAdeleOutputDropdown(AdeleOutput::Disabled));
@@ -1474,8 +1486,13 @@ mod tests {
         /// Some(id)` literal pair now that detail lives behind the keyed map.
         fn with_open(mut self, detail: ConversationDetail) -> Self {
             self.current_conversation_id = Some(detail.id.clone());
-            self.open
-                .insert(detail.id.clone(), ConversationModel { detail });
+            self.open.insert(
+                detail.id.clone(),
+                ConversationModel {
+                    detail: Some(detail),
+                    ..Default::default()
+                },
+            );
             self
         }
     }
@@ -1738,10 +1755,6 @@ mod tests {
         // An empty snapshot drops the draft so the map only retains real ones.
         state.set_composer_draft("c1", String::new());
         assert_eq!(state.composer_draft("c1"), "");
-        assert!(
-            state.conversation_composer.is_empty(),
-            "an empty draft must not leave a lingering map entry"
-        );
     }
 
     #[test]
@@ -1791,8 +1804,8 @@ mod tests {
         });
         assert_eq!(state.composer_draft("c1"), "");
         assert!(
-            state.conversation_composer.is_empty(),
-            "the deleted conversation's draft must be pruned"
+            state.open.is_empty(),
+            "the deleted conversation's model (and its draft) must be pruned"
         );
     }
 
@@ -2007,9 +2020,7 @@ mod tests {
     #[test]
     fn narration_skipped_when_originating_conversation_backgrounded() {
         let mut state = mid_stream_state("c1", "c2");
-        state
-            .conversation_adele_output
-            .insert("c1".to_string(), AdeleOutput::Always);
+        state.open.entry("c1".to_string()).or_default().adele_output = AdeleOutput::Always;
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-real".to_string(),
             full_response: "an answer".to_string(),
@@ -2437,40 +2448,34 @@ mod tests {
         }
         .with_open(detail("c2", vec![]));
         // Both conversations carry voice settings.
-        state.conversation_voice_in.insert("c1".to_string(), true);
-        state
-            .conversation_adele_output
-            .insert("c1".to_string(), AdeleOutput::Always);
-        state.conversation_voice_in.insert("c2".to_string(), true);
-        state
-            .conversation_adele_output
-            .insert("c2".to_string(), AdeleOutput::OnDemand);
+        {
+            let m = state.open.entry("c1".to_string()).or_default();
+            m.voice_in = true;
+            m.adele_output = AdeleOutput::Always;
+        }
+        {
+            let m = state.open.entry("c2".to_string()).or_default();
+            m.voice_in = true;
+            m.adele_output = AdeleOutput::OnDemand;
+        }
 
         // Delete the inactive one.
         state.apply(UiMessage::ConversationDeleted {
             id: "c1".to_string(),
         });
         assert!(
-            !state.conversation_voice_in.contains_key("c1"),
-            "deleted conversation's You: setting must be pruned"
-        );
-        assert!(
-            !state.conversation_adele_output.contains_key("c1"),
-            "deleted conversation's Adele: level must be pruned"
+            !state.open.contains_key("c1"),
+            "the deleted conversation's model (You:/Adele:) must be pruned"
         );
         // The surviving conversation's settings are untouched.
-        assert_eq!(state.conversation_voice_in.get("c2").copied(), Some(true));
-        assert_eq!(
-            state.conversation_adele_output.get("c2").copied(),
-            Some(AdeleOutput::OnDemand)
-        );
+        assert!(state.voice_in_for("c2"));
+        assert_eq!(state.adele_output_for("c2"), AdeleOutput::OnDemand);
 
         // Deleting the active one prunes it too.
         state.apply(UiMessage::ConversationDeleted {
             id: "c2".to_string(),
         });
-        assert!(state.conversation_voice_in.is_empty());
-        assert!(state.conversation_adele_output.is_empty());
+        assert!(state.open.is_empty());
     }
 
     fn note_view(key: &str) -> api::ScratchpadNoteView {
@@ -3105,12 +3110,9 @@ mod tests {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
-        state
-            .conversation_voice_in
-            .insert("c1".to_string(), voice_in);
-        state
-            .conversation_adele_output
-            .insert("c1".to_string(), adele);
+        let model = state.open.entry("c1".to_string()).or_default();
+        model.voice_in = voice_in;
+        model.adele_output = adele;
         state
     }
 
@@ -3122,7 +3124,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             ..Default::default()
         });
-        state.set_open_conversation(detail("c1", vec![]));
+        state.cache_detail(detail("c1", vec![]));
         state.apply(UiMessage::StreamComplete {
             request_id: "req".to_string(),
             full_response: full_response.to_string(),
@@ -3292,7 +3294,7 @@ mod tests {
     fn adopted_external_turn_streams_reply_without_gtk_narration() {
         // Adele=Always would normally narrate every reply.
         let mut state = state_with(false, AdeleOutput::Always);
-        state.set_open_conversation(detail("c1", vec![]));
+        state.cache_detail(detail("c1", vec![]));
         state.apply(UiMessage::UserMessageAdded {
             conversation_id: "c1".to_string(),
             request_id: "voice-req".to_string(),
@@ -3411,7 +3413,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             ..Default::default()
         });
-        state.set_open_conversation(detail("c1", vec![]));
+        state.cache_detail(detail("c1", vec![]));
 
         // The model speaks an aside mid-turn.
         let aside = state.apply(say_this_call("c1", "the spoken answer"));
@@ -3763,9 +3765,7 @@ mod tests {
             ..Default::default()
         };
         // The call's conversation has speech wide open — but it isn't in view.
-        state
-            .conversation_adele_output
-            .insert("c2".to_string(), AdeleOutput::Always);
+        state.open.entry("c2".to_string()).or_default().adele_output = AdeleOutput::Always;
         let effects = state.apply(say_this_call("c2", "background aside"));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
@@ -3812,9 +3812,7 @@ mod tests {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
-        state
-            .conversation_adele_output
-            .insert("c9".to_string(), AdeleOutput::Always); // unrelated
+        state.open.entry("c9".to_string()).or_default().adele_output = AdeleOutput::Always; // unrelated
         let effects = state.apply(say_this_call("c1", "quiet aside"));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
@@ -3839,8 +3837,8 @@ mod tests {
         };
         let effects = state.apply(voice_tool_call("c2", "request_voice"));
         assert_eq!(
-            state.conversation_adele_output.get("c2").copied(),
-            Some(AdeleOutput::OnDemand),
+            state.adele_output_for("c2"),
+            AdeleOutput::OnDemand,
             "request_voice must write the call's conversation"
         );
         assert_eq!(
@@ -3868,13 +3866,11 @@ mod tests {
     #[test]
     fn stop_voice_targets_call_conversation_when_backgrounded() {
         let mut state = state_with(true, AdeleOutput::OnDemand); // viewed c1
-        state
-            .conversation_adele_output
-            .insert("c2".to_string(), AdeleOutput::Always);
+        state.open.entry("c2".to_string()).or_default().adele_output = AdeleOutput::Always;
         let effects = state.apply(voice_tool_call("c2", "stop_voice"));
         assert_eq!(
-            state.conversation_adele_output.get("c2").copied(),
-            Some(AdeleOutput::Disabled),
+            state.adele_output_for("c2"),
+            AdeleOutput::Disabled,
             "stop_voice must write the call's conversation"
         );
         assert_eq!(
