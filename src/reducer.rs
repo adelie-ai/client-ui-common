@@ -58,7 +58,8 @@ struct StreamState {
 }
 
 /// One open conversation's view-model: its loaded detail today; its own
-/// streaming buffer and composer draft in later steps. Splitting the former
+/// streaming buffer in a later step (the composer draft is tracked alongside
+/// the per-conversation voice state for now). Splitting the former
 /// flat `current_conversation: Option<ConversationDetail>` into a keyed
 /// `ConversationModel` is the first half of the per-conversation model the
 /// clients render — [`WindowState::open`] keys these by conversation id so a
@@ -101,6 +102,17 @@ pub struct WindowState {
     /// `say_this` gate, and the send-time `system_refinement`. Replaces phase-2's
     /// two toggles (read-aloud == Always, voice-mode == OnDemand).
     conversation_adele_output: HashMap<String, AdeleOutput>,
+    /// Per-conversation composer draft — the unsent text the user has typed for
+    /// each conversation, keyed by conversation id (absent = no draft). Lets a
+    /// conversation switch save the *outgoing* draft and restore the *incoming*
+    /// one, instead of one global composer widget bleeding a half-typed message
+    /// across conversations. The draft is plain data so the **model** owns it
+    /// (the composer narrowing, #2) — the client's native editor stays the live
+    /// editor and syncs to this at switch boundaries. A side map alongside the
+    /// per-conversation voice maps for now; a later consolidation may fold all
+    /// per-conversation state (detail, voice, draft, stream) into
+    /// [`ConversationModel`].
+    conversation_composer: HashMap<String, String>,
 }
 
 impl WindowState {
@@ -286,6 +298,31 @@ impl WindowState {
     pub fn open_conversation(&mut self, detail: ConversationDetail) {
         self.current_conversation_id = Some(detail.id.clone());
         self.set_open_conversation(detail);
+    }
+
+    /// The saved composer draft for `conversation_id` — the unsent text the user
+    /// last had in the composer for that conversation, or `""` if none is saved.
+    /// View clients read this to restore the draft when switching *to* a
+    /// conversation (the native editor is set from it, cursor at end). Part of
+    /// the shared public API.
+    pub fn composer_draft(&self, conversation_id: &str) -> &str {
+        self.conversation_composer
+            .get(conversation_id)
+            .map_or("", String::as_str)
+    }
+
+    /// Save (or clear) `conversation_id`'s composer draft. View clients call this
+    /// to snapshot the *outgoing* conversation's unsent text when switching away
+    /// from it (a client may also snapshot live as the user types). An empty
+    /// `text` drops the entry, so the map only ever retains non-empty drafts.
+    /// Part of the shared public API.
+    pub fn set_composer_draft(&mut self, conversation_id: &str, text: String) {
+        if text.is_empty() {
+            self.conversation_composer.remove(conversation_id);
+        } else {
+            self.conversation_composer
+                .insert(conversation_id.to_string(), text);
+        }
     }
 }
 
@@ -716,11 +753,12 @@ impl WindowState {
             }
             UiMessage::ConversationDeleted { id } => {
                 self.conversations.retain(|c| c.id != id);
-                // Prune the deleted conversation's per-conversation voice state
-                // (GTK-9): otherwise the maps grow unbounded and a later id
-                // reuse could inherit a stale `You:`/`Adele:` setting.
+                // Prune the deleted conversation's per-conversation state (GTK-9):
+                // otherwise the maps grow unbounded and a later id reuse could
+                // inherit a stale `You:`/`Adele:` setting or composer draft.
                 self.conversation_voice_in.remove(&id);
                 self.conversation_adele_output.remove(&id);
+                self.conversation_composer.remove(&id);
                 let is_active = self.current_conversation_id.as_deref() == Some(&id);
                 if is_active {
                     self.current_conversation_id = None;
@@ -809,6 +847,10 @@ impl WindowState {
                         content: prompt.clone(),
                     });
                 }
+                // The send is committed: drop this conversation's saved composer
+                // draft so a later switch-away snapshot can't resurrect the
+                // just-sent text (the client clears its live composer widget too).
+                self.conversation_composer.remove(&conversation_id);
                 // Per the conversation's `Adele:` level (#80) carry a system
                 // refinement so the reply is shaped for speech (OnDemand → brief;
                 // Always → speakable but full; Disabled → none). Decided here so
@@ -1669,6 +1711,88 @@ mod tests {
             state.current_conversation().unwrap().messages.len(),
             2,
             "a non-matching tail must not be popped"
+        );
+    }
+
+    // --- composer drafts (#2): per-conversation unsent text ---------------
+
+    #[test]
+    fn composer_draft_round_trips_and_is_per_conversation() {
+        let mut state = WindowState::default();
+        // Absent → empty.
+        assert_eq!(state.composer_draft("c1"), "");
+        // Independent drafts per conversation.
+        state.set_composer_draft("c1", "half a thought".to_string());
+        state.set_composer_draft("c2", "a different one".to_string());
+        assert_eq!(state.composer_draft("c1"), "half a thought");
+        assert_eq!(state.composer_draft("c2"), "a different one");
+        // Overwrite replaces in place.
+        state.set_composer_draft("c1", "rewritten".to_string());
+        assert_eq!(state.composer_draft("c1"), "rewritten");
+    }
+
+    #[test]
+    fn set_composer_draft_empty_clears_the_entry() {
+        let mut state = WindowState::default();
+        state.set_composer_draft("c1", "typing".to_string());
+        // An empty snapshot drops the draft so the map only retains real ones.
+        state.set_composer_draft("c1", String::new());
+        assert_eq!(state.composer_draft("c1"), "");
+        assert!(
+            state.conversation_composer.is_empty(),
+            "an empty draft must not leave a lingering map entry"
+        );
+    }
+
+    #[test]
+    fn submit_prompt_clears_the_sent_conversations_draft() {
+        // A switch-away snapshot saved a draft for c1; sending it must drop the
+        // saved draft so switching back can't resurrect the just-sent text.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.set_composer_draft("c1", "hello".to_string());
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+        });
+        assert_eq!(
+            state.composer_draft("c1"),
+            "",
+            "a committed send clears the conversation's saved draft"
+        );
+    }
+
+    #[test]
+    fn a_blocked_send_preserves_the_saved_draft() {
+        // The send is gated mid-stream (TUI-7): nothing was sent, so the saved
+        // draft must survive (the client keeps its live composer text too).
+        let mut state = mid_stream_state("c1", "c1");
+        state.set_composer_draft("c1", "queued".to_string());
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "queued".to_string(),
+        });
+        assert_eq!(
+            state.composer_draft("c1"),
+            "queued",
+            "a blocked send must not clear the saved draft"
+        );
+    }
+
+    #[test]
+    fn deleting_a_conversation_prunes_its_draft() {
+        // GTK-9: per-conversation state is pruned on delete so a later id reuse
+        // can't inherit a stale draft.
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false)],
+            ..Default::default()
+        }
+        .with_open(detail("c1", vec![]));
+        state.set_composer_draft("c1", "orphan".to_string());
+        state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert_eq!(state.composer_draft("c1"), "");
+        assert!(
+            state.conversation_composer.is_empty(),
+            "the deleted conversation's draft must be pruned"
         );
     }
 
