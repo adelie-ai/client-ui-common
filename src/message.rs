@@ -194,6 +194,10 @@ pub enum UiMessage {
     ScratchpadChanged {
         conversation_id: String,
     },
+    /// The user's knowledge base changed (a manual edit on another connection or
+    /// a maintenance pass rewrote entries). Carried from
+    /// `SignalEvent::KnowledgeChanged`; the knowledge browser debounce-refetches.
+    KnowledgeChanged,
 
     // --- Voice input (`You:` dropdown, issue #80) -------------------------
     /// The user changed the per-conversation `You:` (voice input) dropdown in
@@ -394,6 +398,7 @@ impl std::fmt::Debug for UiMessage {
                 .debug_struct("ScratchpadChanged")
                 .field("conversation_id", conversation_id)
                 .finish(),
+            UiMessage::KnowledgeChanged => f.debug_struct("KnowledgeChanged").finish(),
             UiMessage::SetVoiceIn {
                 conversation_id,
                 enabled,
@@ -535,6 +540,7 @@ pub fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
         SignalEvent::ScratchpadChanged { conversation_id } => {
             UiMessage::ScratchpadChanged { conversation_id }
         }
+        SignalEvent::KnowledgeChanged => UiMessage::KnowledgeChanged,
         // Client-local tool execution (#107/#231/#76). The window must ALWAYS
         // resolve this (via `submit_client_tool_result`) or the suspended turn
         // wedges — the previous status-string mapping silently dropped it.

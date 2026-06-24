@@ -1296,6 +1296,10 @@ impl WindowState {
                     vec![]
                 }
             }
+            // The knowledge browser is a self-contained widget with its own
+            // fetch pump (not part of this conversation reducer), so the live
+            // refresh is wired at the window layer. Nothing to do in the reducer.
+            UiMessage::KnowledgeChanged => vec![],
             UiMessage::SetVoiceIn {
                 conversation_id,
                 enabled,
