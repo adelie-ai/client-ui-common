@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_api_model::client::{ChatMessage, ConversationDetail, ConversationSummary};
+use desktop_assistant_api_model::client::{
+    ChatMessage, ConversationDetail, ConversationSummary, MessageKind,
+};
 
 use adele_voice_client_common::AdeleOutput;
 
@@ -41,9 +43,11 @@ struct StreamState {
     /// redundant `conversation_id` of its own; "the stream knows its
     /// conversation" via where it lives.)
     buffer: String,
-    /// Set when a `say_this` aside is *spoken* for this turn; suppresses the
-    /// duplicate full-reply narration at `StreamComplete` so the user doesn't
-    /// hear the turn twice (the spoken aside, then the whole reply read aloud).
+    /// Set when a `say_this` aside is *spoken* for this turn; a defensive
+    /// backstop that suppresses full-reply narration at `StreamComplete` so the
+    /// user can't hear the turn twice. `say_this` speaks only in on-demand mode
+    /// (voice#126), which never auto-narrates, so the two paths are already
+    /// mutually exclusive — this keeps the guarantee if the modes ever change.
     /// Only relevant to gtk-initiated turns (the only ones gtk narrates).
     say_this_spoken_this_turn: bool,
     /// `true` when this turn was NOT initiated by this client — adopted from a
@@ -144,14 +148,15 @@ impl WindowState {
             .unwrap_or_default()
     }
 
-    /// Whether a *reply* is spoken for `conversation` (issue #80): `Adele ==
-    /// Always` OR (`Adele == OnDemand` AND `You == Enabled`). The gate the
-    /// reply-narration path consults — keyed by the *originating*
-    /// conversation (GTK-2); `Disabled` never narrates. Delegates to the shared
-    /// gate (desktop-assistant#274). Part of the shared public API.
+    /// Whether a *reply* is auto-narrated in full for `conversation` (issue
+    /// #80): `Adele == Always` only. `OnDemand` speaks via `say_this` (not
+    /// auto-narration) and `Disabled` never speaks. Decoupled from `You`
+    /// (voice#126) — the `Adele:` level alone governs her output. The gate the
+    /// reply-narration path consults, keyed by the *originating* conversation
+    /// (GTK-2). Delegates to the shared gate (desktop-assistant#274). Part of
+    /// the shared public API.
     pub fn narrate_for(&self, conversation: &str) -> bool {
-        self.adele_output_for(conversation)
-            .narrates_reply(self.voice_in_for(conversation))
+        self.adele_output_for(conversation).narrates_reply()
     }
 
     /// Whether a *reply* is spoken for the *currently active* conversation —
@@ -166,11 +171,12 @@ impl WindowState {
             .unwrap_or(false)
     }
 
-    /// Whether a `say_this` aside is spoken for `conversation` (issue #80):
-    /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`) — keyed
-    /// by the *call's* conversation (GTK-4). `Disabled` downgrades the aside
-    /// to inline text. Delegates to the shared gate (desktop-assistant#274).
-    /// Part of the shared public API.
+    /// Whether a `say_this` aside is spoken aloud for `conversation` (issue
+    /// #80): spoken iff `Adele == OnDemand`, where `say_this` is Adele's sole
+    /// spoken channel (voice#126) — keyed by the *call's* conversation (GTK-4).
+    /// `Always` already narrates every reply and `Disabled` is silent, so both
+    /// downgrade the aside to shown text. Delegates to the shared gate
+    /// (desktop-assistant#274). Part of the shared public API.
     pub fn say_this_spoken_for(&self, conversation: &str) -> bool {
         self.adele_output_for(conversation).speaks_aside()
     }
@@ -567,10 +573,17 @@ pub enum Effect {
     /// cut-off lives in `apply`: when speech is OFF this effect is never
     /// produced, so no path plays audio while the toggle is off.
     Speak(String),
-    /// Render an inline note in the chat transcript (issue #76). Used for the
-    /// `(speech mode disabled) …` downgrade when `say_this` arrives with speech
-    /// OFF, so the text is shown rather than dropped.
-    AddInlineNote(String),
+    /// Append a client-local transcript line the daemon didn't send, tagged
+    /// with explicit presentation metadata so the executor renders the marker
+    /// (a "Spoken" badge, a "(speech mode disabled)" note) from the `kind`
+    /// rather than by parsing `content` (voice#126). Two cases:
+    /// - `MessageKind::Spoken`: a `say_this` Adele voiced (on-demand mode) —
+    ///   shown in the chat alongside the `Speak` effect so the spoken line is
+    ///   also visible.
+    /// - `MessageKind::SpeechDisabled`: a `say_this` that was NOT spoken (the
+    ///   conversation's `Adele:` is Disabled/Always, or the call is for a
+    ///   backgrounded conversation) — shown as a note so the text isn't lost.
+    AddLocalMessage { content: String, kind: MessageKind },
     /// Reflect the active conversation's `Adele:` output level on the input-bar
     /// dropdown (issue #80). Emitted when the model drives the level via
     /// `request_voice` (→ OnDemand) / `stop_voice` (→ Disabled) so the dropdown
@@ -656,7 +669,11 @@ impl std::fmt::Debug for Effect {
             }
             Effect::RefreshSidePaneTasks => f.write_str("RefreshSidePaneTasks"),
             Effect::Speak(t) => f.debug_tuple("Speak").field(t).finish(),
-            Effect::AddInlineNote(t) => f.debug_tuple("AddInlineNote").field(t).finish(),
+            Effect::AddLocalMessage { content, kind } => f
+                .debug_struct("AddLocalMessage")
+                .field("content", content)
+                .field("kind", kind)
+                .finish(),
             Effect::SetAdeleOutputDropdown(l) => {
                 f.debug_tuple("SetAdeleOutputDropdown").field(l).finish()
             }
@@ -892,6 +909,7 @@ impl WindowState {
                         id: String::new(),
                         role: "user".to_string(),
                         content: prompt.clone(),
+                        kind: MessageKind::Normal,
                     });
                 }
                 // The send is committed: drop this conversation's saved composer
@@ -1002,6 +1020,7 @@ impl WindowState {
                             id: String::new(),
                             role: "user".to_string(),
                             content: content.clone(),
+                            kind: MessageKind::Normal,
                         });
                     }
                     return vec![Effect::AddUserMessage(content)];
@@ -1115,16 +1134,16 @@ impl WindowState {
 
                 // Reply narration (issue #80): narrate the finalized reply via
                 // the embedded `Speaker` when the gate holds — `Adele == Always`
-                // OR (`Adele == OnDemand` AND `You == Enabled`). Gated entirely
-                // here so the cut-off holds: when the gate is false no `Speak`
-                // effect exists, so no path plays audio. (The executor
-                // additionally no-ops when there is no embedded engine, e.g. the
-                // daemon path, which narrates its own replies.) Keyed by the
-                // *originating* conversation (GTK-2): a backgrounded turn never
-                // narrates (handled by the early return above) — only an in-view
-                // streaming conversation can. Suppress the full-reply narration
-                // when a `say_this` aside already spoke this turn — otherwise the
-                // user hears it twice (the aside, then the whole reply read aloud).
+                // only now (voice#126: on-demand speaks via say_this, not
+                // auto-narration; decoupled from `You`). Gated entirely here so
+                // the cut-off holds: when the gate is false no `Speak` effect
+                // exists, so no path plays audio. (The executor additionally
+                // no-ops when there is no embedded engine, e.g. the daemon path,
+                // which narrates its own replies.) Keyed by the *originating*
+                // conversation (GTK-2): a backgrounded turn never narrates
+                // (handled by the early return above) — only an in-view streaming
+                // conversation can. `!said_via_tool` is a defensive backstop (see
+                // `say_this_spoken_this_turn`); Always never fires say_this.
                 let narrate = !said_via_tool && !was_external && self.narrate_for(&origin);
 
                 // The streaming conversation is the one in view: finalize it.
@@ -1135,6 +1154,7 @@ impl WindowState {
                         id: String::new(),
                         role: "assistant".to_string(),
                         content: full_response.clone(),
+                        kind: MessageKind::Normal,
                     });
                 }
                 let mut effects = vec![Effect::ClearChatStatus];
@@ -1344,21 +1364,29 @@ impl WindowState {
                 match tool_name.as_str() {
                     "say_this" => match say_this_text(&arguments) {
                         // say_this gate (issue #80, GTK-4): the aside is spoken
-                        // iff `Adele ∈ {OnDemand, Always}` for the *call's*
-                        // conversation AND that conversation is the one in view.
-                        // A backgrounded call's aside is never voiced — it
-                        // downgrades to an inline note so it isn't lost.
+                        // iff `Adele == OnDemand` for the *call's* conversation
+                        // (its sole spoken channel, voice#126) AND that
+                        // conversation is the one in view. A backgrounded call's
+                        // aside is never voiced — it downgrades to a shown note so
+                        // it isn't lost.
                         Some(text) if is_active && self.say_this_spoken_for(&conversation_id) => {
-                            // If this spoken aside belongs to the call's in-flight
-                            // turn, mark *that conversation's* stream so its
-                            // StreamComplete doesn't ALSO read the full reply aloud
-                            // — the model already chose its spoken form (avoids the
-                            // double-speak: aside, then whole reply).
+                            // Belt-and-suspenders against double-speak: mark *that
+                            // conversation's* stream so its StreamComplete won't
+                            // also narrate the full reply. (On-demand never
+                            // auto-narrates, so the gate below is already false —
+                            // this stays correct if the modes ever change.)
                             if let Some(stream) = self.stream_of_mut(&conversation_id) {
                                 stream.say_this_spoken_this_turn = true;
                             }
+                            // Show the spoken line in the transcript too, tagged
+                            // Spoken so the executor can badge it — the user sees
+                            // what Adele said aloud (voice#126).
                             vec![
-                                Effect::Speak(text),
+                                Effect::Speak(text.clone()),
+                                Effect::AddLocalMessage {
+                                    content: text,
+                                    kind: MessageKind::Spoken,
+                                },
                                 Effect::SubmitClientToolResult {
                                     task_id,
                                     tool_call_id,
@@ -1367,12 +1395,18 @@ impl WindowState {
                             ]
                         }
                         Some(text) => {
-                            // Either the call's conversation has speech disabled,
-                            // or it isn't the one in view: show, don't speak. The
-                            // turn still completes; no audio on any path.
-                            let note = format!("(speech mode disabled) {text}");
+                            // Not spoken: the call's conversation is Disabled or
+                            // Always (say_this isn't its spoken channel), or it
+                            // isn't the one in view. Show the text tagged
+                            // SpeechDisabled — the executor adds the "(speech mode
+                            // disabled)" marker; we keep `content` clean so the
+                            // metadata, not a baked-in string, drives rendering.
+                            // The turn still completes; no audio on any path.
                             vec![
-                                Effect::AddInlineNote(note),
+                                Effect::AddLocalMessage {
+                                    content: text,
+                                    kind: MessageKind::SpeechDisabled,
+                                },
                                 Effect::SubmitClientToolResult {
                                     task_id,
                                     tool_call_id,
@@ -1413,8 +1447,9 @@ impl WindowState {
                         effects.push(Effect::SubmitClientToolResult {
                             task_id,
                             tool_call_id,
-                            result: Ok("voice mode on; replies will be read aloud and kept \
-                                 conversational"
+                            result: Ok("voice mode on (on-demand): your written reply is shown as \
+                                 text and not read aloud; speak by calling say_this, kept brief \
+                                 and conversational"
                                 .to_string()),
                         });
                         effects
@@ -1481,6 +1516,7 @@ impl WindowState {
                             id: String::new(),
                             role: "assistant".to_string(),
                             content: full.clone(),
+                            kind: MessageKind::Normal,
                         });
                     }
                     effects.push(Effect::CompleteStreaming(full));
@@ -1623,6 +1659,7 @@ mod tests {
             id: String::new(),
             role: role.to_string(),
             content: content.to_string(),
+            kind: MessageKind::Normal,
         }
     }
 
@@ -3647,9 +3684,9 @@ mod tests {
         );
     }
 
-    /// Default: a `say_this` produces the inline `(speech mode disabled) …`
-    /// downgrade, NO `Speak`, and ALWAYS a `SubmitClientToolResult` (the turn
-    /// completes, can't hang).
+    /// Default: a `say_this` produces the `SpeechDisabled` downgrade line (clean
+    /// content, the marker is the executor's job), NO `Speak`, and ALWAYS a
+    /// `SubmitClientToolResult` (the turn completes, can't hang).
     #[test]
     fn default_say_this_renders_inline_and_resolves_without_audio() {
         let mut state = WindowState {
@@ -3661,10 +3698,12 @@ mod tests {
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
             "Adele Disabled must never produce a Speak effect: {effects:?}"
         );
-        let inline = effects.iter().any(
-            |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) the aside"),
-        );
-        assert!(inline, "expected the inline downgrade note: {effects:?}");
+        let inline = effects.iter().any(|e| matches!(
+            e,
+            Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
+                if content == "the aside"
+        ));
+        assert!(inline, "expected the SpeechDisabled downgrade line: {effects:?}");
         let resolved = effects.iter().any(|e| {
             matches!(
                 e,
@@ -3866,39 +3905,42 @@ mod tests {
         );
     }
 
-    /// Adele=Always: a `say_this` aside is spoken (Adele ∈ {OnDemand, Always}).
+    /// Adele=Always: a `say_this` aside is NOT separately spoken (voice#126 —
+    /// Always already narrates the whole reply; say_this is on-demand's channel).
+    /// It downgrades to a shown SpeechDisabled line so nothing is lost.
     #[test]
-    fn adele_always_speaks_say_this_aside() {
+    fn adele_always_does_not_speak_say_this_aside() {
         let mut state = state_with(false, AdeleOutput::Always);
         let effects = state.apply(say_this_call("c1", "hello aloud"));
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Speak(t) if t == "hello aloud")),
-            "Always must speak a say_this aside: {effects:?}"
-        );
-        assert!(
-            !effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddInlineNote(_))),
-            "no inline downgrade when spoken: {effects:?}"
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "Always must not separately speak a say_this aside: {effects:?}"
         );
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::SubmitClientToolResult { result: Ok(r), .. } if r == "spoken"
+                Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
+                    if content == "hello aloud"
             )),
-            "result must be \"spoken\": {effects:?}"
+            "the aside downgrades to a shown line: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { result: Ok(_), .. }
+            )),
+            "still resolves a result: {effects:?}"
         );
     }
 
-    /// Double-speak fix: when a `say_this` aside is spoken for the in-flight
-    /// turn, the `StreamComplete` reply narration is suppressed — the user hears
-    /// the aside once, not the aside AND the whole reply read aloud after.
+    /// No double-speak: in on-demand mode the model voices an aside via
+    /// `say_this`, and the `StreamComplete` reply narration stays silent — the
+    /// user hears the aside once, not the aside AND the whole reply read aloud.
+    /// (On-demand never auto-narrates, so suppression is automatic; the
+    /// `say_this_spoken_this_turn` backstop covers a future mode change.)
     #[test]
     fn say_this_aside_suppresses_duplicate_reply_narration() {
-        // Always (and OnDemand+You) would otherwise narrate every reply.
-        let mut state = state_with(true, AdeleOutput::Always);
+        let mut state = state_with(false, AdeleOutput::OnDemand);
         // Simulate an in-flight turn for the open conversation.
         state.open.entry("c1".to_string()).or_default().stream = Some(StreamState {
             request_id: Some("req".to_string()),
@@ -3915,14 +3957,14 @@ mod tests {
             "the say_this aside should be spoken: {aside:?}"
         );
 
-        // The turn completes: the full reply must NOT be read aloud again.
+        // The turn completes: the full reply must NOT be read aloud.
         let done = state.apply(UiMessage::StreamComplete {
             request_id: "req".to_string(),
             full_response: "the spoken answer, in more words".to_string(),
         });
         assert!(
             !done.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "no second narration after a spoken aside (double-speak): {done:?}"
+            "on-demand must not narrate the full reply (double-speak): {done:?}"
         );
         assert!(
             done.iter()
@@ -3931,61 +3973,61 @@ mod tests {
         );
     }
 
-    /// Adele=OnDemand + You=Enabled: the reply is spoken (the gate's OnDemand
-    /// arm) and finalized.
+    /// Adele=OnDemand never auto-narrates the reply — its spoken channel is
+    /// `say_this` (voice#126). Decoupled from `You`: neither value narrates.
+    /// The reply text is still finalized.
     #[test]
-    fn adele_on_demand_with_you_enabled_speaks_reply() {
-        let mut state = state_with(true, AdeleOutput::OnDemand);
-        assert!(
-            state.narrate_for_current(),
-            "OnDemand + You=Enabled narrates"
-        );
-        let effects = stream_complete_in(&mut state, "an answer");
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
-            "OnDemand + You=Enabled must speak the reply: {effects:?}"
-        );
+    fn adele_on_demand_does_not_auto_narrate_reply() {
+        for voice_in in [false, true] {
+            let mut state = state_with(voice_in, AdeleOutput::OnDemand);
+            assert!(
+                !state.narrate_for_current(),
+                "OnDemand must not auto-narrate (You={voice_in})"
+            );
+            let effects = stream_complete_in(&mut state, "an answer");
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+                "OnDemand must not speak the reply (You={voice_in}): {effects:?}"
+            );
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
+                "the reply text must still be finalized (You={voice_in}): {effects:?}"
+            );
+        }
     }
 
-    /// Adele=OnDemand + You=Disabled: the reply is NOT spoken (text-only), but a
-    /// `say_this` aside still speaks (asides ignore You).
+    /// Adele=OnDemand: a `say_this` aside speaks (its sole spoken channel) and
+    /// also shows in the transcript tagged `Spoken` (voice#126). Independent of
+    /// `You`.
     #[test]
-    fn adele_on_demand_with_you_disabled_text_only_but_say_this_speaks() {
-        // Reply NOT narrated.
-        let mut state = state_with(false, AdeleOutput::OnDemand);
-        assert!(
-            !state.narrate_for_current(),
-            "OnDemand + You=Disabled must not narrate replies"
-        );
-        let effects = stream_complete_in(&mut state, "an answer");
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "OnDemand + You=Disabled must not speak the reply: {effects:?}"
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
-            "the reply text must still be finalized: {effects:?}"
-        );
-
-        // say_this aside STILL speaks (independent of You).
-        let mut state = state_with(false, AdeleOutput::OnDemand);
-        let effects = state.apply(say_this_call("c1", "an aside"));
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Speak(t) if t == "an aside")),
-            "OnDemand say_this aside must speak even when You=Disabled: {effects:?}"
-        );
-        assert!(
-            !effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddInlineNote(_))),
-            "no inline downgrade when spoken: {effects:?}"
-        );
+    fn adele_on_demand_say_this_speaks_and_shows_spoken() {
+        for voice_in in [false, true] {
+            let mut state = state_with(voice_in, AdeleOutput::OnDemand);
+            let effects = state.apply(say_this_call("c1", "an aside"));
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Speak(t) if t == "an aside")),
+                "OnDemand say_this must speak (You={voice_in}): {effects:?}"
+            );
+            assert!(
+                effects.iter().any(|e| matches!(
+                    e,
+                    Effect::AddLocalMessage { content, kind: MessageKind::Spoken }
+                        if content == "an aside"
+                )),
+                "the spoken line must show tagged Spoken (You={voice_in}): {effects:?}"
+            );
+            assert!(
+                !effects.iter().any(|e| matches!(
+                    e,
+                    Effect::AddLocalMessage { kind: MessageKind::SpeechDisabled, .. }
+                )),
+                "no SpeechDisabled downgrade when spoken (You={voice_in}): {effects:?}"
+            );
+        }
     }
 
     // --- GTK-3: the AdeleOutput gate is the ONLY narration path -----------
@@ -4016,12 +4058,12 @@ mod tests {
         );
     }
 
-    /// GTK-3 acceptance: a dictated turn whose conversation narrates (`Adele ==
-    /// OnDemand` AND `You == Enabled`) produces EXACTLY ONE `Speak` effect — the
-    /// reducer is the single narration source, so there is no double-speak.
+    /// GTK-3 acceptance: a turn whose conversation narrates (`Adele == Always`)
+    /// produces EXACTLY ONE `Speak` effect — the reducer is the single narration
+    /// source, so there is no double-speak.
     #[test]
     fn narrating_conversation_dictated_turn_emits_exactly_one_speak() {
-        let mut state = state_with(true, AdeleOutput::OnDemand);
+        let mut state = state_with(false, AdeleOutput::Always);
         let effects = stream_complete_in(&mut state, "spoken once");
         let speaks = effects
             .iter()
@@ -4255,17 +4297,20 @@ mod tests {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
-        // The call's conversation has speech wide open — but it isn't in view.
-        state.open.entry("c2".to_string()).or_default().adele_output = AdeleOutput::Always;
+        // The call's conversation is on-demand (its own spoken channel) — but it
+        // isn't in view, so the aside still can't play here.
+        state.open.entry("c2".to_string()).or_default().adele_output = AdeleOutput::OnDemand;
         let effects = state.apply(say_this_call("c2", "background aside"));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
             "a background conversation's say_this must never play audio: {effects:?}"
         );
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddInlineNote(t) if t.contains("background aside"))),
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
+                    if content.contains("background aside")
+            )),
             "the aside must be shown as text instead: {effects:?}"
         );
         let results = effects
@@ -4280,16 +4325,17 @@ mod tests {
     /// conversation and played the foreign aside under it.
     #[test]
     fn background_say_this_does_not_borrow_active_conversations_gate() {
-        let mut state = state_with(true, AdeleOutput::Always); // active c1, gate open
+        let mut state = state_with(false, AdeleOutput::OnDemand); // active c1, gate open
         let effects = state.apply(say_this_call("c2", "should not play"));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
             "c2's aside must not play under c1's gate: {effects:?}"
         );
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddInlineNote(_))),
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::AddLocalMessage { kind: MessageKind::SpeechDisabled, .. }
+            )),
             "the aside downgrades to text: {effects:?}"
         );
     }
@@ -4303,17 +4349,19 @@ mod tests {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
-        state.open.entry("c9".to_string()).or_default().adele_output = AdeleOutput::Always; // unrelated
+        state.open.entry("c9".to_string()).or_default().adele_output = AdeleOutput::OnDemand; // unrelated
         let effects = state.apply(say_this_call("c1", "quiet aside"));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
             "c1 is Disabled; no audio: {effects:?}"
         );
         assert!(
-            effects.iter().any(
-                |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) quiet aside")
-            ),
-            "expected the inline downgrade note: {effects:?}"
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
+                    if content == "quiet aside"
+            )),
+            "expected the SpeechDisabled downgrade line: {effects:?}"
         );
     }
 
@@ -4422,7 +4470,10 @@ mod tests {
         );
         for refinement in [ON_DEMAND_SYSTEM_REFINEMENT, ALWAYS_SYSTEM_REFINEMENT] {
             assert!(!refinement.trim().is_empty());
-            for marker in ['*', '_', '`', '#'] {
+            // No `_` here: the on-demand refinement names the `say_this` tool,
+            // whose identifier legitimately contains an underscore. The real
+            // formatting risks are emphasis/code/heading markers.
+            for marker in ['*', '`', '#'] {
                 assert!(
                     !refinement.contains(marker),
                     "the refinement itself must avoid markdown markers ({marker})"
