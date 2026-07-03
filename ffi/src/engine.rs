@@ -26,6 +26,10 @@ use client_ui_common::{
     signal_to_ui_message, voice_mode_client_tools,
 };
 use desktop_assistant_api_model as api;
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, McpHost, default_client_mcp_path, dispatch_client_tool_call,
+    merge_registrations,
+};
 use desktop_assistant_client_common::{
     AssistantClient, ConnectionConfig, Connector, TransportMode,
 };
@@ -139,6 +143,11 @@ enum CoreMsg {
     Ui(Box<UiMessage>),
     /// The connect task hands the live connector to the actor to own.
     InstallConnector(Arc<Connector>),
+    /// The connect task hands the freshly-started client-side MCP host to the
+    /// actor to own (issue #464). Sent right after `InstallConnector` and before
+    /// the signal pump starts, so any `ClientToolCall` the pump forwards finds
+    /// the host already installed.
+    InstallMcpHost(Arc<McpHost>),
     /// The connect task failed before producing a connector.
     ConnectFailed(String),
 }
@@ -163,6 +172,12 @@ fn parse_effort(s: &str) -> Option<api::EffortLevel> {
 struct Engine {
     state: WindowState,
     connector: Option<Arc<Connector>>,
+    /// Client-side MCP host (issue #464): local MCP servers whose tools are
+    /// advertised to the daemon as client-side tools and invoked here on a
+    /// `ClientToolCall`. `None` until a connection starts one (only when the
+    /// `kde` surface has servers configured); replaced on each connect and shut
+    /// down on disconnect.
+    mcp_host: Option<Arc<McpHost>>,
     self_tx: mpsc::UnboundedSender<CoreMsg>,
     sink: ViewSink,
     /// Per-message model override staged by `SelectModel`, applied on the next
@@ -177,6 +192,11 @@ impl Engine {
                 CoreMsg::Intent(intent) => self.handle_intent(intent),
                 CoreMsg::Ui(boxed) => self.dispatch(*boxed),
                 CoreMsg::InstallConnector(conn) => self.connector = Some(conn),
+                CoreMsg::InstallMcpHost(host) => {
+                    // Shut down any prior host before adopting the new one.
+                    self.shutdown_mcp_host();
+                    self.mcp_host = Some(host);
+                }
                 CoreMsg::ConnectFailed(err) => {
                     self.sink.emit(&ViewEvent::ConnectError {
                         message: err.clone(),
@@ -192,6 +212,49 @@ impl Engine {
 
     /// Apply a reducer message and run the resulting effects.
     fn dispatch(&mut self, msg: UiMessage) {
+        // Client-hosted MCP tools (issue #464). A `ClientToolCall` the local MCP
+        // host serves is run off the actor loop and its result submitted via the
+        // connector (the bridge's host path), skipping the reducer entirely — the
+        // reducer only knows the built-in voice tools (`say_this` / `request_voice`
+        // / `stop_voice`). Any tool the host does NOT serve (or when there is no
+        // host / no connector) falls through to the reducer unchanged, so the
+        // built-in tools still resolve. Host tools take precedence at dispatch,
+        // matching `dispatch_client_tool_call` (and the tui/gtk wiring); the
+        // namespaced host names never collide with the built-ins in practice.
+        if let UiMessage::ClientToolCall { tool_name, .. } = &msg
+            && let (Some(host), Some(conn)) = (&self.mcp_host, &self.connector)
+            && host.handles(tool_name)
+        {
+            let host = Arc::clone(host);
+            let conn = Arc::clone(conn);
+            // Re-destructure by value now that we've decided to serve it; the
+            // outer borrow of `msg` (via `tool_name`) has ended by its last use
+            // above, so moving `msg` here is allowed.
+            if let UiMessage::ClientToolCall {
+                task_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+                ..
+            } = msg
+            {
+                tokio::spawn(async move {
+                    // `dispatch_client_tool_call` always submits — even on error —
+                    // so the daemon's parked turn resumes instead of timing out.
+                    dispatch_client_tool_call(
+                        &host,
+                        &*conn,
+                        &task_id,
+                        &tool_call_id,
+                        &tool_name,
+                        arguments,
+                    )
+                    .await;
+                });
+            }
+            return;
+        }
+
         // Surface an explicit connection-up event in addition to the reducer's
         // own status/sensitivity effects, so the C++ side has a clean signal.
         if let UiMessage::Connected { label } = &msg {
@@ -275,12 +338,38 @@ impl Engine {
         // `ClearClient` both mutates actor state and notifies the view.
         if matches!(effect, Effect::ClearClient) {
             self.connector = None;
+            // Tear down the client MCP host with the connection (issue #464): its
+            // tools were advertised over this connection, and a later reconnect
+            // (re-driven by KDE's D-Bus service watcher) starts a fresh one.
+            self.shutdown_mcp_host();
             self.sink.emit(&ViewEvent::ClientCleared);
             return;
         }
         match ViewEvent::try_from_view_effect(effect) {
             Ok(ev) => self.sink.emit(&ev),
             Err(rpc) => self.run_rpc_effect(*rpc),
+        }
+    }
+
+    /// Take and shut down the current client MCP host, if any (issue #464). Runs
+    /// off the actor loop because the graceful shutdown kills each server child
+    /// asynchronously. If an in-flight tool call still holds a handle, the sole
+    /// owner isn't available for the graceful `shutdown(self)`; dropping the
+    /// `Arc` there (and when that call finishes) still tears the children down —
+    /// `McpClient` kills its child on drop — so the servers never leak.
+    fn shutdown_mcp_host(&mut self) {
+        if let Some(host) = self.mcp_host.take() {
+            tokio::spawn(async move {
+                match Arc::try_unwrap(host) {
+                    Ok(host) => host.shutdown().await,
+                    Err(_still_shared) => {
+                        tracing::debug!(
+                            "client MCP host still in use by an in-flight tool call; \
+                             children will be reaped on drop"
+                        );
+                    }
+                }
+            });
         }
     }
 
@@ -357,9 +446,31 @@ impl Engine {
                     let label = conn.label().to_string();
                     // Install in the actor FIRST so later effects find it.
                     let _ = tx.send(CoreMsg::InstallConnector(Arc::clone(&conn)));
+                    // Start the client-side MCP host (issue #464) for the `kde`
+                    // surface: run the locally-configured MCP servers on the edge
+                    // and hold their tools to advertise (below) + route calls to.
+                    // Selection comes from the shared, per-machine
+                    // `~/.config/adele/client-mcp.toml`; an absent/empty config
+                    // yields no host, degrading cleanly. Install it in the actor
+                    // BEFORE the signal pump starts so a `ClientToolCall` always
+                    // finds the host already in place (the channel is FIFO).
+                    let mcp_servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
+                        .resolved_servers("kde")
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    let mcp_host = if mcp_servers.is_empty() {
+                        None
+                    } else {
+                        let host = Arc::new(McpHost::start(&mcp_servers).await);
+                        let _ = tx.send(CoreMsg::InstallMcpHost(Arc::clone(&host)));
+                        Some(host)
+                    };
                     // Pump signals -> messages. Holds only the receiver (never the
                     // Arc<Connector>), so dropping the actor's connector tears the
-                    // connection down cleanly.
+                    // connection down cleanly. A `ClientToolCall` is served by the
+                    // MCP host in the actor's `dispatch` (which owns the host +
+                    // connector), so the pump stays a pure signal->message map.
                     {
                         let mut rx = conn.subscribe();
                         let tx2 = tx.clone();
@@ -402,10 +513,25 @@ impl Engine {
                             let _ = tx.send(ui(UiMessage::TasksLoaded(tasks)));
                         }
                     }
-                    // Advertise voice-mode client tools (best-effort; the daemon
-                    // replaces its set per call, so send on every connect).
-                    if let Err(e) = conn.register_client_tools(voice_mode_client_tools()).await {
-                        tracing::debug!("voice-mode client tools not registered: {e}");
+                    // Advertise this client's tools (best-effort; the daemon
+                    // replaces its set per call, so send on every connect): the
+                    // built-in voice-mode tools merged with the client-hosted MCP
+                    // tools (issue #464), built-ins winning any name clash. This
+                    // works over KDE's D-Bus transport — the daemon bridges client
+                    // tools over D-Bus (desktop-assistant#320), so `as_commands()`
+                    // is `Some` there and the registration is accepted.
+                    let host_tools = mcp_host
+                        .as_ref()
+                        .map(|host| host.registrations())
+                        .unwrap_or_default();
+                    if let Err(e) = conn
+                        .register_client_tools(merge_registrations(
+                            voice_mode_client_tools(),
+                            host_tools,
+                        ))
+                        .await
+                    {
+                        tracing::debug!("client tools not registered: {e}");
                     }
                     let _ = tx.send(ui(UiMessage::Connected { label }));
                 }
@@ -690,6 +816,7 @@ impl Core {
         let engine = Engine {
             state: WindowState::default(),
             connector: None,
+            mcp_host: None,
             self_tx: tx.clone(),
             sink,
             staged_override: None,
@@ -704,5 +831,124 @@ impl Core {
     /// Queue a controller intent for the actor.
     pub fn send_intent(&self, intent: Intent) {
         let _ = self.tx.send(CoreMsg::Intent(intent));
+    }
+}
+
+#[cfg(test)]
+mod mcp_host_tests {
+    //! Cover the engine-specific client-MCP-host wiring (issue #464): the `kde`
+    //! surface selection and the exact tool set the engine advertises. The host
+    //! orchestration + the `dispatch_client_tool_call` bridge are unit-tested in
+    //! `client-common::mcp_host`; here we lock in the choices `spawn_connect` and
+    //! `dispatch` make on top of them (surface name, voice+host merge, routing
+    //! predicate) — the bits that would silently regress if reworded.
+    use super::*;
+
+    /// Minimal `/bin/sh` fake MCP server (one `echo` tool), mirroring the
+    /// `mcp_host` unit tests: answers `initialize`, lists a single tool, and
+    /// replies to `tools/call`. Enough for the host to namespace a tool so we can
+    /// assert the advertise/route wiring.
+    const FAKE_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf %s "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"f","version":"0"}}}\n' "$id" ;;
+    *'"method":"notifications/initialized"'*) : ;;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    fn names(regs: &[api::ClientToolRegistration]) -> std::collections::HashSet<&str> {
+        regs.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// The engine resolves the `kde` surface from `client-mcp.toml`; a server
+    /// enabled under `[surfaces.kde]` is hosted on the KDE client.
+    #[test]
+    fn kde_surface_resolves_configured_servers() {
+        let cfg = ClientMcpConfig::from_toml(
+            r#"
+[[servers]]
+name = "filesystem"
+command = "fileio-mcp"
+namespace = "fs"
+[surfaces.kde]
+enabled = ["filesystem"]
+"#,
+        )
+        .unwrap();
+        let resolved: Vec<&str> = cfg
+            .resolved_servers("kde")
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(resolved, vec!["filesystem"]);
+    }
+
+    /// A box that configures only `[surfaces.default]` still hosts it on KDE:
+    /// `kde` has no entry of its own, so it inherits the default set.
+    #[test]
+    fn kde_surface_falls_back_to_default() {
+        let cfg = ClientMcpConfig::from_toml(
+            r#"
+[[servers]]
+name = "git"
+command = "git-mcp"
+namespace = "git"
+[surfaces.default]
+enabled = ["git"]
+"#,
+        )
+        .unwrap();
+        let resolved: Vec<&str> = cfg
+            .resolved_servers("kde")
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(resolved, vec!["git"]);
+    }
+
+    /// The full advertise chain `spawn_connect` runs: resolve the `kde` surface,
+    /// start the host, and merge its tools with the built-in voice tools into the
+    /// single set handed to `register_client_tools`. The routing predicate the
+    /// actor's `dispatch` uses (`host.handles`) must claim the hosted tool and
+    /// disown the built-ins, so each is served by the right path.
+    #[tokio::test]
+    async fn advertised_set_merges_voice_and_host_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.sh");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+
+        let cfg = ClientMcpConfig::from_toml(&format!(
+            r#"
+[[servers]]
+name = "fake"
+command = "/bin/sh"
+args = ["{}"]
+namespace = "ns"
+[surfaces.kde]
+enabled = ["fake"]
+"#,
+            script.display()
+        ))
+        .unwrap();
+        let servers: Vec<_> = cfg.resolved_servers("kde").into_iter().cloned().collect();
+        let host = McpHost::start(&servers).await;
+
+        // Exactly the set spawn_connect advertises to the daemon.
+        let advertised = merge_registrations(voice_mode_client_tools(), host.registrations());
+        let advertised = names(&advertised);
+        assert!(advertised.contains("request_voice"), "built-in voice tool");
+        assert!(advertised.contains("stop_voice"), "built-in voice tool");
+        assert!(advertised.contains("ns__echo"), "client-hosted MCP tool");
+
+        // dispatch's routing gate: host tools go to the host, built-ins fall
+        // through to the reducer.
+        assert!(host.handles("ns__echo"));
+        assert!(!host.handles("request_voice"));
+
+        host.shutdown().await;
     }
 }
