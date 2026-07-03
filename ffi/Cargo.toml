@@ -32,8 +32,13 @@ desktop-assistant-api-model = { path = "../../desktop-assistant/crates/api-model
 
 # The actual transport. Default features keep the `dbus` transport on — KDE's
 # canonical path is `TransportMode::Dbus` (the org.desktopAssistant bridge); UDS
-# and WS are also reachable through the same `Connector`.
-desktop-assistant-client-common = { path = "../../desktop-assistant/crates/client-common" }
+# and WS are also reachable through the same `Connector`. `mcp-host` adds the
+# client-side MCP host (run local MCP servers on the edge, advertise their tools
+# to the daemon as client-side tools). It pulls the stdio MCP client + toml but
+# — since desktop-assistant#475 — NOT the HTTP/reqwest transport.
+desktop-assistant-client-common = { path = "../../desktop-assistant/crates/client-common", features = [
+    "mcp-host",
+] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }
@@ -45,3 +50,6 @@ cbindgen = "0.29"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }
+# The client-MCP-host wiring tests spin up a `/bin/sh` fake MCP server from a
+# temp dir (mirroring the `mcp_host` unit tests).
+tempfile = "3"
