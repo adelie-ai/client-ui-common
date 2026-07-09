@@ -134,6 +134,18 @@ void adele_core_cancel_task(Core *core, const char *task_id);
  */
 void adele_core_fetch_task_logs(Core *core, const char *task_id);
 
+/*
+ Stage an explicit WebSocket bearer token for the next [`adele_core_connect`]
+ (empty ⇒ clear). Used verbatim as the WS bearer credential, bypassing the
+ D-Bus / `/login` token minting — the path a client with no local token minter
+ (e.g. macOS, which has no D-Bus bridge) uses after obtaining a token
+ out-of-band from the daemon's `/login`. Ignored for non-WS transports.
+
+ # Safety
+ `core` must be a live handle; `jwt` must be null or a valid C string.
+ */
+void adele_core_set_ws_jwt(Core *core, const char *jwt);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

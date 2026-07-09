@@ -132,6 +132,11 @@ pub enum Intent {
     CancelTask(String),
     /// Fetch a background task's log page (delivered as a `TaskLogs` view event).
     FetchTaskLogs(String),
+    /// Stage (or clear) an explicit WebSocket bearer token for the next connect.
+    /// Empty ⇒ clear (fall back to the connector's own token minting). Lets a
+    /// client with no local D-Bus token minter (e.g. macOS) supply a token it
+    /// obtained out-of-band from the daemon's `/login`.
+    SetWsJwt(String),
 }
 
 /// The actor's single input channel.
@@ -183,6 +188,9 @@ struct Engine {
     /// Per-message model override staged by `SelectModel`, applied on the next
     /// send. `None` ⇒ inherit the conversation / interactive-purpose default.
     staged_override: Option<api::SendPromptOverride>,
+    /// Explicit WS bearer token staged by `SetWsJwt`, applied to the next WS
+    /// connect. `None` ⇒ let the connector mint one (D-Bus / `/login`).
+    ws_jwt: Option<String>,
 }
 
 impl Engine {
@@ -295,6 +303,7 @@ impl Engine {
             } => self.set_model_override(connection_id, model_id, effort),
             Intent::CancelTask(id) => self.spawn_cancel_task(id),
             Intent::FetchTaskLogs(id) => self.spawn_fetch_task_logs(id),
+            Intent::SetWsJwt(jwt) => self.ws_jwt = (!jwt.is_empty()).then_some(jwt),
         }
     }
 
@@ -428,6 +437,7 @@ impl Engine {
 
     fn spawn_connect(&self, mode: TransportMode, address: String) {
         let tx = self.self_tx.clone();
+        let ws_jwt = self.ws_jwt.clone();
         tokio::spawn(async move {
             let mut config = ConnectionConfig {
                 transport_mode: mode,
@@ -439,6 +449,12 @@ impl Engine {
                 }
                 TransportMode::Ws if !address.is_empty() => config.ws_url = address,
                 _ => {}
+            }
+            // An explicitly staged token short-circuits `resolve_ws_bearer_token`
+            // (no D-Bus / `/login` round-trip) — the macOS path, where the token
+            // was fetched out-of-band.
+            if matches!(mode, TransportMode::Ws) && ws_jwt.is_some() {
+                config.ws_jwt = ws_jwt;
             }
             match Connector::connect(&config).await {
                 Ok(conn) => {
@@ -820,6 +836,7 @@ impl Core {
             self_tx: tx.clone(),
             sink,
             staged_override: None,
+            ws_jwt: None,
         };
         runtime.spawn(engine.run(rx));
         Self {

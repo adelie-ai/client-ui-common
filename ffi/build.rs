@@ -18,15 +18,28 @@ fn main() {
     println!("cargo:rerun-if-changed=src/view_event.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
-    // Give the cdylib a SONAME. Without it, a C/C++ consumer that links the
-    // produced `libadele_client_core.so` by path (e.g. adele-kde's
-    // `libadelecore.so` QML plugin) records the absolute build-tree path as its
-    // `DT_NEEDED`, so the installed plugin only resolves the core while this
-    // build tree exists. With a SONAME, the consumer records the bare name and
-    // its `$ORIGIN` RPATH resolves the co-installed copy — a self-contained,
-    // build-tree-independent install. `rustc-cdylib-link-arg` applies to the
-    // cdylib link only (ignored for the rlib).
-    println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libadele_client_core.so");
+    // Give the cdylib a stable install identity so a consumer that links it by
+    // path records a build-tree-independent name and resolves the co-installed
+    // copy via its own RPATH. The linker option is platform-specific:
+    //
+    // - ELF (Linux/BSD): a SONAME. Without it, a C/C++ consumer (e.g. adele-kde's
+    //   `libadelecore.so` QML plugin) records the absolute build-tree path as its
+    //   `DT_NEEDED`, so the installed plugin only resolves the core while this
+    //   build tree exists. With a SONAME it records the bare name and its
+    //   `$ORIGIN` RPATH resolves the co-installed copy.
+    // - Mach-O (macOS/iOS): the analog is the dylib `install_name`. Apple's `ld`
+    //   rejects `-soname` outright, so an `@rpath`-relative install_name is both
+    //   what makes the link succeed and what lets a Swift/ObjC consumer resolve
+    //   the core from an `@loader_path`/`@executable_path` RPATH at runtime.
+    //
+    // `rustc-cdylib-link-arg` applies to the cdylib link only (ignored for the rlib).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os.as_str() {
+        "macos" | "ios" => println!(
+            "cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libadele_client_core.dylib"
+        ),
+        _ => println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libadele_client_core.so"),
+    }
 
     let config = cbindgen::Config::from_file(crate_dir.join("cbindgen.toml")).unwrap_or_default();
 
