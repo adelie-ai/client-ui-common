@@ -281,3 +281,28 @@ pub unsafe extern "C" fn adele_core_set_ws_jwt(core: *mut Core, jwt: *const c_ch
     };
     core.send_intent(Intent::SetWsJwt(unsafe { cstr_to_string(jwt) }));
 }
+
+/// Send an arbitrary management command (an `api::Command` serialized as JSON)
+/// over the connector. The `CommandResult` is delivered later as a
+/// `command_result` view event carrying the same `request_id`, so the caller can
+/// correlate the reply. This is the generic settings/management channel
+/// (connections, purposes, knowledge base) beyond the typed chat intents.
+///
+/// # Safety
+/// `core` must be a live handle; `request_id`/`command_json` must be null or
+/// valid C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_send_command(
+    core: *mut Core,
+    request_id: *const c_char,
+    command_json: *const c_char,
+) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::SendCommand {
+        request_id: unsafe { cstr_to_string(request_id) },
+        command_json: unsafe { cstr_to_string(command_json) },
+    });
+}
