@@ -146,6 +146,19 @@ void adele_core_fetch_task_logs(Core *core, const char *task_id);
  */
 void adele_core_set_ws_jwt(Core *core, const char *jwt);
 
+/*
+ Send an arbitrary management command (an `api::Command` serialized as JSON)
+ over the connector. The `CommandResult` is delivered later as a
+ `command_result` view event carrying the same `request_id`, so the caller can
+ correlate the reply. This is the generic settings/management channel
+ (connections, purposes, knowledge base) beyond the typed chat intents.
+
+ # Safety
+ `core` must be a live handle; `request_id`/`command_json` must be null or
+ valid C strings.
+ */
+void adele_core_send_command(Core *core, const char *request_id, const char *command_json);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
