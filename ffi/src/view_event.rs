@@ -143,6 +143,19 @@ pub enum ViewEvent {
     Connected { label: String },
     /// A connection attempt failed (executor-emitted).
     ConnectError { message: String },
+    /// Result of a client-issued management command (`adele_core_send_command`),
+    /// correlated by `request_id`. Executor-emitted (not from an `Effect`).
+    /// `result` carries the `CommandResult` as JSON on success; `error` is set on
+    /// failure. This is the generic management channel (connections, purposes,
+    /// knowledge base) the reducer's typed effects don't cover.
+    CommandResult {
+        request_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// The connector was torn down — `Effect::ClearClient` (disconnect).
     ClientCleared,
     /// Bottom status-bar text.

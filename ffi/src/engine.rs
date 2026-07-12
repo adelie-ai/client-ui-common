@@ -132,6 +132,19 @@ pub enum Intent {
     CancelTask(String),
     /// Fetch a background task's log page (delivered as a `TaskLogs` view event).
     FetchTaskLogs(String),
+    /// Stage (or clear) an explicit WebSocket bearer token for the next connect.
+    /// Empty ⇒ clear (fall back to the connector's own token minting). Lets a
+    /// client with no local D-Bus token minter (e.g. macOS) supply a token it
+    /// obtained out-of-band from the daemon's `/login`.
+    SetWsJwt(String),
+    /// Send an arbitrary management `api::Command` (serialized as JSON) over the
+    /// connector; the `CommandResult` comes back as a `command_result` view event
+    /// keyed by `request_id`. The generic channel for settings/management
+    /// (connections, purposes, knowledge base) the typed effects don't cover.
+    SendCommand {
+        request_id: String,
+        command_json: String,
+    },
 }
 
 /// The actor's single input channel.
@@ -183,6 +196,9 @@ struct Engine {
     /// Per-message model override staged by `SelectModel`, applied on the next
     /// send. `None` ⇒ inherit the conversation / interactive-purpose default.
     staged_override: Option<api::SendPromptOverride>,
+    /// Explicit WS bearer token staged by `SetWsJwt`, applied to the next WS
+    /// connect. `None` ⇒ let the connector mint one (D-Bus / `/login`).
+    ws_jwt: Option<String>,
 }
 
 impl Engine {
@@ -295,7 +311,45 @@ impl Engine {
             } => self.set_model_override(connection_id, model_id, effort),
             Intent::CancelTask(id) => self.spawn_cancel_task(id),
             Intent::FetchTaskLogs(id) => self.spawn_fetch_task_logs(id),
+            Intent::SetWsJwt(jwt) => self.ws_jwt = (!jwt.is_empty()).then_some(jwt),
+            Intent::SendCommand {
+                request_id,
+                command_json,
+            } => self.spawn_send_command(request_id, command_json),
         }
+    }
+
+    /// Send an arbitrary management command over the connector and emit its
+    /// `CommandResult` (or an error) as a `command_result` view event keyed by
+    /// `request_id`. The C side correlates the reply to its awaiting caller.
+    fn spawn_send_command(&self, request_id: String, command_json: String) {
+        let sink = self.sink;
+        let connector = self.connector.clone();
+        tokio::spawn(async move {
+            let (ok, result, error) = match connector {
+                None => (false, None, Some("not connected".to_string())),
+                Some(conn) => match serde_json::from_str::<api::Command>(&command_json) {
+                    Err(e) => (false, None, Some(format!("invalid command json: {e}"))),
+                    Ok(command) => match conn.client().as_commands() {
+                        None => (
+                            false,
+                            None,
+                            Some("command channel unavailable on this transport".to_string()),
+                        ),
+                        Some(cmds) => match cmds.send_command(command).await {
+                            Ok(res) => (true, serde_json::to_value(&res).ok(), None),
+                            Err(e) => (false, None, Some(format!("{e}"))),
+                        },
+                    },
+                },
+            };
+            sink.emit(&ViewEvent::CommandResult {
+                request_id,
+                ok,
+                result,
+                error,
+            });
+        });
     }
 
     /// Stage (or clear) the per-message model override applied to the next send.
@@ -428,6 +482,7 @@ impl Engine {
 
     fn spawn_connect(&self, mode: TransportMode, address: String) {
         let tx = self.self_tx.clone();
+        let ws_jwt = self.ws_jwt.clone();
         tokio::spawn(async move {
             let mut config = ConnectionConfig {
                 transport_mode: mode,
@@ -439,6 +494,12 @@ impl Engine {
                 }
                 TransportMode::Ws if !address.is_empty() => config.ws_url = address,
                 _ => {}
+            }
+            // An explicitly staged token short-circuits `resolve_ws_bearer_token`
+            // (no D-Bus / `/login` round-trip) — the macOS path, where the token
+            // was fetched out-of-band.
+            if matches!(mode, TransportMode::Ws) && ws_jwt.is_some() {
+                config.ws_jwt = ws_jwt;
             }
             match Connector::connect(&config).await {
                 Ok(conn) => {
@@ -820,6 +881,7 @@ impl Core {
             self_tx: tx.clone(),
             sink,
             staged_override: None,
+            ws_jwt: None,
         };
         runtime.spawn(engine.run(rx));
         Self {

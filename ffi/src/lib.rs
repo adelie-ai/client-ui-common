@@ -264,3 +264,45 @@ pub unsafe extern "C" fn adele_core_fetch_task_logs(core: *mut Core, task_id: *c
     };
     core.send_intent(Intent::FetchTaskLogs(unsafe { cstr_to_string(task_id) }));
 }
+
+/// Stage an explicit WebSocket bearer token for the next [`adele_core_connect`]
+/// (empty ⇒ clear). Used verbatim as the WS bearer credential, bypassing the
+/// D-Bus / `/login` token minting — the path a client with no local token minter
+/// (e.g. macOS, which has no D-Bus bridge) uses after obtaining a token
+/// out-of-band from the daemon's `/login`. Ignored for non-WS transports.
+///
+/// # Safety
+/// `core` must be a live handle; `jwt` must be null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_set_ws_jwt(core: *mut Core, jwt: *const c_char) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::SetWsJwt(unsafe { cstr_to_string(jwt) }));
+}
+
+/// Send an arbitrary management command (an `api::Command` serialized as JSON)
+/// over the connector. The `CommandResult` is delivered later as a
+/// `command_result` view event carrying the same `request_id`, so the caller can
+/// correlate the reply. This is the generic settings/management channel
+/// (connections, purposes, knowledge base) beyond the typed chat intents.
+///
+/// # Safety
+/// `core` must be a live handle; `request_id`/`command_json` must be null or
+/// valid C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_send_command(
+    core: *mut Core,
+    request_id: *const c_char,
+    command_json: *const c_char,
+) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::SendCommand {
+        request_id: unsafe { cstr_to_string(request_id) },
+        command_json: unsafe { cstr_to_string(command_json) },
+    });
+}
