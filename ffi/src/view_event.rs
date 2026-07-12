@@ -277,7 +277,20 @@ impl ViewEvent {
             Effect::SidePaneSetScratchpad(notes) => ViewEvent::Scratchpad { notes },
             Effect::RefreshSidePaneTasks => ViewEvent::RefreshSidePaneTasks,
             Effect::Speak(text) => ViewEvent::Speak { text },
-            Effect::AddInlineNote(text) => ViewEvent::InlineNote { text },
+            Effect::AddLocalMessage { content, kind } => ViewEvent::InlineNote {
+                // Interim kde presentation (voice#126): QML has no dedicated
+                // Spoken / SpeechDisabled affordance yet (tracked as a follow-up),
+                // so render the explicit `kind` metadata as a text marker here at
+                // the FFI boundary — acting on the metadata at the presentation
+                // layer rather than baking it into `content` or parsing it back.
+                text: match kind {
+                    api::client::MessageKind::Spoken => format!("Spoken: {content}"),
+                    api::client::MessageKind::SpeechDisabled => {
+                        format!("(speech mode disabled) {content}")
+                    }
+                    api::client::MessageKind::Normal => content,
+                },
+            },
             Effect::SetAdeleOutputDropdown(level) => ViewEvent::AdeleOutputDropdown {
                 level: adele_output_str(level),
             },
