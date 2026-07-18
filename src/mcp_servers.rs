@@ -33,6 +33,18 @@ pub enum Runner {
     Daemon,
 }
 
+impl Runner {
+    /// Stable tiebreak rank used when two rows share a (case-insensitive) name.
+    /// Daemon-run servers sort ahead of client-run ones. Kept private: it is an
+    /// ordering detail, not part of the public contract.
+    fn sort_rank(self) -> u8 {
+        match self {
+            Runner::Daemon => 0,
+            Runner::Client => 1,
+        }
+    }
+}
+
 /// The runner filter backing the panel's dropdown. `All` is the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunnerFilter {
@@ -91,16 +103,23 @@ pub struct ServerRow {
 /// remote WebSocket (`true`) versus a co-located UDS/D-Bus link (`false`); the
 /// host suffix is only added when both `is_remote` and a `host` are present.
 pub fn runner_label(runner: Runner, is_remote: bool, host: Option<&str>) -> String {
-    let _ = (runner, is_remote, host);
-    todo!()
+    match runner {
+        Runner::Client => "client".to_string(),
+        Runner::Daemon => match (is_remote, host) {
+            (true, Some(host)) => format!("daemon · {host}"),
+            _ => "daemon".to_string(),
+        },
+    }
 }
 
 /// Honest transport chip text: `"stdio"` or `"http"`. Never emits the retired
 /// "local"/"remote" conflation. Anything that is not `"http"` is treated as
 /// `"stdio"` (the daemon only ever reports those two values).
 pub fn transport_chip(transport: &str) -> &'static str {
-    let _ = transport;
-    todo!()
+    match transport {
+        "http" => "http",
+        _ => "stdio",
+    }
 }
 
 /// Merge daemon-run and client-run servers into one panel-ordered list.
@@ -110,14 +129,45 @@ pub fn transport_chip(transport: &str) -> &'static str {
 /// (case-insensitive), with the [`Runner`] as a stable tiebreak so equal names
 /// order deterministically.
 pub fn server_rows(daemon: &[McpServerView], client: &[ClientServerDto]) -> Vec<ServerRow> {
-    let _ = (daemon, client);
-    todo!()
+    let daemon_rows = daemon.iter().map(|d| ServerRow {
+        name: d.name.clone(),
+        runner: Runner::Daemon,
+        transport: d.transport.clone(),
+        status: d.status.clone(),
+        tool_count: d.tool_count,
+        detail: d.detail.clone(),
+    });
+    let client_rows = client.iter().map(|c| ServerRow {
+        name: c.name.clone(),
+        runner: Runner::Client,
+        transport: c.transport.clone(),
+        status: c.status.clone(),
+        tool_count: c.tool_count,
+        detail: None,
+    });
+
+    let mut rows: Vec<ServerRow> = daemon_rows.chain(client_rows).collect();
+    // Case-insensitive name order, with the runner as a stable tiebreak so
+    // rows that share a name (one per side) order deterministically.
+    rows.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then(a.runner.sort_rank().cmp(&b.runner.sort_rank()))
+    });
+    rows
 }
 
 /// Apply a [`RunnerFilter`] to already-built rows, preserving their order.
 pub fn filter_rows(rows: &[ServerRow], filter: RunnerFilter) -> Vec<ServerRow> {
-    let _ = (rows, filter);
-    todo!()
+    rows.iter()
+        .filter(|row| match filter {
+            RunnerFilter::All => true,
+            RunnerFilter::Daemon => row.runner == Runner::Daemon,
+            RunnerFilter::Client => row.runner == Runner::Client,
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
