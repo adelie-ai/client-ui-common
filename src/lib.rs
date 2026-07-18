@@ -23,12 +23,17 @@
 //! voice crates, never owned here — so the daemon repo stays voice-free.
 
 mod context_usage;
+mod mcp_servers;
 mod message;
 mod reducer;
 mod selected_models;
 
 pub use adele_voice_client_common::AdeleOutput;
 pub use context_usage::{ContextFillLevel, ContextUsageView};
+pub use mcp_servers::{
+    ClientServerDto, Runner, RunnerFilter, ServerRow, filter_rows, runner_label, server_rows,
+    transport_chip,
+};
 pub use message::{UiMessage, interactive_default_from_purposes, signal_to_ui_message};
 pub use reducer::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
 pub use selected_models::SelectedModel;
