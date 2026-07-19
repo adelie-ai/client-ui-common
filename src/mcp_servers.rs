@@ -194,6 +194,16 @@ pub fn kind_label(kind: ServerKind) -> &'static str {
     }
 }
 
+/// Merge daemon-run and client-run servers into one panel-ordered list.
+///
+/// The 2-argument form for callers that have no built-in servers to surface. It
+/// is exactly [`server_rows_with_builtins`] with an empty `builtins` slice, so
+/// it returns the same rows it always has - existing panel callers (gtk/tui/kde)
+/// are unaffected and adopt the built-in-aware form in a later slice.
+pub fn server_rows(daemon: &[McpServerView], client: &[ClientServerDto]) -> Vec<ServerRow> {
+    server_rows_with_builtins(daemon, client, &[])
+}
+
 /// Merge daemon-run, external client-run, and built-in servers into one
 /// panel-ordered list.
 ///
@@ -209,7 +219,7 @@ pub fn kind_label(kind: ServerKind) -> &'static str {
 /// [`Runner`] as a stable tiebreak (daemon before client). Built-ins are chained
 /// after the external client rows, so on a name tie a shadowed built-in slots
 /// directly after its active external override.
-pub fn server_rows(
+pub fn server_rows_with_builtins(
     daemon: &[McpServerView],
     client: &[ClientServerDto],
     builtins: &[BuiltinServerDto],
@@ -400,7 +410,7 @@ mod tests {
         }];
         let client = vec![cv("beta", "http", "running", 1)];
 
-        let rows = server_rows(&daemon, &client, &[]);
+        let rows = server_rows(&daemon, &client);
         assert_eq!(rows.len(), 2);
 
         let alpha = rows
@@ -440,7 +450,7 @@ mod tests {
             cv("github", "stdio", "running", 1),
         ];
 
-        let rows = server_rows(&daemon, &client, &[]);
+        let rows = server_rows(&daemon, &client);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "Beta", "github", "github", "Zeta"]);
 
@@ -461,7 +471,7 @@ mod tests {
         ];
         let client = vec![cv("browser", "stdio", "running", 3)];
 
-        let rows = server_rows(&daemon, &client, &[]);
+        let rows = server_rows(&daemon, &client);
         assert_eq!(rows.len(), 3);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["browser", "git", "time"]);
@@ -469,17 +479,17 @@ mod tests {
 
     #[test]
     fn server_rows_handles_empty_sources() {
-        assert!(server_rows(&[], &[], &[]).is_empty());
+        assert!(server_rows(&[], &[]).is_empty());
 
-        let only_daemon = server_rows(&[dv("alpha", "stdio", "running", 1)], &[], &[]);
+        let only_daemon = server_rows(&[dv("alpha", "stdio", "running", 1)], &[]);
         assert_eq!(only_daemon.len(), 1);
         assert_eq!(only_daemon[0].runner, Runner::Daemon);
 
-        let only_client = server_rows(&[], &[cv("beta", "http", "running", 1)], &[]);
+        let only_client = server_rows(&[], &[cv("beta", "http", "running", 1)]);
         assert_eq!(only_client.len(), 1);
         assert_eq!(only_client[0].runner, Runner::Client);
 
-        let only_builtin = server_rows(&[], &[], &[bv("notes", 2, None)]);
+        let only_builtin = server_rows_with_builtins(&[], &[], &[bv("notes", 2, None)]);
         assert_eq!(only_builtin.len(), 1);
         assert_eq!(only_builtin[0].runner, Runner::Client);
         assert_eq!(only_builtin[0].kind, ServerKind::BuiltIn);
@@ -492,7 +502,7 @@ mod tests {
         // A built-in is client-runner, so it rides the Client filter with the
         // external client rows and is excluded by the Daemon filter.
         let builtins = vec![bv("notes", 2, None)];
-        let rows = server_rows(&daemon, &client, &builtins);
+        let rows = server_rows_with_builtins(&daemon, &client, &builtins);
 
         assert_eq!(RunnerFilter::default(), RunnerFilter::All);
         assert_eq!(filter_rows(&rows, RunnerFilter::All).len(), 3);
@@ -508,7 +518,7 @@ mod tests {
 
     #[test]
     fn builtin_row_has_builtin_kind_and_client_runner() {
-        let rows = server_rows(&[], &[], &[bv("fileio", 7, None)]);
+        let rows = server_rows_with_builtins(&[], &[], &[bv("fileio", 7, None)]);
         assert_eq!(rows.len(), 1);
 
         let row = &rows[0];
@@ -522,7 +532,7 @@ mod tests {
 
     #[test]
     fn overridden_builtin_row_is_disabled_with_reason() {
-        let rows = server_rows(&[], &[], &[bv("fileio", 7, Some("fileio-client"))]);
+        let rows = server_rows_with_builtins(&[], &[], &[bv("fileio", 7, Some("fileio-client"))]);
         assert_eq!(rows.len(), 1);
 
         let row = &rows[0];
@@ -545,7 +555,7 @@ mod tests {
         let client = vec![cv("fileio", "stdio", "running", 4)];
         let builtins = vec![bv("fileio", 3, Some("fileio")), bv("alpha", 2, None)];
 
-        let rows = server_rows(&daemon, &client, &builtins);
+        let rows = server_rows_with_builtins(&daemon, &client, &builtins);
 
         // Case-insensitive name order; daemon-before-client on ties; a shadowed
         // built-in slots directly after its active external override.
@@ -572,6 +582,23 @@ mod tests {
         // Daemon rows keep their transport-derived kinds.
         assert_eq!(rows[3].kind, ServerKind::Http); // git
         assert_eq!(rows[4].kind, ServerKind::Stdio); // Zeta
+    }
+
+    #[test]
+    fn server_rows_2arg_equals_with_empty_builtins() {
+        // The 2-arg form is a thin wrapper: for the no-builtins case it returns
+        // exactly what the built-in-aware form does with an empty slice, so
+        // existing callers see unchanged behavior.
+        let daemon = vec![
+            dv("Zeta", "stdio", "running", 1),
+            dv("git", "http", "running", 2),
+        ];
+        let client = vec![cv("browser", "stdio", "running", 3)];
+
+        assert_eq!(
+            server_rows(&daemon, &client),
+            server_rows_with_builtins(&daemon, &client, &[])
+        );
     }
 
     #[test]

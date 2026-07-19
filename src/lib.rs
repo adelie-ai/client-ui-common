@@ -32,7 +32,7 @@ pub use adele_voice_client_common::AdeleOutput;
 pub use context_usage::{ContextFillLevel, ContextUsageView};
 pub use mcp_servers::{
     BuiltinServerDto, ClientServerDto, Runner, RunnerFilter, ServerKind, ServerRow, filter_rows,
-    kind_label, runner_label, server_rows, transport_chip,
+    kind_label, runner_label, server_rows, server_rows_with_builtins, transport_chip,
 };
 pub use message::{UiMessage, interactive_default_from_purposes, signal_to_ui_message};
 pub use reducer::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
