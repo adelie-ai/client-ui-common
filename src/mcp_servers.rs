@@ -194,6 +194,17 @@ mod tests {
         }
     }
 
+    /// A [`BuiltinServerDto`] for a compiled-in server. `overridden_by` is the
+    /// external server name shadowing it, or `None` when the built-in is active.
+    fn bv(name: &str, tools: u32, overridden_by: Option<&str>) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: name.to_string(),
+            namespace: name.to_string(),
+            tool_count: tools,
+            overridden_by: overridden_by.map(str::to_string),
+        }
+    }
+
     #[test]
     fn runner_enum_and_serverrow_construct() {
         let row = ServerRow {
@@ -203,6 +214,8 @@ mod tests {
             status: "running".to_string(),
             tool_count: 5,
             detail: None,
+            kind: ServerKind::Stdio,
+            disabled_reason: None,
         };
         assert_eq!(row.runner, Runner::Daemon);
         assert_ne!(Runner::Daemon, Runner::Client);
@@ -210,11 +223,19 @@ mod tests {
         assert_eq!(row.tool_count, 5);
         assert_eq!(row.transport, "stdio");
         assert_eq!(row.detail, None);
+        assert_eq!(row.kind, ServerKind::Stdio);
+        assert_eq!(row.disabled_reason, None);
 
         // Runner is Copy: using it after a bind does not move it.
         let r = Runner::Client;
         let r2 = r;
         assert_eq!(r, r2);
+
+        // ServerKind is Copy too.
+        let k = ServerKind::BuiltIn;
+        let k2 = k;
+        assert_eq!(k, k2);
+        assert_ne!(ServerKind::Stdio, ServerKind::Http);
     }
 
     #[test]
@@ -269,7 +290,7 @@ mod tests {
         }];
         let client = vec![cv("beta", "http", "running", 1)];
 
-        let rows = server_rows(&daemon, &client);
+        let rows = server_rows(&daemon, &client, &[]);
         assert_eq!(rows.len(), 2);
 
         let alpha = rows
@@ -285,9 +306,14 @@ mod tests {
         assert_eq!(alpha.transport, "stdio");
         assert_eq!(alpha.status, "error");
         assert_eq!(alpha.detail.as_deref(), Some("boom"));
+        // Kind is derived from transport for daemon/client rows.
+        assert_eq!(alpha.kind, ServerKind::Stdio);
+        assert_eq!(alpha.disabled_reason, None);
 
         assert_eq!(beta.runner, Runner::Client);
         assert_eq!(beta.transport, "http");
+        assert_eq!(beta.kind, ServerKind::Http);
+        assert_eq!(beta.disabled_reason, None);
         // Client rows never carry a daemon-side detail.
         assert_eq!(beta.detail, None);
     }
@@ -304,7 +330,7 @@ mod tests {
             cv("github", "stdio", "running", 1),
         ];
 
-        let rows = server_rows(&daemon, &client);
+        let rows = server_rows(&daemon, &client, &[]);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "Beta", "github", "github", "Zeta"]);
 
@@ -325,7 +351,7 @@ mod tests {
         ];
         let client = vec![cv("browser", "stdio", "running", 3)];
 
-        let rows = server_rows(&daemon, &client);
+        let rows = server_rows(&daemon, &client, &[]);
         assert_eq!(rows.len(), 3);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["browser", "git", "time"]);
@@ -333,32 +359,119 @@ mod tests {
 
     #[test]
     fn server_rows_handles_empty_sources() {
-        assert!(server_rows(&[], &[]).is_empty());
+        assert!(server_rows(&[], &[], &[]).is_empty());
 
-        let only_daemon = server_rows(&[dv("alpha", "stdio", "running", 1)], &[]);
+        let only_daemon = server_rows(&[dv("alpha", "stdio", "running", 1)], &[], &[]);
         assert_eq!(only_daemon.len(), 1);
         assert_eq!(only_daemon[0].runner, Runner::Daemon);
 
-        let only_client = server_rows(&[], &[cv("beta", "http", "running", 1)]);
+        let only_client = server_rows(&[], &[cv("beta", "http", "running", 1)], &[]);
         assert_eq!(only_client.len(), 1);
         assert_eq!(only_client[0].runner, Runner::Client);
+
+        let only_builtin = server_rows(&[], &[], &[bv("notes", 2, None)]);
+        assert_eq!(only_builtin.len(), 1);
+        assert_eq!(only_builtin[0].runner, Runner::Client);
+        assert_eq!(only_builtin[0].kind, ServerKind::BuiltIn);
     }
 
     #[test]
     fn filter_rows_all_daemon_client() {
         let daemon = vec![dv("alpha", "stdio", "running", 1)];
         let client = vec![cv("beta", "http", "running", 1)];
-        let rows = server_rows(&daemon, &client);
+        // A built-in is client-runner, so it rides the Client filter with the
+        // external client rows and is excluded by the Daemon filter.
+        let builtins = vec![bv("notes", 2, None)];
+        let rows = server_rows(&daemon, &client, &builtins);
 
         assert_eq!(RunnerFilter::default(), RunnerFilter::All);
-        assert_eq!(filter_rows(&rows, RunnerFilter::All).len(), 2);
+        assert_eq!(filter_rows(&rows, RunnerFilter::All).len(), 3);
 
         let daemon_only = filter_rows(&rows, RunnerFilter::Daemon);
         assert_eq!(daemon_only.len(), 1);
         assert!(daemon_only.iter().all(|r| r.runner == Runner::Daemon));
 
         let client_only = filter_rows(&rows, RunnerFilter::Client);
-        assert_eq!(client_only.len(), 1);
+        assert_eq!(client_only.len(), 2);
         assert!(client_only.iter().all(|r| r.runner == Runner::Client));
+    }
+
+    #[test]
+    fn builtin_row_has_builtin_kind_and_client_runner() {
+        let rows = server_rows(&[], &[], &[bv("fileio", 7, None)]);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.name, "fileio");
+        assert_eq!(row.runner, Runner::Client);
+        assert_eq!(row.kind, ServerKind::BuiltIn);
+        assert_eq!(row.tool_count, 7);
+        // An un-shadowed built-in is active: no disabled reason.
+        assert_eq!(row.disabled_reason, None);
+    }
+
+    #[test]
+    fn overridden_builtin_row_is_disabled_with_reason() {
+        let rows = server_rows(&[], &[], &[bv("fileio", 7, Some("fileio-client"))]);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.kind, ServerKind::BuiltIn);
+        assert_eq!(row.runner, Runner::Client);
+        assert_eq!(
+            row.disabled_reason,
+            Some("overridden by the external \"fileio-client\"".to_string())
+        );
+    }
+
+    #[test]
+    fn rows_sort_stable_with_builtins() {
+        // A mix of daemon, external-client, and built-in servers, including a
+        // built-in shadowed by an external client server of the same name.
+        let daemon = vec![
+            dv("Zeta", "stdio", "running", 1),
+            dv("git", "http", "running", 2),
+        ];
+        let client = vec![cv("fileio", "stdio", "running", 4)];
+        let builtins = vec![bv("fileio", 3, Some("fileio")), bv("alpha", 2, None)];
+
+        let rows = server_rows(&daemon, &client, &builtins);
+
+        // Case-insensitive name order; daemon-before-client on ties; a shadowed
+        // built-in slots directly after its active external override.
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "fileio", "fileio", "git", "Zeta"]);
+
+        // The "alpha" row is the active built-in.
+        assert_eq!(rows[0].kind, ServerKind::BuiltIn);
+        assert_eq!(rows[0].disabled_reason, None);
+
+        // The two "fileio" rows: the external client override first (active),
+        // then the shadowed built-in (disabled with a reason).
+        assert_eq!(rows[1].runner, Runner::Client);
+        assert_eq!(rows[1].kind, ServerKind::Stdio);
+        assert_eq!(rows[1].disabled_reason, None);
+
+        assert_eq!(rows[2].runner, Runner::Client);
+        assert_eq!(rows[2].kind, ServerKind::BuiltIn);
+        assert_eq!(
+            rows[2].disabled_reason,
+            Some("overridden by the external \"fileio\"".to_string())
+        );
+
+        // Daemon rows keep their transport-derived kinds.
+        assert_eq!(rows[3].kind, ServerKind::Http); // git
+        assert_eq!(rows[4].kind, ServerKind::Stdio); // Zeta
+    }
+
+    #[test]
+    fn kind_label_names_each_kind_and_matches_transport_chip() {
+        assert_eq!(kind_label(ServerKind::Stdio), "stdio");
+        assert_eq!(kind_label(ServerKind::Http), "http");
+        assert_eq!(kind_label(ServerKind::BuiltIn), "built-in");
+
+        // For external kinds, the unified chip agrees with the legacy one.
+        assert_eq!(kind_label(ServerKind::Stdio), transport_chip("stdio"));
+        assert_eq!(kind_label(ServerKind::Http), transport_chip("http"));
     }
 }
