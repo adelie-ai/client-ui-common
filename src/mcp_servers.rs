@@ -57,6 +57,37 @@ pub enum RunnerFilter {
     Client,
 }
 
+/// How an MCP server is hosted - orthogonal to its [`Runner`].
+///
+/// Why: a client-run server can be an external subprocess, an external remote
+/// endpoint, or a server compiled into the client and hosted in-process
+/// (desktop-assistant#538). The panel renders this as a chip via [`kind_label`];
+/// for external servers the kind mirrors the transport, so the two agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerKind {
+    /// External process speaking MCP over stdio.
+    Stdio,
+    /// External endpoint speaking MCP over streamable HTTP.
+    Http,
+    /// Compiled into the client and hosted in-process - no subprocess or socket.
+    BuiltIn,
+}
+
+impl ServerKind {
+    /// Kind for an *external* (subprocess/remote) server from its transport
+    /// string: `"http"` -> [`ServerKind::Http`], anything else -> [`Stdio`],
+    /// mirroring [`transport_chip`]'s stdio default. Built-in rows set their kind
+    /// explicitly and never pass through here.
+    ///
+    /// [`Stdio`]: ServerKind::Stdio
+    fn from_transport(transport: &str) -> ServerKind {
+        match transport {
+            "http" => ServerKind::Http,
+            _ => ServerKind::Stdio,
+        }
+    }
+}
+
 /// Plain client-side input describing one client-run MCP server.
 ///
 /// Why a bespoke DTO: it lets this module stay free of `client-common` /
@@ -72,6 +103,27 @@ pub struct ClientServerDto {
     pub status: String,
     /// Number of tools the server exposes.
     pub tool_count: u32,
+}
+
+/// Plain client-side input describing one MCP server compiled into the client
+/// and hosted in-process (desktop-assistant#538).
+///
+/// Why a bespoke DTO: like [`ClientServerDto`], it keeps this module free of the
+/// client's in-process MCP host types. The host client enumerates its
+/// compiled-in built-ins into this flat shape and passes them in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinServerDto {
+    /// Server name as shown in the panel - also the key an external client-run
+    /// server of the same name overrides.
+    pub name: String,
+    /// The built-in's tool namespace (e.g. `"fileio"`).
+    pub namespace: String,
+    /// Number of tools the built-in exposes.
+    pub tool_count: u32,
+    /// `Some(name)` when an external client-run server of the same name shadows
+    /// this built-in (the external one wins and the built-in renders disabled);
+    /// `None` when the built-in is active.
+    pub overridden_by: Option<String>,
 }
 
 /// One rendered row of the MCP-servers panel — exactly the fields both gtk and
@@ -90,6 +142,14 @@ pub struct ServerRow {
     pub tool_count: u32,
     /// Optional detail (e.g. a last connection error); `None` when absent.
     pub detail: Option<String>,
+    /// How the server is hosted (render via [`kind_label`]). For daemon/client
+    /// rows it is derived from [`transport`](Self::transport); built-in rows are
+    /// [`ServerKind::BuiltIn`].
+    pub kind: ServerKind,
+    /// `None` when the row is active; `Some(reason)` when it should render
+    /// disabled (e.g. a built-in shadowed by an external server of the same
+    /// name), with `reason` the user-facing explanation.
+    pub disabled_reason: Option<String>,
 }
 
 /// Human label for a row's runner.
@@ -122,13 +182,38 @@ pub fn transport_chip(transport: &str) -> &'static str {
     }
 }
 
-/// Merge daemon-run and client-run servers into one panel-ordered list.
+/// Human chip text for a row's [`ServerKind`]: `"stdio"` / `"http"` /
+/// `"built-in"`. The unified successor to [`transport_chip`] that also names
+/// built-ins; for external kinds it returns the same value the transport chip
+/// would, so panels can render every row's chip from `row.kind` alone.
+pub fn kind_label(kind: ServerKind) -> &'static str {
+    match kind {
+        ServerKind::Stdio => "stdio",
+        ServerKind::Http => "http",
+        ServerKind::BuiltIn => "built-in",
+    }
+}
+
+/// Merge daemon-run, external client-run, and built-in servers into one
+/// panel-ordered list.
 ///
-/// Daemon items are tagged [`Runner::Daemon`] and client items
-/// [`Runner::Client`]. The result is sorted alphabetically by name
-/// (case-insensitive), with the [`Runner`] as a stable tiebreak so equal names
-/// order deterministically.
-pub fn server_rows(daemon: &[McpServerView], client: &[ClientServerDto]) -> Vec<ServerRow> {
+/// Daemon items are tagged [`Runner::Daemon`]; external client items and
+/// built-ins are both [`Runner::Client`] (a built-in is hosted in-process by the
+/// client) and differ only in their [`ServerKind`]. Daemon/client `kind` is
+/// derived from the transport ([`http`](ServerKind::Http) else
+/// [`stdio`](ServerKind::Stdio)); built-ins are [`ServerKind::BuiltIn`]. A
+/// built-in whose [`overridden_by`](BuiltinServerDto::overridden_by) is set
+/// renders disabled with an "overridden by the external ..." reason.
+///
+/// The result is sorted alphabetically by name (case-insensitive) with the
+/// [`Runner`] as a stable tiebreak (daemon before client). Built-ins are chained
+/// after the external client rows, so on a name tie a shadowed built-in slots
+/// directly after its active external override.
+pub fn server_rows(
+    daemon: &[McpServerView],
+    client: &[ClientServerDto],
+    builtins: &[BuiltinServerDto],
+) -> Vec<ServerRow> {
     let daemon_rows = daemon.iter().map(|d| ServerRow {
         name: d.name.clone(),
         runner: Runner::Daemon,
@@ -136,6 +221,8 @@ pub fn server_rows(daemon: &[McpServerView], client: &[ClientServerDto]) -> Vec<
         status: d.status.clone(),
         tool_count: d.tool_count,
         detail: d.detail.clone(),
+        kind: ServerKind::from_transport(&d.transport),
+        disabled_reason: None,
     });
     let client_rows = client.iter().map(|c| ServerRow {
         name: c.name.clone(),
@@ -144,11 +231,34 @@ pub fn server_rows(daemon: &[McpServerView], client: &[ClientServerDto]) -> Vec<
         status: c.status.clone(),
         tool_count: c.tool_count,
         detail: None,
+        kind: ServerKind::from_transport(&c.transport),
+        disabled_reason: None,
+    });
+    let builtin_rows = builtins.iter().map(|b| ServerRow {
+        name: b.name.clone(),
+        runner: Runner::Client,
+        // Built-ins have no wire transport; the chip comes from `kind`.
+        transport: "builtin".to_string(),
+        status: if b.overridden_by.is_some() {
+            "disabled"
+        } else {
+            "running"
+        }
+        .to_string(),
+        tool_count: b.tool_count,
+        detail: None,
+        kind: ServerKind::BuiltIn,
+        disabled_reason: b
+            .overridden_by
+            .as_ref()
+            .map(|n| format!("overridden by the external \"{n}\"")),
     });
 
-    let mut rows: Vec<ServerRow> = daemon_rows.chain(client_rows).collect();
-    // Case-insensitive name order, with the runner as a stable tiebreak so
-    // rows that share a name (one per side) order deterministically.
+    let mut rows: Vec<ServerRow> = daemon_rows.chain(client_rows).chain(builtin_rows).collect();
+    // Case-insensitive name order, with the runner as a stable tiebreak so rows
+    // that share a name order deterministically. `sort_by` is stable, so among
+    // same-name client-runner rows the chain order holds: an external override
+    // (client) precedes the built-in it shadows.
     rows.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
