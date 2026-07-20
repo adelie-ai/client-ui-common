@@ -124,6 +124,12 @@ pub struct BuiltinServerDto {
     /// this built-in (the external one wins and the built-in renders disabled);
     /// `None` when the built-in is active.
     pub overridden_by: Option<String>,
+    /// `true` when this built-in was explicitly turned off for the surface in the
+    /// client's config (`disabled_builtins`), so it renders disabled even with no
+    /// external override. Orthogonal to [`overridden_by`](Self::overridden_by):
+    /// both can be set, and the disabled-in-config reason takes display precedence.
+    /// da#538 slice 4.
+    pub disabled_by_config: bool,
 }
 
 /// One rendered row of the MCP-servers panel — exactly the fields both gtk and
@@ -244,24 +250,33 @@ pub fn server_rows_with_builtins(
         kind: ServerKind::from_transport(&c.transport),
         disabled_reason: None,
     });
-    let builtin_rows = builtins.iter().map(|b| ServerRow {
-        name: b.name.clone(),
-        runner: Runner::Client,
-        // Built-ins have no wire transport; the chip comes from `kind`.
-        transport: "builtin".to_string(),
-        status: if b.overridden_by.is_some() {
-            "disabled"
+    let builtin_rows = builtins.iter().map(|b| {
+        // A built-in renders disabled when it was turned off in config OR shadowed
+        // by a same-name external server. The config-disable reason wins the display
+        // when both apply — it is the user's explicit choice.
+        let disabled_reason = if b.disabled_by_config {
+            Some("disabled in this client's config".to_string())
         } else {
-            "running"
+            b.overridden_by
+                .as_ref()
+                .map(|n| format!("overridden by the external \"{n}\""))
+        };
+        ServerRow {
+            name: b.name.clone(),
+            runner: Runner::Client,
+            // Built-ins have no wire transport; the chip comes from `kind`.
+            transport: "builtin".to_string(),
+            status: if disabled_reason.is_some() {
+                "disabled"
+            } else {
+                "running"
+            }
+            .to_string(),
+            tool_count: b.tool_count,
+            detail: None,
+            kind: ServerKind::BuiltIn,
+            disabled_reason,
         }
-        .to_string(),
-        tool_count: b.tool_count,
-        detail: None,
-        kind: ServerKind::BuiltIn,
-        disabled_reason: b
-            .overridden_by
-            .as_ref()
-            .map(|n| format!("overridden by the external \"{n}\"")),
     });
 
     let mut rows: Vec<ServerRow> = daemon_rows.chain(client_rows).chain(builtin_rows).collect();
@@ -316,12 +331,26 @@ mod tests {
 
     /// A [`BuiltinServerDto`] for a compiled-in server. `overridden_by` is the
     /// external server name shadowing it, or `None` when the built-in is active.
+    /// Not disabled-by-config; use [`bv_disabled`] for that case.
     fn bv(name: &str, tools: u32, overridden_by: Option<&str>) -> BuiltinServerDto {
         BuiltinServerDto {
             name: name.to_string(),
             namespace: name.to_string(),
             tool_count: tools,
             overridden_by: overridden_by.map(str::to_string),
+            disabled_by_config: false,
+        }
+    }
+
+    /// A [`BuiltinServerDto`] explicitly disabled for the surface via client config.
+    /// `overridden_by` may still be set to exercise the both-reasons precedence.
+    fn bv_disabled(name: &str, tools: u32, overridden_by: Option<&str>) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: name.to_string(),
+            namespace: name.to_string(),
+            tool_count: tools,
+            overridden_by: overridden_by.map(str::to_string),
+            disabled_by_config: true,
         }
     }
 
@@ -541,6 +570,39 @@ mod tests {
         assert_eq!(
             row.disabled_reason,
             Some("overridden by the external \"fileio-client\"".to_string())
+        );
+    }
+
+    #[test]
+    fn config_disabled_builtin_row_is_disabled_with_reason() {
+        let rows = server_rows_with_builtins(&[], &[], &[bv_disabled("web", 2, None)]);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.kind, ServerKind::BuiltIn);
+        assert_eq!(row.runner, Runner::Client);
+        assert_eq!(row.status, "disabled");
+        assert_eq!(
+            row.disabled_reason,
+            Some("disabled in this client's config".to_string())
+        );
+    }
+
+    #[test]
+    fn config_disable_takes_precedence_over_override_in_reason() {
+        // When a built-in is BOTH disabled in config and overridden by an external
+        // server, the config-disable reason wins the display (the user's explicit
+        // choice), and the row is still disabled.
+        let rows =
+            server_rows_with_builtins(&[], &[], &[bv_disabled("fileio", 7, Some("fileio-client"))]);
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.status, "disabled");
+        assert_eq!(
+            row.disabled_reason,
+            Some("disabled in this client's config".to_string()),
+            "config-disable reason must win over the override reason"
         );
     }
 
