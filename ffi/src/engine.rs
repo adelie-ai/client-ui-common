@@ -435,9 +435,15 @@ impl Engine {
     /// double-render (the daemon's echoed `UserMessageAdded` is deduped by
     /// request_id, and a queued submit emits no `SendPrompt` at all).
     fn submit_prompt(&mut self, text: String) {
+        // Mint a per-send idempotency key here (#570): the reducer stays
+        // wasm-clean and never generates UUIDs, so the native host supplies one.
+        // It stamps the optimistic bubble and rides the `SendMessage` wire field
+        // so a retry re-attaches and the echoed `UserMessageAdded` dedupes by
+        // exact match. (KDE's default D-Bus transport drops the key — idempotency
+        // is inert there until a UDS/WS transport carries it; that is harmless.)
         self.dispatch(UiMessage::SubmitPrompt {
             prompt: text,
-            idempotency_key: None,
+            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
         });
     }
 
@@ -492,17 +498,17 @@ impl Engine {
                 conversation_id,
                 prompt,
                 system_refinement,
-                idempotency_key: _,
+                idempotency_key,
             } => {
                 // Draw the optimistic user bubble for our own send (the reducer
                 // pushed it into its transcript, but the KDE view is event-driven
                 // and doesn't re-read state). Covers both a direct submit and a
                 // queue flush; the daemon's echoed `UserMessageAdded` is deduped
-                // by request_id so this never double-renders.
+                // by idempotency key (or request_id) so this never double-renders.
                 self.sink.emit(&ViewEvent::AddUserMessage {
                     content: prompt.clone(),
                 });
-                self.spawn_send(conversation_id, prompt, system_refinement);
+                self.spawn_send(conversation_id, prompt, system_refinement, idempotency_key);
             }
             Effect::SubscribeConversations(ids) => self.spawn_subscribe(ids),
             Effect::FetchScratchpad(id) => self.spawn_fetch_scratchpad(id),
@@ -696,6 +702,7 @@ impl Engine {
         conversation_id: String,
         prompt: String,
         system_refinement: Option<String>,
+        idempotency_key: Option<String>,
     ) {
         let Some(conn) = self.connector.clone() else {
             // No live connection: roll the optimistic bubble back out.
@@ -712,26 +719,42 @@ impl Engine {
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
             let refinement = system_refinement.as_deref().unwrap_or("");
-            // With a staged model override, send via the generic Commands channel
-            // (`send_prompt_full` carries BOTH the override and the refinement);
-            // otherwise use the Connector's refinement send, which also handles
-            // the no-Commands D-Bus prompt-fold fallback.
+            // Forward the client-minted idempotency key on the `SendMessage` wire
+            // field (#570) via the `*_idempotent` send methods, so a retry after a
+            // dropped connection re-attaches to the live turn and the echoed
+            // `UserMessageAdded` dedupes by exact match. With a staged model
+            // override, send via the generic Commands channel
+            // (`send_prompt_idempotent` carries the override, refinement, AND
+            // key); otherwise use the Connector's refinement+key send, which also
+            // handles the no-Commands D-Bus prompt-fold fallback (which drops the
+            // key — inert until a socket transport, as documented on `submit`).
             let result = if let Some(ov) = override_selection {
                 if let Some(cmds) = conn.client().as_commands() {
-                    cmds.send_prompt_full(
+                    cmds.send_prompt_idempotent(
                         &conversation_id,
                         &prompt,
                         Some(ov),
                         refinement.to_string(),
+                        idempotency_key,
                     )
                     .await
                 } else {
-                    conn.send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
-                        .await
+                    conn.send_prompt_with_system_refinement_idempotent(
+                        &conversation_id,
+                        &prompt,
+                        refinement,
+                        idempotency_key,
+                    )
+                    .await
                 }
             } else {
-                conn.send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
-                    .await
+                conn.send_prompt_with_system_refinement_idempotent(
+                    &conversation_id,
+                    &prompt,
+                    refinement,
+                    idempotency_key,
+                )
+                .await
             };
             match result {
                 Ok(task_id) => {

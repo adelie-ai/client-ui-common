@@ -44,6 +44,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# Mints a per-send idempotency key (#570) for the reducer to stamp on the
+# optimistic bubble and forward on the wire. The reducer stays wasm-clean and
+# never mints UUIDs itself — the native FFI host does it here.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 cbindgen = "0.29"

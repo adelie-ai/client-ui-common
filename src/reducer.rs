@@ -553,7 +553,10 @@ impl WindowState {
             .map(|q| q.text.as_str())
             .collect::<Vec<_>>()
             .join(QUEUE_JOIN);
-        let mut effects = self.commit_send(combined, None);
+        // The combined turn adopts the FIRST queued message's key (#570), so its
+        // echo still dedupes by exact match; `None` when the queue was keyless.
+        let combined_key = queued.first().and_then(|q| q.idempotency_key.clone());
+        let mut effects = self.commit_send(combined, combined_key);
         effects.push(self.queued_snapshot_effect());
         effects
     }
@@ -1101,7 +1104,7 @@ impl WindowState {
             }
             UiMessage::SubmitPrompt {
                 prompt,
-                idempotency_key: _,
+                idempotency_key,
             } => {
                 // Single send-decision point (Phase-2). Rather than *refuse* a
                 // send while a reply streams (the old TUI-7 gate), we QUEUE it:
@@ -1155,7 +1158,7 @@ impl WindowState {
                     if has_text && let Some(model) = self.open.get_mut(&conversation_id) {
                         model.outbox.push(QueuedMessage {
                             text: prompt,
-                            idempotency_key: None,
+                            idempotency_key,
                         });
                         model.composer.clear();
                     }
@@ -1180,7 +1183,7 @@ impl WindowState {
                         if has_text {
                             model.outbox.push(QueuedMessage {
                                 text: prompt,
-                                idempotency_key: None,
+                                idempotency_key,
                             });
                         }
                         model.composer.clear();
@@ -1200,7 +1203,7 @@ impl WindowState {
                 if let Some(model) = self.open.get_mut(&conversation_id) {
                     model.composer.clear();
                 }
-                self.commit_send(prompt, None)
+                self.commit_send(prompt, idempotency_key)
             }
             UiMessage::EditQueued { index } => {
                 // Check out queued item `index` into the composer to edit it
@@ -1343,8 +1346,35 @@ impl WindowState {
                 conversation_id,
                 request_id,
                 content,
-                idempotency_key: _,
+                idempotency_key,
             } => {
+                // Case 0 — our own send recognized by EXACT idempotency-key match
+                // (#570). When the echo carries a key we stamped on an optimistic
+                // bubble still held for this conversation, this is unambiguously
+                // our send coming back — regardless of send/echo ordering and
+                // regardless of whether the daemon normalized the content. Claim
+                // the real `request_id` onto a still-pending stream (so chunks
+                // correlate) if one exists yet, and render nothing. This subsumes
+                // Case 1 / Case 1b for keyed sends; the keyless fallbacks below
+                // stay for voice turns, other clients, and pre-key clients.
+                if let Some(key) = idempotency_key.as_deref()
+                    && self
+                        .open
+                        .get(&conversation_id)
+                        .and_then(|m| m.detail.as_ref())
+                        .is_some_and(|d| {
+                            d.messages
+                                .iter()
+                                .any(|msg| msg.idempotency_key.as_deref() == Some(key))
+                        })
+                {
+                    if let Some(stream) = self.stream_of_mut(&conversation_id)
+                        && stream.request_id.is_none()
+                    {
+                        stream.request_id = Some(request_id);
+                    }
+                    return vec![];
+                }
                 // Case 1 — this client's own send, echoed back (#1). We drew the
                 // user bubble optimistically at send time and set "__pending__"
                 // on this conversation's own stream (Phase-2 Step-2b-ii); claim
