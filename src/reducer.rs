@@ -479,11 +479,11 @@ impl WindowState {
                 kind: MessageKind::Normal,
             });
         }
-        // The send is committed: drop this conversation's saved composer draft
-        // so a later switch-away snapshot can't resurrect the just-sent text.
-        if let Some(model) = self.open.get_mut(&conversation_id) {
-            model.composer.clear();
-        }
+        // NB: does NOT clear the saved composer draft. A *direct* send consumes
+        // the composer text (its caller clears the draft), but a *flush* sends
+        // the outbox — the composer may hold an unrelated fresh draft that must
+        // survive (a switch-back flush would otherwise wipe it; see the flush
+        // paths). The one caller that consumes the composer clears it itself.
         let system_refinement = refinement_for_send(self).map(str::to_string);
         vec![Effect::SendPrompt {
             conversation_id,
@@ -498,9 +498,18 @@ impl WindowState {
     /// The in-progress composer draft (a fresh, not-yet-Entered message) is left
     /// untouched — only the committed queue is flushed. Returns the send effects
     /// plus a cleared-queue snapshot, or an empty vec when there is nothing to
-    /// flush (no current conversation, a reply still streaming, or an empty
-    /// queue). Only ever flushes the *current* conversation, because the
-    /// combined send draws its optimistic bubble into the open transcript.
+    /// flush (no current conversation, a reply still streaming, an empty queue,
+    /// or a queued message currently checked out for editing). Only ever flushes
+    /// the *current* conversation, because the combined send draws its optimistic
+    /// bubble into the open transcript.
+    ///
+    /// Deferred while an edit is checked out: the checked-out message lives in
+    /// `editing.original` (removed from `outbox`), and flushing now would either
+    /// drop it or send the stale pre-edit text and orphan the user's in-progress
+    /// edit. So a flush that fires mid-edit (a reply completing while the user
+    /// recalls a queued message to fix it) leaves the queue intact; it flushes
+    /// when the user finishes the edit (a `SubmitPrompt` reinserts it, then
+    /// flushes) or on the next send into the idle conversation.
     fn flush_outbox(&mut self) -> Vec<Effect> {
         let Some(id) = self.current_conversation_id.clone() else {
             return vec![];
@@ -511,15 +520,26 @@ impl WindowState {
         let Some(model) = self.open.get_mut(&id) else {
             return vec![];
         };
-        if model.outbox.is_empty() {
+        if model.editing.is_some() || model.outbox.is_empty() {
             return vec![];
         }
         let queued = std::mem::take(&mut model.outbox);
-        model.editing = None;
         let combined = queued.join(QUEUE_JOIN);
         let mut effects = self.commit_send(combined);
         effects.push(self.queued_snapshot_effect());
         effects
+    }
+
+    /// Flush any pending queued messages for the now-open conversation as one
+    /// combined send — the public entry point for a client whose conversation
+    /// switch seeds the detail directly via [`open_conversation`](Self::open_conversation)
+    /// rather than routing through [`UiMessage::ConversationLoaded`] (which
+    /// flushes on switch-back automatically). The TUI's `load_conversation` is
+    /// such a path. A no-op (empty vec) when the current conversation is idle
+    /// with an empty queue, still streaming, or mid-edit — so calling it after
+    /// every switch is safe. Part of the shared public API.
+    pub fn flush_pending_queue(&mut self) -> Vec<Effect> {
+        self.flush_outbox()
     }
 }
 
@@ -1104,8 +1124,14 @@ impl WindowState {
                     .get(&conversation_id)
                     .is_some_and(|m| !m.outbox.is_empty());
                 if has_queue {
-                    if has_text && let Some(model) = self.open.get_mut(&conversation_id) {
-                        model.outbox.push(prompt);
+                    // The user hit Enter, consuming the composer, so drop the
+                    // saved draft (commit_send no longer does — a background
+                    // flush must not, and this is a user-initiated one).
+                    if let Some(model) = self.open.get_mut(&conversation_id) {
+                        if has_text {
+                            model.outbox.push(prompt);
+                        }
+                        model.composer.clear();
                     }
                     return self.flush_outbox();
                 }
@@ -1115,6 +1141,12 @@ impl WindowState {
                 //     its text; the action is gated upstream too).
                 if prompt.is_empty() {
                     return vec![];
+                }
+                // The composer text is the sent text: drop the saved draft so a
+                // later switch-away snapshot can't resurrect it (commit_send no
+                // longer clears it — the flush path must not).
+                if let Some(model) = self.open.get_mut(&conversation_id) {
+                    model.composer.clear();
                 }
                 self.commit_send(prompt)
             }
@@ -3182,6 +3214,107 @@ mod tests {
             prompt: "hi".to_string(),
         });
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_flush_that_fires_mid_edit_is_deferred_not_dropped() {
+        // The user queues "a","b", then recalls "b" to fix it (checked out into
+        // the composer). The reply completes while they're mid-edit. The flush
+        // must NOT fire (it would drop the checked-out "b" or send its stale
+        // original) — the queue stays intact until the edit is finished.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+        });
+        state.apply(UiMessage::EditQueued { index: 1 }); // check out "b"
+        assert_eq!(state.editing_queued_index(), Some(1));
+        let done = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        assert!(
+            !done.iter().any(|e| matches!(e, Effect::SendPrompt { .. })),
+            "a flush mid-edit must be deferred, not fire: {done:?}"
+        );
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["a".to_string()],
+            "the rest of the queue is untouched"
+        );
+        assert_eq!(
+            state.editing_queued_index(),
+            Some(1),
+            "the edit is still checked out"
+        );
+        // Finishing the edit (now idle) flushes the WHOLE batch, edit included.
+        let flushed = state.apply(UiMessage::SubmitPrompt {
+            prompt: "b fixed".to_string(),
+        });
+        assert!(
+            flushed.iter().any(|e| matches!(
+                e,
+                Effect::SendPrompt { prompt, .. } if prompt == "a\nb fixed"
+            )),
+            "finishing the edit flushes the whole batch as one: {flushed:?}"
+        );
+        assert!(state.queued_messages_for_view().is_empty());
+    }
+
+    #[test]
+    fn a_flush_preserves_an_unrelated_saved_composer_draft() {
+        // A backgrounded reply completes and the queue flushes on the next
+        // trigger. The user had a fresh, unsent draft saved for that
+        // conversation — the flush sends the QUEUE, not the draft, so the saved
+        // draft must survive (regression for the switch-back draft-clobber).
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "msg1".to_string(),
+        });
+        // The user then typed a fresh draft (the client saved it).
+        state.set_composer_draft("c1", "draft2".to_string());
+        let done = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        assert!(
+            done.iter()
+                .any(|e| matches!(e, Effect::SendPrompt { prompt, .. } if prompt == "msg1")),
+            "the queue flushed: {done:?}"
+        );
+        assert_eq!(
+            state.composer_draft("c1"),
+            "draft2",
+            "the flush must not clobber the unrelated saved draft"
+        );
+    }
+
+    #[test]
+    fn flush_pending_queue_sends_an_idle_conversations_backlog() {
+        // The public entry point for a client (the TUI) whose switch seeds detail
+        // directly instead of routing through ConversationLoaded.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "x".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "y".to_string(),
+        });
+        // Reply completed while backgrounded → idle with a pending queue.
+        state.reset_streaming_state();
+        let effects = state.flush_pending_queue();
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SendPrompt { prompt, .. } if prompt == "x\ny"
+            )),
+            "flush_pending_queue sends the backlog as one: {effects:?}"
+        );
+        assert!(state.queued_messages_for_view().is_empty());
+        // Idempotent: nothing left to flush.
+        assert!(state.flush_pending_queue().is_empty());
     }
 
     /// Multi-stream TUI-8: a disconnect drops EVERY conversation's in-flight
