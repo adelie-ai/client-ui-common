@@ -65,6 +65,17 @@ struct StreamState {
 /// run-together lines.
 const QUEUE_JOIN: &str = "\n\n";
 
+/// One message awaiting flush in a conversation's outbox. Carries the text plus
+/// the client-minted idempotency key (#570) supplied when it was queued, so the
+/// combined flush can adopt the first message's key and the echoed
+/// `UserMessageAdded` still dedupes by exact match. `idempotency_key` is `None`
+/// for a keyless send.
+#[derive(Debug, Clone)]
+struct QueuedMessage {
+    text: String,
+    idempotency_key: Option<String>,
+}
+
 /// A queued message the user has pulled back into the composer to edit
 /// ([`ConversationModel::editing`]). Records where it came from so a re-submit
 /// reinserts it in place and a cancel restores it unchanged.
@@ -76,6 +87,10 @@ struct QueuedEdit {
     /// The message's text as it was when checked out, so `CancelQueuedEdit`
     /// restores it even if the composer was edited.
     original: String,
+    /// The checked-out message's idempotency key (#570), preserved so a
+    /// reinsert (finish-edit or cancel) keeps the original queued key rather
+    /// than dropping it.
+    key: Option<String>,
 }
 
 /// One conversation's view-model — all of its per-conversation state in one
@@ -108,7 +123,7 @@ struct ConversationModel {
     /// flushed as ONE combined submission when the stream ends — so a burst of
     /// Enter-presses ("I hit enter as I think") becomes a single turn, not
     /// several. Empty when nothing is queued.
-    outbox: Vec<String>,
+    outbox: Vec<QueuedMessage>,
     /// Set when the user has pulled a queued message back into the composer to
     /// edit it (up-arrow recall / a chip's edit affordance): the outbox slot it
     /// was checked out from (so a re-submit reinserts it in place) and its
@@ -414,19 +429,19 @@ impl WindowState {
     /// The queued messages awaiting flush for `conversation_id`, in submit
     /// order, or an empty slice when nothing is queued. View clients render the
     /// "N queued" indicator / chips from this. Part of the shared public API.
-    pub fn queued_messages(&self, conversation_id: &str) -> &[String] {
-        self.open
-            .get(conversation_id)
-            .map_or(&[], |m| m.outbox.as_slice())
+    pub fn queued_messages(&self, conversation_id: &str) -> Vec<String> {
+        self.open.get(conversation_id).map_or_else(Vec::new, |m| {
+            m.outbox.iter().map(|q| q.text.clone()).collect()
+        })
     }
 
     /// The queued messages for the *currently open* conversation. Part of the
     /// shared public API — a client that redraws from state each frame reads
     /// this rather than tracking [`Effect::SetQueuedMessages`].
-    pub fn queued_messages_for_view(&self) -> &[String] {
+    pub fn queued_messages_for_view(&self) -> Vec<String> {
         self.current_conversation_id
             .as_deref()
-            .map_or(&[], |id| self.queued_messages(id))
+            .map_or_else(Vec::new, |id| self.queued_messages(id))
     }
 
     /// The outbox index of the queued message currently checked out into the
@@ -449,7 +464,12 @@ impl WindowState {
             .current_conversation_id
             .as_deref()
             .and_then(|id| self.open.get(id))
-            .map(|m| (m.outbox.clone(), m.editing.as_ref().map(|e| e.index)))
+            .map(|m| {
+                (
+                    m.outbox.iter().map(|q| q.text.clone()).collect(),
+                    m.editing.as_ref().map(|e| e.index),
+                )
+            })
             .unwrap_or_default();
         Effect::SetQueuedMessages { messages, editing }
     }
@@ -462,7 +482,7 @@ impl WindowState {
     /// the live composer widget — the caller decides whether to clear it (a
     /// direct send clears it; a background flush must not clobber a fresh
     /// draft).
-    fn commit_send(&mut self, prompt: String) -> Vec<Effect> {
+    fn commit_send(&mut self, prompt: String, idempotency_key: Option<String>) -> Vec<Effect> {
         let conversation_id = self
             .current_conversation_id
             .clone()
@@ -470,13 +490,16 @@ impl WindowState {
         // Optimistic local echo of our own send (#1): draw the user bubble now
         // so the turn feels instant. The daemon assigns the real id when it
         // persists the turn; the echoed-back `UserMessageAdded` is de-duped by
-        // request_id, so an empty id here is correct.
+        // its `idempotency_key` (exact match, #570) or — keyless — by
+        // request_id, so an empty id here is correct. Stamp the bubble with the
+        // send's key so the echo can find it regardless of content or ordering.
         if let Some(conv) = self.current_conversation_mut() {
             conv.messages.push(ChatMessage {
                 id: String::new(),
                 role: "user".to_string(),
                 content: prompt.clone(),
                 kind: MessageKind::Normal,
+                idempotency_key: idempotency_key.clone(),
             });
         }
         // NB: does NOT clear the saved composer draft. A *direct* send consumes
@@ -489,6 +512,7 @@ impl WindowState {
             conversation_id,
             prompt,
             system_refinement,
+            idempotency_key,
         }]
     }
 
@@ -524,8 +548,15 @@ impl WindowState {
             return vec![];
         }
         let queued = std::mem::take(&mut model.outbox);
-        let combined = queued.join(QUEUE_JOIN);
-        let mut effects = self.commit_send(combined);
+        let combined = queued
+            .iter()
+            .map(|q| q.text.as_str())
+            .collect::<Vec<_>>()
+            .join(QUEUE_JOIN);
+        // The combined turn adopts the FIRST queued message's key (#570), so its
+        // echo still dedupes by exact match; `None` when the queue was keyless.
+        let combined_key = queued.first().and_then(|q| q.idempotency_key.clone());
+        let mut effects = self.commit_send(combined, combined_key);
         effects.push(self.queued_snapshot_effect());
         effects
     }
@@ -693,6 +724,11 @@ pub enum Effect {
         conversation_id: String,
         prompt: String,
         system_refinement: Option<String>,
+        /// The client-minted idempotency key for this send (#570), or `None` for
+        /// a keyless send. The executor forwards it on the `SendMessage` wire
+        /// field (via the `*_idempotent` send methods) so a retry re-attaches to
+        /// the live turn and the echoed `UserMessageAdded` dedupes by exact key.
+        idempotency_key: Option<String>,
     },
     /// Apply (or clear, with `None`) the model-picker selection.
     SetModelSelection(Option<api::ConversationModelSelectionView>),
@@ -817,11 +853,13 @@ impl std::fmt::Debug for Effect {
                 conversation_id,
                 prompt,
                 system_refinement,
+                idempotency_key,
             } => f
                 .debug_struct("SendPrompt")
                 .field("conversation_id", conversation_id)
                 .field("prompt", prompt)
                 .field("system_refinement", system_refinement)
+                .field("idempotency_key", idempotency_key)
                 .finish(),
             Effect::SetModelSelection(s) => f.debug_tuple("SetModelSelection").field(s).finish(),
             Effect::SetModels(m) => f.debug_tuple("SetModels").field(m).finish(),
@@ -1064,7 +1102,10 @@ impl WindowState {
                     Effect::EnsureActiveConversation,
                 ]
             }
-            UiMessage::SubmitPrompt { prompt } => {
+            UiMessage::SubmitPrompt {
+                prompt,
+                idempotency_key,
+            } => {
                 // Single send-decision point (Phase-2). Rather than *refuse* a
                 // send while a reply streams (the old TUI-7 gate), we QUEUE it:
                 // the user can keep hitting Enter as they think and the whole
@@ -1087,7 +1128,15 @@ impl WindowState {
                     if let Some(model) = self.open.get_mut(&conversation_id) {
                         if has_text {
                             let at = edit.index.min(model.outbox.len());
-                            model.outbox.insert(at, prompt);
+                            // Reinsert keeps the recalled item's ORIGINAL queued
+                            // key (#570), not a fresh one — it is the same send.
+                            model.outbox.insert(
+                                at,
+                                QueuedMessage {
+                                    text: prompt,
+                                    idempotency_key: edit.key,
+                                },
+                            );
                         }
                         model.composer.clear();
                     }
@@ -1107,7 +1156,10 @@ impl WindowState {
                 //     clears; the batch flushes as one when the reply completes.
                 if self.current_stream().is_some() {
                     if has_text && let Some(model) = self.open.get_mut(&conversation_id) {
-                        model.outbox.push(prompt);
+                        model.outbox.push(QueuedMessage {
+                            text: prompt,
+                            idempotency_key,
+                        });
                         model.composer.clear();
                     }
                     return vec![
@@ -1129,7 +1181,10 @@ impl WindowState {
                     // flush must not, and this is a user-initiated one).
                     if let Some(model) = self.open.get_mut(&conversation_id) {
                         if has_text {
-                            model.outbox.push(prompt);
+                            model.outbox.push(QueuedMessage {
+                                text: prompt,
+                                idempotency_key,
+                            });
                         }
                         model.composer.clear();
                     }
@@ -1148,7 +1203,7 @@ impl WindowState {
                 if let Some(model) = self.open.get_mut(&conversation_id) {
                     model.composer.clear();
                 }
-                self.commit_send(prompt)
+                self.commit_send(prompt, idempotency_key)
             }
             UiMessage::EditQueued { index } => {
                 // Check out queued item `index` into the composer to edit it
@@ -1164,7 +1219,13 @@ impl WindowState {
                 };
                 if let Some(prev) = model.editing.take() {
                     let at = prev.index.min(model.outbox.len());
-                    model.outbox.insert(at, prev.original);
+                    model.outbox.insert(
+                        at,
+                        QueuedMessage {
+                            text: prev.original,
+                            idempotency_key: prev.key,
+                        },
+                    );
                 }
                 if index >= model.outbox.len() {
                     // Stale/out-of-range (the queue changed under a click): after
@@ -1175,13 +1236,18 @@ impl WindowState {
                         self.queued_snapshot_effect(),
                     ];
                 }
-                let text = model.outbox.remove(index);
+                let item = model.outbox.remove(index);
                 model.editing = Some(QueuedEdit {
                     index,
-                    original: text.clone(),
+                    original: item.text.clone(),
+                    // Preserve the checked-out send's key across the edit (#570).
+                    key: item.idempotency_key,
                 });
-                model.composer = text.clone();
-                vec![Effect::SetComposerText(text), self.queued_snapshot_effect()]
+                model.composer = item.text.clone();
+                vec![
+                    Effect::SetComposerText(item.text),
+                    self.queued_snapshot_effect(),
+                ]
             }
             UiMessage::RemoveQueued { index } => {
                 // Drop queued item `index` without sending it (a chip's x).
@@ -1217,7 +1283,13 @@ impl WindowState {
                     return vec![];
                 };
                 let at = edit.index.min(model.outbox.len());
-                model.outbox.insert(at, edit.original);
+                model.outbox.insert(
+                    at,
+                    QueuedMessage {
+                        text: edit.original,
+                        idempotency_key: edit.key,
+                    },
+                );
                 model.composer.clear();
                 vec![
                     Effect::SetComposerText(String::new()),
@@ -1274,7 +1346,43 @@ impl WindowState {
                 conversation_id,
                 request_id,
                 content,
+                idempotency_key,
             } => {
+                // Case 0 — our own send recognized by EXACT idempotency-key match
+                // (#570). When the echo carries a key we stamped on an optimistic
+                // bubble still held for this conversation, this is unambiguously
+                // our send coming back — regardless of send/echo ordering and
+                // regardless of whether the daemon normalized the content. Claim
+                // the real `request_id` onto a still-pending stream (so chunks
+                // correlate) if one exists yet, and render nothing. This subsumes
+                // Case 1 / Case 1b for keyed sends; the keyless fallbacks below
+                // stay for voice turns, other clients, and pre-key clients.
+                //
+                // Phase-1 limitation: the optimistic bubble's key lives only in
+                // memory. After a transcript RELOAD or a switch-away-and-back the
+                // detail is rebuilt from `MessageView`, which sets
+                // `idempotency_key: None` (the key is not persisted on the message
+                // row yet), so this exact-key match no longer fires and the
+                // content compare (Case 1b / Case 2) is the reload fallback.
+                // Persisting the key on the row is tracked as follow-up #570.
+                if let Some(key) = idempotency_key.as_deref()
+                    && self
+                        .open
+                        .get(&conversation_id)
+                        .and_then(|m| m.detail.as_ref())
+                        .is_some_and(|d| {
+                            d.messages
+                                .iter()
+                                .any(|msg| msg.idempotency_key.as_deref() == Some(key))
+                        })
+                {
+                    if let Some(stream) = self.stream_of_mut(&conversation_id)
+                        && stream.request_id.is_none()
+                    {
+                        stream.request_id = Some(request_id);
+                    }
+                    return vec![];
+                }
                 // Case 1 — this client's own send, echoed back (#1). We drew the
                 // user bubble optimistically at send time and set "__pending__"
                 // on this conversation's own stream (Phase-2 Step-2b-ii); claim
@@ -1340,6 +1448,9 @@ impl WindowState {
                             role: "user".to_string(),
                             content: content.clone(),
                             kind: MessageKind::Normal,
+                            // An externally-initiated turn (voice / another
+                            // client): not our optimistic send, so no key (#570).
+                            idempotency_key: None,
                         });
                     }
                     return vec![Effect::AddUserMessage(content)];
@@ -1474,6 +1585,8 @@ impl WindowState {
                         role: "assistant".to_string(),
                         content: full_response.clone(),
                         kind: MessageKind::Normal,
+                        // Assistant replies never carry a send idempotency key.
+                        idempotency_key: None,
                     });
                 }
                 let mut effects = vec![Effect::ClearChatStatus];
@@ -1847,6 +1960,7 @@ impl WindowState {
                             role: "assistant".to_string(),
                             content: full.clone(),
                             kind: MessageKind::Normal,
+                            idempotency_key: None,
                         });
                     }
                     effects.push(Effect::CompleteStreaming(full));
@@ -1990,6 +2104,7 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
             kind: MessageKind::Normal,
+            idempotency_key: None,
         }
     }
 
@@ -2022,6 +2137,232 @@ mod tests {
                 capabilities: api::ModelCapabilitiesView::default(),
             },
         }
+    }
+
+    // --- Idempotency key threading + exact-match dedup (#570) ------------
+
+    #[test]
+    fn submit_prompt_threads_idempotency_key_into_send_effect() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("turn-k".to_string()),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SendPrompt { idempotency_key: Some(k), .. }] if k == "turn-k"
+            ),
+            "the send effect must carry the client-minted idempotency key: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn optimistic_bubble_is_stamped_with_the_idempotency_key() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("turn-k".to_string()),
+        });
+        let bubble = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .last()
+            .expect("the optimistic user bubble");
+        assert_eq!(bubble.role, "user");
+        assert_eq!(
+            bubble.idempotency_key.as_deref(),
+            Some("turn-k"),
+            "the optimistic user bubble must be stamped with the send's key"
+        );
+    }
+
+    #[test]
+    fn an_echo_matching_the_optimistic_key_dedups_even_with_different_content() {
+        // Our own send: key `k`, content "a" — drawn optimistically.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+            idempotency_key: Some("k".to_string()),
+        });
+        // The daemon echoes `UserMessageAdded` with the SAME key but DIFFERENT
+        // content. Exact-key match (#570) must dedupe regardless of content —
+        // proving it is a key compare, not the content fallback.
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "r".to_string(),
+            content: "DIFFERENT".to_string(),
+            idempotency_key: Some("k".to_string()),
+        });
+        assert!(
+            !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "an exact-key echo must not draw a second bubble even when content differs: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "exactly one user bubble (the optimistic one), not a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_keyless_echo_still_uses_the_content_fallback() {
+        // With no idempotency key the pre-#570 content compare (Case 1b) still
+        // dedupes our own echoed send: a direct send draws the optimistic
+        // bubble, and the keyless echo of the same content — arriving before the
+        // ack opens the pending stream — renders nothing.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hi".to_string(),
+            idempotency_key: None,
+        });
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "r".to_string(),
+            content: "hi".to_string(),
+            idempotency_key: None,
+        });
+        assert!(
+            !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "a keyless echo of our own send must fall back to the content compare: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "exactly one user bubble via the keyless content fallback"
+        );
+    }
+
+    #[test]
+    fn queue_flush_uses_the_first_queued_messages_key() {
+        // Two sends queued mid-stream each carry their own key; the combined
+        // flush turn adopts the FIRST queued message's key (#570), so its echo
+        // still dedupes by exact match.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+            idempotency_key: Some("ka".to_string()),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+            idempotency_key: Some("kb".to_string()),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        let sent = effects.iter().find_map(|e| match e {
+            Effect::SendPrompt {
+                idempotency_key,
+                prompt,
+                ..
+            } => Some((idempotency_key.clone(), prompt.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            sent,
+            Some((Some("ka".to_string()), "a\n\nb".to_string())),
+            "the combined flush turn adopts the FIRST queued message's key: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn case0_claims_request_id_onto_pending_stream() {
+        // Our own send drew an optimistic bubble keyed `K`, then the ack opened
+        // a `__pending__` stream (real id not yet claimed). The keyed echo
+        // arrives: Case 0 recognizes it by exact key, claims the daemon
+        // `request_id` onto the pending stream (so later chunks correlate), and
+        // renders nothing — no duplicate bubble.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "ack-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        assert!(
+            state.stream_unclaimed(),
+            "precondition: the ack left a __pending__ stream with no claimed id"
+        );
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "R".to_string(),
+            content: "normalized-differently".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert_eq!(
+            state.stream_request_id(),
+            Some("R"),
+            "Case 0 must claim the real request_id onto the pending stream"
+        );
+        assert!(
+            !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "the keyed echo must not draw a second bubble: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "exactly one user bubble (the optimistic one)"
+        );
+    }
+
+    #[test]
+    fn case0_echo_before_ack_no_stream_renders_nothing() {
+        // The keyed echo can beat the `PromptSent` ack that opens the pending
+        // stream (a queue flush primes the daemon to echo first). With no stream
+        // yet, Case 0's exact-key match still dedupes the echo: nothing to claim,
+        // and no second bubble drawn.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hi".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert!(
+            state.any_stream().is_none(),
+            "precondition: no stream is open before the ack"
+        );
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "R".to_string(),
+            content: "hi".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert!(
+            echo.is_empty(),
+            "a keyed echo with no stream yet must render nothing: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "dedup holds before the ack opens the stream: one bubble only"
+        );
     }
 
     // --- __pending__ sentinel handoff (#31) ------------------------------
@@ -2081,6 +2422,7 @@ mod tests {
         .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "hello".to_string(),
+            idempotency_key: None,
         });
         // Optimistic user bubble drawn into the open transcript...
         let conv = state.current_conversation().unwrap();
@@ -2092,7 +2434,7 @@ mod tests {
         assert!(
             matches!(
                 effects.as_slice(),
-                [Effect::SendPrompt { conversation_id, prompt, system_refinement }]
+                [Effect::SendPrompt { conversation_id, prompt, system_refinement, .. }]
                     if conversation_id == "c1" && prompt == "hello" && system_refinement.is_none()
             ),
             "{effects:?}"
@@ -2111,6 +2453,7 @@ mod tests {
         });
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "hi".to_string(),
+            idempotency_key: None,
         });
         assert!(
             matches!(
@@ -2130,6 +2473,7 @@ mod tests {
         let before = state.current_conversation().unwrap().messages.len();
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "second".to_string(),
+            idempotency_key: None,
         });
         assert!(
             matches!(
@@ -2167,6 +2511,7 @@ mod tests {
         .with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: String::new(),
+            idempotency_key: None,
         });
         assert!(effects.is_empty());
         assert!(state.current_conversation().unwrap().messages.is_empty());
@@ -2264,6 +2609,7 @@ mod tests {
         state.set_composer_draft("c1", "hello".to_string());
         state.apply(UiMessage::SubmitPrompt {
             prompt: "hello".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.composer_draft("c1"),
@@ -2282,6 +2628,7 @@ mod tests {
         state.set_composer_draft("c1", "queued".to_string());
         state.apply(UiMessage::SubmitPrompt {
             prompt: "queued".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.composer_draft("c1"),
@@ -2750,6 +3097,7 @@ mod tests {
             .with_open(detail("c3", vec![]));
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "hello c3".to_string(),
+            idempotency_key: None,
         });
         assert!(
             matches!(
@@ -2783,6 +3131,7 @@ mod tests {
         let before = state.current_conversation().unwrap().messages.len();
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "second".to_string(),
+            idempotency_key: None,
         });
         assert!(
             !effects
@@ -2811,9 +3160,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "check the weather".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "in Boston".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.queued_messages_for_view(),
@@ -2870,9 +3221,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "a".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "b".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::StreamComplete {
             request_id: "req-real".to_string(),
@@ -2884,6 +3237,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             request_id: "req-2".to_string(),
             content: combined.clone(),
+            idempotency_key: None,
         });
         assert!(
             !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
@@ -2936,9 +3290,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "one".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "two".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-real".to_string(),
@@ -2962,9 +3318,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "one".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "two".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::StreamError {
             request_id: "req-real".to_string(),
@@ -2987,6 +3345,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "queued".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-real".to_string(),
@@ -3014,14 +3373,17 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "first".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "second".to_string(),
+            idempotency_key: None,
         });
         // Force idle WITHOUT flushing (as a backgrounded completion would).
         state.reset_streaming_state();
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "third".to_string(),
+            idempotency_key: None,
         });
         assert!(
             effects.iter().any(|e| matches!(
@@ -3040,6 +3402,7 @@ mod tests {
         let mut state = WindowState::default().with_open(detail("c1", vec![]));
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "hello".to_string(),
+            idempotency_key: None,
         });
         assert!(
             matches!(effects.as_slice(), [Effect::SendPrompt { prompt, .. }] if prompt == "hello"),
@@ -3054,6 +3417,7 @@ mod tests {
         for m in ["alpha", "bravo", "charlie"] {
             state.apply(UiMessage::SubmitPrompt {
                 prompt: m.to_string(),
+                idempotency_key: None,
             });
         }
         let effects = state.apply(UiMessage::EditQueued { index: 1 });
@@ -3072,6 +3436,7 @@ mod tests {
         // Edit and re-submit while still streaming → stays queued, reinserted at 1.
         state.apply(UiMessage::SubmitPrompt {
             prompt: "bravo EDITED".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.queued_messages_for_view(),
@@ -3090,9 +3455,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "x".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "y".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::EditQueued { index: 0 });
         assert!(
@@ -3109,6 +3476,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "only".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::EditQueued { index: 5 });
         assert_eq!(state.queued_messages_for_view(), &["only".to_string()]);
@@ -3120,9 +3488,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "a".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "b".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::EditQueued { index: 1 }); // check out "b"
         assert_eq!(state.editing_queued_index(), Some(1));
@@ -3148,9 +3518,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "keep".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "drop".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::RemoveQueued { index: 1 });
         assert_eq!(state.queued_messages_for_view(), &["keep".to_string()]);
@@ -3168,6 +3540,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "only".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::RemoveQueued { index: 9 });
         assert!(
@@ -3183,6 +3556,7 @@ mod tests {
         for m in ["a", "b", "c"] {
             state.apply(UiMessage::SubmitPrompt {
                 prompt: m.to_string(),
+                idempotency_key: None,
             });
         }
         state.apply(UiMessage::EditQueued { index: 2 }); // check out "c"; queue ["a","b"]
@@ -3196,6 +3570,7 @@ mod tests {
         assert_eq!(state.queued_messages_for_view(), &["b".to_string()]);
         state.apply(UiMessage::SubmitPrompt {
             prompt: "c".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.queued_messages_for_view(),
@@ -3209,6 +3584,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "original".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::EditQueued { index: 0 });
         assert!(state.queued_messages_for_view().is_empty());
@@ -3232,6 +3608,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "q".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::CancelQueuedEdit);
         assert!(
@@ -3246,13 +3623,16 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "a".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "b".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::EditQueued { index: 0 }); // check out "a"
         state.apply(UiMessage::SubmitPrompt {
             prompt: String::new(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.queued_messages_for_view(),
@@ -3267,6 +3647,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "   ".to_string(),
+            idempotency_key: None,
         });
         assert!(
             state.queued_messages_for_view().is_empty(),
@@ -3281,6 +3662,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "for c1".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
         assert!(
@@ -3302,6 +3684,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "later".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
         let bg = state.apply(UiMessage::StreamComplete {
@@ -3337,6 +3720,7 @@ mod tests {
         let mut state = WindowState::default();
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "hi".to_string(),
+            idempotency_key: None,
         });
         assert!(effects.is_empty());
     }
@@ -3350,9 +3734,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "a".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "b".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::EditQueued { index: 1 }); // check out "b"
         assert_eq!(state.editing_queued_index(), Some(1));
@@ -3377,6 +3763,7 @@ mod tests {
         // Finishing the edit (now idle) flushes the WHOLE batch, edit included.
         let flushed = state.apply(UiMessage::SubmitPrompt {
             prompt: "b fixed".to_string(),
+            idempotency_key: None,
         });
         assert!(
             flushed.iter().any(|e| matches!(
@@ -3397,6 +3784,7 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "msg1".to_string(),
+            idempotency_key: None,
         });
         // The user then typed a fresh draft (the client saved it).
         state.set_composer_draft("c1", "draft2".to_string());
@@ -3423,9 +3811,11 @@ mod tests {
         let mut state = mid_stream_state("c1", "c1");
         state.apply(UiMessage::SubmitPrompt {
             prompt: "x".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::SubmitPrompt {
             prompt: "y".to_string(),
+            idempotency_key: None,
         });
         // Reply completed while backgrounded → idle with a pending queue.
         state.reset_streaming_state();
@@ -4775,6 +5165,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             request_id: "voice-req".to_string(),
             content: "what's the weather?".to_string(),
+            idempotency_key: None,
         });
         assert!(
             effects
@@ -4818,6 +5209,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             request_id: "real-req".to_string(),
             content: "typed this".to_string(),
+            idempotency_key: None,
         });
         assert!(
             effects.is_empty(),
@@ -4847,6 +5239,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             request_id: "voice-req".to_string(),
             content: "a question".to_string(),
+            idempotency_key: None,
         });
         let done = state.apply(UiMessage::StreamComplete {
             request_id: "voice-req".to_string(),
@@ -4880,6 +5273,7 @@ mod tests {
             conversation_id: "c2".to_string(),
             request_id: "bg-req".to_string(),
             content: "background".to_string(),
+            idempotency_key: None,
         });
         assert!(
             effects.is_empty(),
@@ -4910,6 +5304,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             request_id: "other".to_string(),
             content: "concurrent".to_string(),
+            idempotency_key: None,
         });
         assert!(
             effects.is_empty(),

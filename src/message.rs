@@ -64,6 +64,13 @@ pub enum UiMessage {
         conversation_id: String,
         request_id: String,
         content: String,
+        /// Echoes the initiating `SendMessage.idempotency_key` (#570), so the
+        /// initiator can recognize its own send by exact key match against the
+        /// optimistic bubble it stamped — independent of send/echo ordering and
+        /// of whether the content still matches. `None` for keyless send paths
+        /// (a voice turn, another client, or a client that minted no key), which
+        /// fall back to the `request_id` / content dedupe.
+        idempotency_key: Option<String>,
     },
     /// Per-turn context-window fill report (desktop-assistant#341). Token
     /// COUNTS only — drives the read-only fill indicator in the status bar.
@@ -134,6 +141,13 @@ pub enum UiMessage {
     /// (transport concerns the core doesn't own).
     SubmitPrompt {
         prompt: String,
+        /// A client-minted, per-send idempotency key (#570) the reducer stamps
+        /// on the optimistic user bubble and emits on [`Effect::SendPrompt`], so
+        /// the echoed-back `UserMessageAdded` carrying the same key dedupes by
+        /// exact match. The reducer never mints keys itself (it stays
+        /// wasm-clean); the host passes one in. `None` keeps the keyless send
+        /// behaviour unchanged.
+        idempotency_key: Option<String>,
     },
     /// The send RPC for an optimistically-appended `prompt` failed: roll the
     /// optimistic user bubble back out of `conversation_id`'s transcript (only
@@ -328,11 +342,13 @@ impl std::fmt::Debug for UiMessage {
                 conversation_id,
                 request_id,
                 content,
+                idempotency_key,
             } => f
                 .debug_struct("UserMessageAdded")
                 .field("conversation_id", conversation_id)
                 .field("request_id", request_id)
                 .field("content", content)
+                .field("idempotency_key", idempotency_key)
                 .finish(),
             UiMessage::ContextUsage {
                 conversation_id,
@@ -374,9 +390,13 @@ impl std::fmt::Debug for UiMessage {
                 .field("task_id", task_id)
                 .field("conversation_id", conversation_id)
                 .finish(),
-            UiMessage::SubmitPrompt { prompt } => f
+            UiMessage::SubmitPrompt {
+                prompt,
+                idempotency_key,
+            } => f
                 .debug_struct("SubmitPrompt")
                 .field("prompt", prompt)
+                .field("idempotency_key", idempotency_key)
                 .finish(),
             UiMessage::SendFailed {
                 conversation_id,
@@ -508,10 +528,12 @@ pub fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
             conversation_id,
             request_id,
             content,
+            idempotency_key,
         } => UiMessage::UserMessageAdded {
             conversation_id,
             request_id,
             content,
+            idempotency_key,
         },
         SignalEvent::Chunk {
             request_id, chunk, ..
