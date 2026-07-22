@@ -200,10 +200,11 @@ fn build_connection_config(
     mode: TransportMode,
     address: &str,
     ws_jwt: Option<String>,
-    _share_client_context: bool,
+    share_client_context: bool,
 ) -> ConnectionConfig {
     let mut config = ConnectionConfig {
         transport_mode: mode,
+        share_client_context,
         ..Default::default()
     };
     match mode {
@@ -358,8 +359,7 @@ impl Engine {
             Intent::CancelTask(id) => self.spawn_cancel_task(id),
             Intent::FetchTaskLogs(id) => self.spawn_fetch_task_logs(id),
             Intent::SetWsJwt(jwt) => self.ws_jwt = (!jwt.is_empty()).then_some(jwt),
-            // TODO(spec): store the staged flag (wired in the implementation commit).
-            Intent::SetShareClientContext(_enabled) => {}
+            Intent::SetShareClientContext(enabled) => self.share_client_context = enabled,
             Intent::SendCommand {
                 request_id,
                 command_json,
