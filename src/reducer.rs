@@ -60,10 +60,10 @@ struct StreamState {
 }
 
 /// Separator used to fold several queued messages into one combined prompt on
-/// flush. A single newline preserves the line breaks the user got by pressing
-/// Enter between thoughts (as if they'd used Shift+Enter), so the batch reads as
-/// one message with several lines rather than run-together text.
-const QUEUE_JOIN: &str = "\n";
+/// flush. A blank line (an EOL plus an empty line) separates each queued
+/// message, so a burst of Enters reads as distinct paragraphs rather than
+/// run-together lines.
+const QUEUE_JOIN: &str = "\n\n";
 
 /// A queued message the user has pulled back into the composer to edit
 /// ([`ConversationModel::editing`]). Records where it came from so a re-submit
@@ -1285,6 +1285,30 @@ impl WindowState {
                     && stream.request_id.is_none()
                 {
                     stream.request_id = Some(request_id);
+                    return vec![];
+                }
+                // Case 1b — this client's own send echoed back BEFORE its
+                // `PromptSent` ack opened the `__pending__` stream. A queue FLUSH
+                // reliably hits this: the daemon, primed by the just-finished
+                // turn, emits `UserMessageAdded` for the combined follow-up
+                // before it acks the send, so Case 1 finds no pending stream yet.
+                // The optimistic bubble `commit_send` drew is still the last
+                // message; recognize this echo as its duplicate (same content,
+                // still unkeyed) and render nothing — otherwise Case 2 would draw
+                // the user bubble a second time and mark the reply external (so
+                // our own turn wouldn't narrate). The pending stream is opened by
+                // the ack (`PromptSent`) as usual, exactly as for a direct send.
+                // (An idempotency id on the send/echo would make this an exact
+                // match instead of a content compare; tracked as a follow-up.)
+                if self.current_stream().is_none()
+                    && self.is_active_conversation(&conversation_id)
+                    && self
+                        .current_conversation()
+                        .and_then(|c| c.messages.last())
+                        .is_some_and(|m| {
+                            m.id.is_empty() && m.role == "user" && m.content == content
+                        })
+                {
                     return vec![];
                 }
                 // Case 2 — a turn this client did NOT initiate (a voice turn, or
@@ -2810,7 +2834,10 @@ mod tests {
         });
         assert_eq!(
             sent,
-            Some(("c1".to_string(), "check the weather\nin Boston".to_string())),
+            Some((
+                "c1".to_string(),
+                "check the weather\n\nin Boston".to_string()
+            )),
             "the whole queue flushes as ONE newline-joined send: {effects:?}"
         );
         // The combined send is emitted AFTER the reply is finalized.
@@ -2827,6 +2854,104 @@ mod tests {
         assert!(
             state.queued_messages_for_view().is_empty(),
             "the queue is cleared after flush"
+        );
+    }
+
+    #[test]
+    fn a_flush_echo_arriving_before_the_ack_is_not_drawn_as_a_second_bubble() {
+        // Regression (queue-flush double render): the reply completes, the queue
+        // flushes as ONE combined send, and `commit_send` draws the optimistic
+        // user bubble. The daemon — primed by the turn that just finished —
+        // can echo `UserMessageAdded` for the follow-up BEFORE it acks the send
+        // (`PromptSent`), so the dedup's `__pending__` stream does not exist yet
+        // and the echo would fall through to the "external turn" path and draw
+        // the bubble a SECOND time. It must instead be recognized as our own
+        // send and rendered nothing.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+        });
+        state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        let combined = format!("a{QUEUE_JOIN}b");
+        // The echo arrives BEFORE the send's ack (`PromptSent`).
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "req-2".to_string(),
+            content: combined.clone(),
+        });
+        assert!(
+            !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "the echo of our own flushed send must not draw a second bubble: {echo:?}"
+        );
+        let combined_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content == combined)
+            .count();
+        assert_eq!(
+            combined_bubbles, 1,
+            "exactly one combined user bubble, not two"
+        );
+        // The ack arrives after the echo (the flush race) and opens the pending
+        // stream as usual; it draws no bubble, and the model still holds exactly
+        // one combined bubble.
+        let ack = state.apply(UiMessage::PromptSent {
+            task_id: String::new(),
+            conversation_id: "c1".to_string(),
+        });
+        assert!(
+            !ack.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "the late ack draws no bubble: {ack:?}"
+        );
+        assert!(
+            state.current_stream().is_some(),
+            "the follow-up turn is live after the ack"
+        );
+        let after_ack = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content == combined)
+            .count();
+        assert_eq!(
+            after_ack, 1,
+            "still exactly one combined bubble after the ack"
+        );
+    }
+
+    #[test]
+    fn queued_messages_join_with_a_blank_line_between_them() {
+        // A queued burst should read as separate paragraphs, not run-together
+        // lines: each message is separated by a blank line (an EOL plus an
+        // empty line) so the combined turn is legible.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "two".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        let sent = effects.iter().find_map(|e| match e {
+            Effect::SendPrompt { prompt, .. } => Some(prompt.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            sent,
+            Some("one\n\ntwo".to_string()),
+            "queued messages join with a blank line between them: {effects:?}"
         );
     }
 
@@ -2848,7 +2973,7 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::SendPrompt { prompt, .. } if prompt == "one\ntwo")),
+                .any(|e| matches!(e, Effect::SendPrompt { prompt, .. } if prompt == "one\n\ntwo")),
             "a failed turn flushes the queued follow-ups as one: {effects:?}"
         );
         assert!(state.queued_messages_for_view().is_empty());
@@ -2901,7 +3026,7 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::SendPrompt { prompt, .. } if prompt == "first\nsecond\nthird"
+                Effect::SendPrompt { prompt, .. } if prompt == "first\n\nsecond\n\nthird"
             )),
             "an Enter on an idle conversation with a pending queue flushes all: {effects:?}"
         );
@@ -3256,7 +3381,7 @@ mod tests {
         assert!(
             flushed.iter().any(|e| matches!(
                 e,
-                Effect::SendPrompt { prompt, .. } if prompt == "a\nb fixed"
+                Effect::SendPrompt { prompt, .. } if prompt == "a\n\nb fixed"
             )),
             "finishing the edit flushes the whole batch as one: {flushed:?}"
         );
@@ -3308,7 +3433,7 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::SendPrompt { prompt, .. } if prompt == "x\ny"
+                Effect::SendPrompt { prompt, .. } if prompt == "x\n\ny"
             )),
             "flush_pending_queue sends the backlog as one: {effects:?}"
         );
