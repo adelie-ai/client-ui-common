@@ -378,6 +378,7 @@ mod tests {
             conversation_id: "c1".into(),
             prompt: "hello".into(),
             system_refinement: None,
+            idempotency_key: None,
         });
         assert!(matches!(back, Err(b) if matches!(*b, Effect::SendPrompt { .. })));
 

@@ -435,7 +435,10 @@ impl Engine {
     /// double-render (the daemon's echoed `UserMessageAdded` is deduped by
     /// request_id, and a queued submit emits no `SendPrompt` at all).
     fn submit_prompt(&mut self, text: String) {
-        self.dispatch(UiMessage::SubmitPrompt { prompt: text });
+        self.dispatch(UiMessage::SubmitPrompt {
+            prompt: text,
+            idempotency_key: None,
+        });
     }
 
     /// Run one effect: view effects emit; the connector-state + RPC effects are
@@ -489,6 +492,7 @@ impl Engine {
                 conversation_id,
                 prompt,
                 system_refinement,
+                idempotency_key: _,
             } => {
                 // Draw the optimistic user bubble for our own send (the reducer
                 // pushed it into its transcript, but the KDE view is event-driven
