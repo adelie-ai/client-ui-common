@@ -137,6 +137,14 @@ pub enum Intent {
     /// client with no local D-Bus token minter (e.g. macOS) supply a token it
     /// obtained out-of-band from the daemon's `/login`.
     SetWsJwt(String),
+    /// Set whether basic device context (name, username, home dir, hostname,
+    /// timezone, OS) is shared with the assistant on the next connect (#549).
+    /// Mirrors the `ConnectionConfig::share_client_context` opt-out: the flag is
+    /// staged on the actor and applied when `spawn_connect` builds the config, so
+    /// a change takes effect on the next (re)connect. Default **on** — the core
+    /// initializes it `true`, matching `ConnectionConfig::default()`; the KDE KCM
+    /// checkbox flips it to opt out.
+    SetShareClientContext(bool),
     /// Send an arbitrary management `api::Command` (serialized as JSON) over the
     /// connector; the `CommandResult` comes back as a `command_result` view event
     /// keyed by `request_id`. The generic channel for settings/management
@@ -181,6 +189,40 @@ fn parse_effort(s: &str) -> Option<api::EffortLevel> {
     }
 }
 
+/// Assemble the [`ConnectionConfig`] for a connect from the staged inputs.
+///
+/// Pulled out of [`Engine::spawn_connect`] so the config-assembly logic is
+/// unit-testable across the FFI boundary without a live daemon or runtime: the
+/// transport-specific address wiring, the WS-only staged bearer token, and the
+/// `share_client_context` opt-out (#549) all land on the config here. Everything
+/// else keeps [`ConnectionConfig::default()`].
+fn build_connection_config(
+    mode: TransportMode,
+    address: &str,
+    ws_jwt: Option<String>,
+    share_client_context: bool,
+) -> ConnectionConfig {
+    let mut config = ConnectionConfig {
+        transport_mode: mode,
+        share_client_context,
+        ..Default::default()
+    };
+    match mode {
+        TransportMode::Uds if !address.is_empty() => {
+            config.socket_path = Some(address.into());
+        }
+        TransportMode::Ws if !address.is_empty() => config.ws_url = address.to_string(),
+        _ => {}
+    }
+    // An explicitly staged token short-circuits `resolve_ws_bearer_token` (no
+    // D-Bus / `/login` round-trip) — the macOS path, where the token was fetched
+    // out-of-band. Only meaningful for WS.
+    if matches!(mode, TransportMode::Ws) && ws_jwt.is_some() {
+        config.ws_jwt = ws_jwt;
+    }
+    config
+}
+
 /// The actor: owns the reducer state + the connector, runs effects.
 struct Engine {
     state: WindowState,
@@ -199,6 +241,11 @@ struct Engine {
     /// Explicit WS bearer token staged by `SetWsJwt`, applied to the next WS
     /// connect. `None` ⇒ let the connector mint one (D-Bus / `/login`).
     ws_jwt: Option<String>,
+    /// Whether to share basic device context with the assistant on connect
+    /// (#549), staged by `SetShareClientContext` and applied in `spawn_connect`.
+    /// `true` by default (matches `ConnectionConfig::default()`); the KDE KCM
+    /// checkbox flips it to opt out.
+    share_client_context: bool,
 }
 
 impl Engine {
@@ -312,6 +359,7 @@ impl Engine {
             Intent::CancelTask(id) => self.spawn_cancel_task(id),
             Intent::FetchTaskLogs(id) => self.spawn_fetch_task_logs(id),
             Intent::SetWsJwt(jwt) => self.ws_jwt = (!jwt.is_empty()).then_some(jwt),
+            Intent::SetShareClientContext(enabled) => self.share_client_context = enabled,
             Intent::SendCommand {
                 request_id,
                 command_json,
@@ -483,24 +531,9 @@ impl Engine {
     fn spawn_connect(&self, mode: TransportMode, address: String) {
         let tx = self.self_tx.clone();
         let ws_jwt = self.ws_jwt.clone();
+        let share_client_context = self.share_client_context;
         tokio::spawn(async move {
-            let mut config = ConnectionConfig {
-                transport_mode: mode,
-                ..Default::default()
-            };
-            match mode {
-                TransportMode::Uds if !address.is_empty() => {
-                    config.socket_path = Some(address.into());
-                }
-                TransportMode::Ws if !address.is_empty() => config.ws_url = address,
-                _ => {}
-            }
-            // An explicitly staged token short-circuits `resolve_ws_bearer_token`
-            // (no D-Bus / `/login` round-trip) — the macOS path, where the token
-            // was fetched out-of-band.
-            if matches!(mode, TransportMode::Ws) && ws_jwt.is_some() {
-                config.ws_jwt = ws_jwt;
-            }
+            let config = build_connection_config(mode, &address, ws_jwt, share_client_context);
             match Connector::connect(&config).await {
                 Ok(conn) => {
                     let conn = Arc::new(conn);
@@ -882,6 +915,9 @@ impl Core {
             sink,
             staged_override: None,
             ws_jwt: None,
+            // Default on, matching `ConnectionConfig::default()`; the KDE KCM
+            // checkbox opts out via `SetShareClientContext(false)` (#549).
+            share_client_context: true,
         };
         runtime.spawn(engine.run(rx));
         Self {
@@ -1012,5 +1048,97 @@ enabled = ["fake"]
         assert!(!host.handles("request_voice"));
 
         host.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod share_context_tests {
+    //! Cover the `share_client_context` opt-out wiring (#549): the intent stores
+    //! the staged flag on the actor, `spawn_connect`'s config assembly carries it
+    //! onto the `ConnectionConfig`, and the default is on. This is the KDE opt-out
+    //! path — the KCM checkbox flips the flag through the C-ABI setter.
+    use super::*;
+
+    /// A no-op view sink: these tests never assert on emitted events, they only
+    /// exercise the intent handler's field mutation.
+    extern "C" fn noop_sink(_user_data: *mut std::ffi::c_void, _json: *const std::ffi::c_char) {}
+
+    /// Build a bare engine for the field-storage assertions. No tokio runtime is
+    /// needed because `SetShareClientContext` only mutates a field — it never
+    /// spawns — so a plain `#[test]` suffices.
+    fn test_engine() -> Engine {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Engine {
+            state: WindowState::default(),
+            connector: None,
+            mcp_host: None,
+            self_tx: tx,
+            sink: ViewSink::new(noop_sink, 0),
+            staged_override: None,
+            ws_jwt: None,
+            share_client_context: true,
+        }
+    }
+
+    /// A fresh engine shares context by default, matching `ConnectionConfig::default()`.
+    #[test]
+    fn defaults_to_sharing_on() {
+        assert!(
+            test_engine().share_client_context,
+            "sharing must default on"
+        );
+    }
+
+    /// `SetShareClientContext(false)` stages the opt-out on the actor.
+    #[test]
+    fn intent_stores_opt_out() {
+        let mut engine = test_engine();
+        engine.handle_intent(Intent::SetShareClientContext(false));
+        assert!(
+            !engine.share_client_context,
+            "the opt-out flag must be stored on the engine"
+        );
+    }
+
+    /// ...and toggling back on restores sharing (the checkbox is re-checkable).
+    #[test]
+    fn intent_restores_sharing() {
+        let mut engine = test_engine();
+        engine.handle_intent(Intent::SetShareClientContext(false));
+        engine.handle_intent(Intent::SetShareClientContext(true));
+        assert!(
+            engine.share_client_context,
+            "sharing must be re-enablable after opting out"
+        );
+    }
+
+    /// The staged flag reaches the `ConnectionConfig` that `spawn_connect` builds:
+    /// off stays off, on stays on. Assembled via the same helper `spawn_connect`
+    /// uses, so this locks the flag onto the actual connect path.
+    #[test]
+    fn flag_reaches_connection_config() {
+        let off = build_connection_config(TransportMode::Ws, "", None, false);
+        assert!(
+            !off.share_client_context,
+            "the opt-out must reach the ConnectionConfig"
+        );
+        let on = build_connection_config(TransportMode::Ws, "", None, true);
+        assert!(
+            on.share_client_context,
+            "the opt-in must reach the ConnectionConfig"
+        );
+    }
+
+    /// The extraction preserves the transport-specific wiring: a UDS address
+    /// still lands as the socket path while the flag rides along.
+    #[test]
+    fn preserves_transport_wiring() {
+        let cfg = build_connection_config(TransportMode::Uds, "/run/adele.sock", None, false);
+        assert_eq!(
+            cfg.socket_path.as_deref(),
+            Some(std::path::Path::new("/run/adele.sock")),
+            "UDS address must still map to the socket path"
+        );
+        assert!(!cfg.share_client_context);
     }
 }

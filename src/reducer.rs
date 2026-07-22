@@ -1447,10 +1447,12 @@ impl WindowState {
                         effects.push(Effect::SubmitClientToolResult {
                             task_id,
                             tool_call_id,
-                            result: Ok("voice mode on (on-demand): your written reply is shown as \
+                            result: Ok(
+                                "voice mode on (on-demand): your written reply is shown as \
                                  text and not read aloud; speak by calling say_this, kept brief \
                                  and conversational"
-                                .to_string()),
+                                    .to_string(),
+                            ),
                         });
                         effects
                     }
@@ -3698,12 +3700,17 @@ mod tests {
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
             "Adele Disabled must never produce a Speak effect: {effects:?}"
         );
-        let inline = effects.iter().any(|e| matches!(
-            e,
-            Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
-                if content == "the aside"
-        ));
-        assert!(inline, "expected the SpeechDisabled downgrade line: {effects:?}");
+        let inline = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
+                    if content == "the aside"
+            )
+        });
+        assert!(
+            inline,
+            "expected the SpeechDisabled downgrade line: {effects:?}"
+        );
         let resolved = effects.iter().any(|e| {
             matches!(
                 e,
@@ -3925,10 +3932,9 @@ mod tests {
             "the aside downgrades to a shown line: {effects:?}"
         );
         assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                Effect::SubmitClientToolResult { result: Ok(_), .. }
-            )),
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { result: Ok(_), .. })),
             "still resolves a result: {effects:?}"
         );
     }
@@ -4023,7 +4029,10 @@ mod tests {
             assert!(
                 !effects.iter().any(|e| matches!(
                     e,
-                    Effect::AddLocalMessage { kind: MessageKind::SpeechDisabled, .. }
+                    Effect::AddLocalMessage {
+                        kind: MessageKind::SpeechDisabled,
+                        ..
+                    }
                 )),
                 "no SpeechDisabled downgrade when spoken (You={voice_in}): {effects:?}"
             );
@@ -4334,7 +4343,10 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::AddLocalMessage { kind: MessageKind::SpeechDisabled, .. }
+                Effect::AddLocalMessage {
+                    kind: MessageKind::SpeechDisabled,
+                    ..
+                }
             )),
             "the aside downgrades to text: {effects:?}"
         );

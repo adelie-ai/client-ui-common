@@ -147,6 +147,20 @@ void adele_core_fetch_task_logs(Core *core, const char *task_id);
 void adele_core_set_ws_jwt(Core *core, const char *jwt);
 
 /*
+ Set whether basic device context (name, username, home dir, hostname,
+ timezone, OS) is shared with the assistant on the next [`adele_core_connect`]
+ (#549). `true` (the default) shares it so the assistant can personalize;
+ `false` opts out, sending no context field / header at all. Staged on the
+ core and applied when the next connect builds its `ConnectionConfig`, so a
+ change takes effect on the following (re)connect. This backs the KDE KCM
+ "Share device info with the assistant" checkbox.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`].
+ */
+void adele_core_set_share_client_context(Core *core, bool enabled);
+
+/*
  Send an arbitrary management command (an `api::Command` serialized as JSON)
  over the connector. The `CommandResult` is delivered later as a
  `command_result` view event carrying the same `request_id`, so the caller can

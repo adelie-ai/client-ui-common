@@ -282,6 +282,25 @@ pub unsafe extern "C" fn adele_core_set_ws_jwt(core: *mut Core, jwt: *const c_ch
     core.send_intent(Intent::SetWsJwt(unsafe { cstr_to_string(jwt) }));
 }
 
+/// Set whether basic device context (name, username, home dir, hostname,
+/// timezone, OS) is shared with the assistant on the next [`adele_core_connect`]
+/// (#549). `true` (the default) shares it so the assistant can personalize;
+/// `false` opts out, sending no context field / header at all. Staged on the
+/// core and applied when the next connect builds its `ConnectionConfig`, so a
+/// change takes effect on the following (re)connect. This backs the KDE KCM
+/// "Share device info with the assistant" checkbox.
+///
+/// # Safety
+/// `core` must be a live handle from [`adele_core_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_set_share_client_context(core: *mut Core, enabled: bool) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::SetShareClientContext(enabled));
+}
+
 /// Send an arbitrary management command (an `api::Command` serialized as JSON)
 /// over the connector. The `CommandResult` is delivered later as a
 /// `command_result` view event carrying the same `request_id`, so the caller can
