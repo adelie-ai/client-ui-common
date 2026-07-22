@@ -257,6 +257,23 @@ struct Engine {
     share_client_context: bool,
 }
 
+/// Build the `SubmitPrompt` message for a user send, minting a fresh per-send
+/// idempotency key (#570). Pulled out of [`Engine::submit_prompt`] so the
+/// key-minting contract is unit-testable without standing up a transport.
+///
+/// Why the host mints it: the reducer stays wasm-clean and never generates
+/// UUIDs, so the native host supplies one. It stamps the optimistic bubble and
+/// rides the `SendMessage` wire field so a dropped-connection retry re-attaches
+/// to the live turn and the echoed `UserMessageAdded` dedupes by exact match.
+/// (KDE's default D-Bus transport drops the key — idempotency is inert there
+/// until a UDS/WS transport carries it; that is harmless.)
+fn submit_prompt_message(text: String) -> UiMessage {
+    UiMessage::SubmitPrompt {
+        prompt: text,
+        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+    }
+}
+
 impl Engine {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<CoreMsg>) {
         while let Some(msg) = rx.recv().await {
@@ -435,16 +452,7 @@ impl Engine {
     /// double-render (the daemon's echoed `UserMessageAdded` is deduped by
     /// request_id, and a queued submit emits no `SendPrompt` at all).
     fn submit_prompt(&mut self, text: String) {
-        // Mint a per-send idempotency key here (#570): the reducer stays
-        // wasm-clean and never generates UUIDs, so the native host supplies one.
-        // It stamps the optimistic bubble and rides the `SendMessage` wire field
-        // so a retry re-attaches and the echoed `UserMessageAdded` dedupes by
-        // exact match. (KDE's default D-Bus transport drops the key — idempotency
-        // is inert there until a UDS/WS transport carries it; that is harmless.)
-        self.dispatch(UiMessage::SubmitPrompt {
-            prompt: text,
-            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-        });
+        self.dispatch(submit_prompt_message(text));
     }
 
     /// Run one effect: view effects emit; the connector-state + RPC effects are
@@ -1181,5 +1189,60 @@ mod share_context_tests {
             "UDS address must still map to the socket path"
         );
         assert!(!cfg.share_client_context);
+    }
+}
+
+#[cfg(test)]
+mod idempotency_key_tests {
+    //! Cover the host-side per-send idempotency-key minting (#570): the native
+    //! FFI host supplies a fresh v4 UUID per user send so a dropped-connection
+    //! retry re-attaches to the live turn and the echoed `UserMessageAdded`
+    //! dedupes by exact match. Mirrors the GTK host's
+    //! `each_send_mints_a_distinct_idempotency_key` — the reducer stays
+    //! wasm-clean and never mints keys.
+    use super::*;
+
+    fn key_of(msg: UiMessage) -> String {
+        match msg {
+            UiMessage::SubmitPrompt {
+                idempotency_key, ..
+            } => idempotency_key.expect("a user send must carry an idempotency key"),
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    /// A user send stamps a fresh v4 (random) UUID key.
+    #[test]
+    fn send_stamps_a_fresh_v4_idempotency_key() {
+        let msg = submit_prompt_message("hello".to_string());
+        match &msg {
+            UiMessage::SubmitPrompt { prompt, .. } => assert_eq!(prompt, "hello"),
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+        let key = key_of(msg);
+        let parsed = uuid::Uuid::parse_str(&key).expect("the idempotency key must be a valid UUID");
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "the key must be a v4 (random) UUID"
+        );
+    }
+
+    /// Two sends mint DISTINCT keys — retrying one turn never re-attaches to
+    /// another. Each key also parses as a v4 UUID.
+    #[test]
+    fn each_send_mints_a_distinct_v4_key() {
+        let first = key_of(submit_prompt_message("a".to_string()));
+        let second = key_of(submit_prompt_message("b".to_string()));
+        assert_ne!(first, second, "each send must get its own idempotency key");
+        for key in [&first, &second] {
+            let parsed =
+                uuid::Uuid::parse_str(key).expect("each idempotency key must be a valid UUID");
+            assert_eq!(
+                parsed.get_version(),
+                Some(uuid::Version::Random),
+                "each key must be a v4 (random) UUID"
+            );
+        }
     }
 }

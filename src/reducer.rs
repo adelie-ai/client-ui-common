@@ -1357,6 +1357,14 @@ impl WindowState {
                 // correlate) if one exists yet, and render nothing. This subsumes
                 // Case 1 / Case 1b for keyed sends; the keyless fallbacks below
                 // stay for voice turns, other clients, and pre-key clients.
+                //
+                // Phase-1 limitation: the optimistic bubble's key lives only in
+                // memory. After a transcript RELOAD or a switch-away-and-back the
+                // detail is rebuilt from `MessageView`, which sets
+                // `idempotency_key: None` (the key is not persisted on the message
+                // row yet), so this exact-key match no longer fires and the
+                // content compare (Case 1b / Case 2) is the reload fallback.
+                // Persisting the key on the row is tracked as follow-up #570.
                 if let Some(key) = idempotency_key.as_deref()
                     && self
                         .open
@@ -2268,6 +2276,92 @@ mod tests {
             sent,
             Some((Some("ka".to_string()), "a\n\nb".to_string())),
             "the combined flush turn adopts the FIRST queued message's key: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn case0_claims_request_id_onto_pending_stream() {
+        // Our own send drew an optimistic bubble keyed `K`, then the ack opened
+        // a `__pending__` stream (real id not yet claimed). The keyed echo
+        // arrives: Case 0 recognizes it by exact key, claims the daemon
+        // `request_id` onto the pending stream (so later chunks correlate), and
+        // renders nothing — no duplicate bubble.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "ack-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        assert!(
+            state.stream_unclaimed(),
+            "precondition: the ack left a __pending__ stream with no claimed id"
+        );
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "R".to_string(),
+            content: "normalized-differently".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert_eq!(
+            state.stream_request_id(),
+            Some("R"),
+            "Case 0 must claim the real request_id onto the pending stream"
+        );
+        assert!(
+            !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "the keyed echo must not draw a second bubble: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "exactly one user bubble (the optimistic one)"
+        );
+    }
+
+    #[test]
+    fn case0_echo_before_ack_no_stream_renders_nothing() {
+        // The keyed echo can beat the `PromptSent` ack that opens the pending
+        // stream (a queue flush primes the daemon to echo first). With no stream
+        // yet, Case 0's exact-key match still dedupes the echo: nothing to claim,
+        // and no second bubble drawn.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hi".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert!(
+            state.any_stream().is_none(),
+            "precondition: no stream is open before the ack"
+        );
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "R".to_string(),
+            content: "hi".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert!(
+            echo.is_empty(),
+            "a keyed echo with no stream yet must render nothing: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "dedup holds before the ack opens the stream: one bubble only"
         );
     }
 
