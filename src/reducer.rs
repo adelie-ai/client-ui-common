@@ -2831,6 +2831,87 @@ mod tests {
     }
 
     #[test]
+    fn a_flush_echo_arriving_before_the_ack_is_not_drawn_as_a_second_bubble() {
+        // Regression (queue-flush double render): the reply completes, the queue
+        // flushes as ONE combined send, and `commit_send` draws the optimistic
+        // user bubble. The daemon — primed by the turn that just finished —
+        // can echo `UserMessageAdded` for the follow-up BEFORE it acks the send
+        // (`PromptSent`), so the dedup's `__pending__` stream does not exist yet
+        // and the echo would fall through to the "external turn" path and draw
+        // the bubble a SECOND time. It must instead be recognized as our own
+        // send and rendered nothing.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+        });
+        state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        let combined = format!("a{QUEUE_JOIN}b");
+        // The echo arrives BEFORE the send's ack (`PromptSent`).
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "req-2".to_string(),
+            content: combined.clone(),
+        });
+        assert!(
+            !echo
+                .iter()
+                .any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "the echo of our own flushed send must not draw a second bubble: {echo:?}"
+        );
+        let combined_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content == combined)
+            .count();
+        assert_eq!(
+            combined_bubbles, 1,
+            "exactly one combined user bubble, not two"
+        );
+        // The ack, arriving late, must be a no-op — it must not re-open or clobber
+        // the stream the echo already claimed.
+        let ack = state.apply(UiMessage::PromptSent {
+            task_id: String::new(),
+            conversation_id: "c1".to_string(),
+        });
+        assert!(ack.is_empty(), "the late ack is idempotent: {ack:?}");
+    }
+
+    #[test]
+    fn queued_messages_join_with_a_blank_line_between_them() {
+        // A queued burst should read as separate paragraphs, not run-together
+        // lines: each message is separated by a blank line (an EOL plus an
+        // empty line) so the combined turn is legible.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "two".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        let sent = effects.iter().find_map(|e| match e {
+            Effect::SendPrompt { prompt, .. } => Some(prompt.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            sent,
+            Some("one\n\ntwo".to_string()),
+            "queued messages join with a blank line between them: {effects:?}"
+        );
+    }
+
+    #[test]
     fn queue_flushes_on_stream_error_too() {
         // A failed turn still flushes the user's queued follow-ups: they're the
         // user's messages, not the failed reply's.
