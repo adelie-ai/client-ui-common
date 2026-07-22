@@ -162,6 +162,17 @@ pub enum ViewEvent {
     Status { text: String },
     /// Enable/disable the send control.
     SendSensitive { value: bool },
+    /// Replace the composer widget's text (cursor to end) — the reducer loads a
+    /// recalled queued message here, or clears the composer (`""`) when a
+    /// submitted message is queued or an edit is cancelled.
+    ComposerText { text: String },
+    /// Render-ready snapshot of the open conversation's queued messages (in
+    /// submit order) plus the index currently checked out for editing, if any.
+    /// Drives the "N queued" chips / indicator.
+    QueuedMessages {
+        messages: Vec<String>,
+        editing: Option<usize>,
+    },
     /// Replace the sidebar conversation list.
     Conversations { items: Vec<ConversationSummaryDto> },
     /// Load a conversation into the chat view (replaces the transcript).
@@ -244,6 +255,10 @@ impl ViewEvent {
         let ev = match effect {
             Effect::SetStatusText(text) => ViewEvent::Status { text },
             Effect::SetSendSensitive(value) => ViewEvent::SendSensitive { value },
+            Effect::SetComposerText(text) => ViewEvent::ComposerText { text },
+            Effect::SetQueuedMessages { messages, editing } => {
+                ViewEvent::QueuedMessages { messages, editing }
+            }
             Effect::SetConversations(convs) => ViewEvent::Conversations {
                 items: convs
                     .into_iter()
@@ -374,6 +389,29 @@ mod tests {
             ViewEvent::try_from_view_effect(Effect::SubscribeConversations(vec!["c".into()])),
             Err(b) if matches!(*b, Effect::SubscribeConversations(_))
         ));
+    }
+
+    #[test]
+    fn composer_text_effect_maps_to_a_view_event() {
+        let ev = ViewEvent::try_from_view_effect(Effect::SetComposerText("recalled".into()))
+            .expect("SetComposerText is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"composer_text","text":"recalled"}"#
+        );
+    }
+
+    #[test]
+    fn queued_messages_effect_maps_to_a_view_event() {
+        let ev = ViewEvent::try_from_view_effect(Effect::SetQueuedMessages {
+            messages: vec!["a".into(), "b".into()],
+            editing: Some(1),
+        })
+        .expect("SetQueuedMessages is a view effect");
+        let json = ev.to_json().unwrap();
+        assert!(json.contains(r#""type":"queued_messages""#), "{json}");
+        assert!(json.contains(r#""messages":["a","b"]"#), "{json}");
+        assert!(json.contains(r#""editing":1"#), "{json}");
     }
 
     #[test]

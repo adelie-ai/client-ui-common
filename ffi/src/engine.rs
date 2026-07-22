@@ -103,6 +103,15 @@ pub enum Intent {
     },
     /// The user submitted `prompt` into the open conversation.
     SendPrompt(String),
+    /// The user checked out queued message `index` to edit it (recall / a chip's
+    /// edit affordance). It loads into the composer via a `composer_text` view
+    /// event; re-submitting reinserts it in place.
+    EditQueued(usize),
+    /// The user removed queued message `index` (a chip's x) without sending it.
+    RemoveQueued(usize),
+    /// The user abandoned an in-progress queued-message edit (the checked-out
+    /// message returns to the queue unchanged and the composer clears).
+    CancelQueuedEdit,
     /// The user opened a conversation.
     SelectConversation(String),
     /// The user asked for a new conversation.
@@ -334,6 +343,9 @@ impl Engine {
         match intent {
             Intent::Connect { mode, address } => self.spawn_connect(mode, address),
             Intent::SendPrompt(text) => self.submit_prompt(text),
+            Intent::EditQueued(index) => self.dispatch(UiMessage::EditQueued { index }),
+            Intent::RemoveQueued(index) => self.dispatch(UiMessage::RemoveQueued { index }),
+            Intent::CancelQueuedEdit => self.dispatch(UiMessage::CancelQueuedEdit),
             Intent::SelectConversation(id) => self.spawn_get_conversation(id, false),
             Intent::NewConversation => self.spawn_create_conversation(),
             Intent::DeleteConversation(id) => self.spawn_delete_conversation(id),
@@ -414,24 +426,16 @@ impl Engine {
         });
     }
 
-    /// Send-decision via the shared core. The reducer draws the optimistic user
-    /// bubble into its own transcript but does NOT emit `AddUserMessage` for our
-    /// own send (tui re-reads state; our view is event-driven) — so surface the
-    /// bubble here when accepted, mirroring gtk's optimistic draw. The daemon's
-    /// echoed `UserMessageAdded` is deduped by request_id, so no double-render.
+    /// Send-decision via the shared core. The optimistic user bubble is drawn
+    /// where the `SendPrompt` effect is executed ([`run_rpc_effect`]), not here —
+    /// because a send can now also originate from a queue *flush* (a burst of
+    /// messages queued while a reply streamed, sent as one when it finishes),
+    /// which arrives as a `StreamComplete`/`StreamError` reducer message, not as
+    /// a `SubmitPrompt`. Drawing on the effect covers both paths with no
+    /// double-render (the daemon's echoed `UserMessageAdded` is deduped by
+    /// request_id, and a queued submit emits no `SendPrompt` at all).
     fn submit_prompt(&mut self, text: String) {
-        let effects = self.state.apply(UiMessage::SubmitPrompt {
-            prompt: text.clone(),
-        });
-        if effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendPrompt { .. }))
-        {
-            self.sink.emit(&ViewEvent::AddUserMessage { content: text });
-        }
-        for effect in effects {
-            self.run_effect(effect);
-        }
+        self.dispatch(UiMessage::SubmitPrompt { prompt: text });
     }
 
     /// Run one effect: view effects emit; the connector-state + RPC effects are
@@ -485,7 +489,17 @@ impl Engine {
                 conversation_id,
                 prompt,
                 system_refinement,
-            } => self.spawn_send(conversation_id, prompt, system_refinement),
+            } => {
+                // Draw the optimistic user bubble for our own send (the reducer
+                // pushed it into its transcript, but the KDE view is event-driven
+                // and doesn't re-read state). Covers both a direct submit and a
+                // queue flush; the daemon's echoed `UserMessageAdded` is deduped
+                // by request_id so this never double-renders.
+                self.sink.emit(&ViewEvent::AddUserMessage {
+                    content: prompt.clone(),
+                });
+                self.spawn_send(conversation_id, prompt, system_refinement);
+            }
             Effect::SubscribeConversations(ids) => self.spawn_subscribe(ids),
             Effect::FetchScratchpad(id) => self.spawn_fetch_scratchpad(id),
             Effect::SubmitClientToolResult {

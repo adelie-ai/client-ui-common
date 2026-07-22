@@ -117,13 +117,21 @@ pub enum UiMessage {
         conversation_id: String,
     },
     /// The user asked to send `prompt` into the currently-open conversation
-    /// (Enter / dictation). The reducer is the single decision point: it gates
-    /// the send (rejects while a reply is still streaming, TUI-7), draws the
-    /// user's bubble optimistically into the open transcript, and — when
-    /// accepted — emits [`Effect::SendPrompt`] carrying the conversation, the
-    /// prompt, and the voice-derived `system_refinement` for the client's
-    /// executor to run as the actual RPC. The connection gate and the staged
-    /// model override stay client-side (transport concerns the core doesn't own).
+    /// (Enter / dictation). The reducer is the single decision point:
+    /// - Idle with an empty queue → the normal send: draw the user's bubble
+    ///   optimistically and emit [`Effect::SendPrompt`] with the conversation,
+    ///   the prompt, and the voice-derived `system_refinement`.
+    /// - A reply is streaming into this conversation → the send is QUEUED (not
+    ///   refused): the text joins this conversation's outbox and the composer
+    ///   clears ([`Effect::SetComposerText`]). The whole queue flushes as ONE
+    ///   combined turn when the reply finishes (see [`Effect::SetQueuedMessages`]
+    ///   and the [`EditQueued`]/[`RemoveQueued`]/[`CancelQueuedEdit`] editing
+    ///   messages).
+    /// - Finishing an edit of a checked-out queued message → the edited text is
+    ///   reinserted in place (or dropped if emptied) rather than sent.
+    ///
+    /// The connection gate and the staged model override stay client-side
+    /// (transport concerns the core doesn't own).
     SubmitPrompt {
         prompt: String,
     },
@@ -237,6 +245,26 @@ pub enum UiMessage {
         tool_name: String,
         arguments: serde_json::Value,
     },
+
+    // --- Message queuing (queue-while-busy) -------------------------------
+    /// Pull the queued message at `index` back into the composer to edit it —
+    /// up-arrow recall or an edit affordance on a queued chip. Removes it from
+    /// the visible queue and loads it into the composer (via
+    /// [`Effect::SetComposerText`]); a following [`SubmitPrompt`] reinserts the
+    /// edited text at `index`. An out-of-range `index` is ignored. See the
+    /// queue design on `SubmitPrompt`.
+    EditQueued {
+        index: usize,
+    },
+    /// Remove the queued message at `index` (an x/delete affordance on a chip)
+    /// without sending it. An out-of-range `index` is ignored.
+    RemoveQueued {
+        index: usize,
+    },
+    /// Abandon an in-progress queued-message edit (Escape / focus-out): the
+    /// checked-out message is returned to the queue unchanged and the composer
+    /// is cleared. A no-op when not currently editing a queued message.
+    CancelQueuedEdit,
 }
 
 // Manual `Debug` (retained from when a variant carried the non-`Debug`
@@ -429,6 +457,14 @@ impl std::fmt::Debug for UiMessage {
                 .field("tool_name", tool_name)
                 .field("arguments", arguments)
                 .finish(),
+            UiMessage::EditQueued { index } => {
+                f.debug_struct("EditQueued").field("index", index).finish()
+            }
+            UiMessage::RemoveQueued { index } => f
+                .debug_struct("RemoveQueued")
+                .field("index", index)
+                .finish(),
+            UiMessage::CancelQueuedEdit => f.write_str("CancelQueuedEdit"),
         }
     }
 }
