@@ -59,6 +59,25 @@ struct StreamState {
     external: bool,
 }
 
+/// Separator used to fold several queued messages into one combined prompt on
+/// flush. A single newline preserves the line breaks the user got by pressing
+/// Enter between thoughts (as if they'd used Shift+Enter), so the batch reads as
+/// one message with several lines rather than run-together text.
+const QUEUE_JOIN: &str = "\n";
+
+/// A queued message the user has pulled back into the composer to edit
+/// ([`ConversationModel::editing`]). Records where it came from so a re-submit
+/// reinserts it in place and a cancel restores it unchanged.
+#[derive(Debug, Clone)]
+struct QueuedEdit {
+    /// The outbox slot the message was checked out from; a re-submit reinserts
+    /// the edited text here (clamped to the current queue length).
+    index: usize,
+    /// The message's text as it was when checked out, so `CancelQueuedEdit`
+    /// restores it even if the composer was edited.
+    original: String,
+}
+
 /// One conversation's view-model — all of its per-conversation state in one
 /// place, keyed by conversation id in [`WindowState::open`] so it's found by
 /// identity. Holds the loaded transcript (`detail`, optional so a model can
@@ -84,6 +103,19 @@ struct ConversationModel {
     /// The unsent composer draft for this conversation (the composer narrowing,
     /// #2) — empty when there is no draft.
     composer: String,
+    /// Messages the user submitted into this conversation *while a reply was
+    /// streaming* (the send was "not allowed"). Held in submit order and
+    /// flushed as ONE combined submission when the stream ends — so a burst of
+    /// Enter-presses ("I hit enter as I think") becomes a single turn, not
+    /// several. Empty when nothing is queued.
+    outbox: Vec<String>,
+    /// Set when the user has pulled a queued message back into the composer to
+    /// edit it (up-arrow recall / a chip's edit affordance): the outbox slot it
+    /// was checked out from (so a re-submit reinserts it in place) and its
+    /// original text (so a cancel restores it unchanged). `None` when composing
+    /// a fresh message. The checked-out message lives in the composer, not the
+    /// outbox, while this is `Some`.
+    editing: Option<QueuedEdit>,
     /// This conversation's in-flight streaming reply, or `None` when no turn is
     /// streaming for it (Phase-2 Step-2b-ii). Folding `stream` per-conversation
     /// (it formerly lived as a single `WindowState::stream`) lets several
@@ -378,6 +410,117 @@ impl WindowState {
             None => {}
         }
     }
+
+    /// The queued messages awaiting flush for `conversation_id`, in submit
+    /// order, or an empty slice when nothing is queued. View clients render the
+    /// "N queued" indicator / chips from this. Part of the shared public API.
+    pub fn queued_messages(&self, conversation_id: &str) -> &[String] {
+        self.open
+            .get(conversation_id)
+            .map_or(&[], |m| m.outbox.as_slice())
+    }
+
+    /// The queued messages for the *currently open* conversation. Part of the
+    /// shared public API — a client that redraws from state each frame reads
+    /// this rather than tracking [`Effect::SetQueuedMessages`].
+    pub fn queued_messages_for_view(&self) -> &[String] {
+        self.current_conversation_id
+            .as_deref()
+            .map_or(&[], |id| self.queued_messages(id))
+    }
+
+    /// The outbox index of the queued message currently checked out into the
+    /// composer for editing in the open conversation, or `None` when composing
+    /// a fresh message. Lets a client (the TUI) walk the queue with up/down.
+    /// Part of the shared public API.
+    pub fn editing_queued_index(&self) -> Option<usize> {
+        self.current_conversation_id
+            .as_deref()
+            .and_then(|id| self.open.get(id))
+            .and_then(|m| m.editing.as_ref())
+            .map(|e| e.index)
+    }
+
+    /// Build the render snapshot of the open conversation's queue for the
+    /// client — the queued texts plus the index being edited. Emitted whenever
+    /// the queue/edit state changes so the "N queued" indicator stays in sync.
+    fn queued_snapshot_effect(&self) -> Effect {
+        let (messages, editing) = self
+            .current_conversation_id
+            .as_deref()
+            .and_then(|id| self.open.get(id))
+            .map(|m| (m.outbox.clone(), m.editing.as_ref().map(|e| e.index)))
+            .unwrap_or_default();
+        Effect::SetQueuedMessages { messages, editing }
+    }
+
+    /// Commit `prompt` as a real send into the currently-open conversation:
+    /// draw the optimistic user bubble, drop the saved draft, and emit the send
+    /// RPC. Shared by the direct-send path ([`UiMessage::SubmitPrompt`], idle
+    /// with an empty queue) and the queue flush. Caller guarantees a current
+    /// conversation exists and it is idle (no in-flight stream). Does NOT touch
+    /// the live composer widget — the caller decides whether to clear it (a
+    /// direct send clears it; a background flush must not clobber a fresh
+    /// draft).
+    fn commit_send(&mut self, prompt: String) -> Vec<Effect> {
+        let conversation_id = self
+            .current_conversation_id
+            .clone()
+            .expect("commit_send requires a current conversation (caller contract)");
+        // Optimistic local echo of our own send (#1): draw the user bubble now
+        // so the turn feels instant. The daemon assigns the real id when it
+        // persists the turn; the echoed-back `UserMessageAdded` is de-duped by
+        // request_id, so an empty id here is correct.
+        if let Some(conv) = self.current_conversation_mut() {
+            conv.messages.push(ChatMessage {
+                id: String::new(),
+                role: "user".to_string(),
+                content: prompt.clone(),
+                kind: MessageKind::Normal,
+            });
+        }
+        // The send is committed: drop this conversation's saved composer draft
+        // so a later switch-away snapshot can't resurrect the just-sent text.
+        if let Some(model) = self.open.get_mut(&conversation_id) {
+            model.composer.clear();
+        }
+        let system_refinement = refinement_for_send(self).map(str::to_string);
+        vec![Effect::SendPrompt {
+            conversation_id,
+            prompt,
+            system_refinement,
+        }]
+    }
+
+    /// Flush the open conversation's queued messages as ONE combined send, if it
+    /// is idle and has a non-empty queue. Joins the queued texts with
+    /// [`QUEUE_JOIN`] and sends them as a single turn, then clears the queue.
+    /// The in-progress composer draft (a fresh, not-yet-Entered message) is left
+    /// untouched — only the committed queue is flushed. Returns the send effects
+    /// plus a cleared-queue snapshot, or an empty vec when there is nothing to
+    /// flush (no current conversation, a reply still streaming, or an empty
+    /// queue). Only ever flushes the *current* conversation, because the
+    /// combined send draws its optimistic bubble into the open transcript.
+    fn flush_outbox(&mut self) -> Vec<Effect> {
+        let Some(id) = self.current_conversation_id.clone() else {
+            return vec![];
+        };
+        if self.current_stream().is_some() {
+            return vec![];
+        }
+        let Some(model) = self.open.get_mut(&id) else {
+            return vec![];
+        };
+        if model.outbox.is_empty() {
+            return vec![];
+        }
+        let queued = std::mem::take(&mut model.outbox);
+        model.editing = None;
+        let combined = queued.join(QUEUE_JOIN);
+        let mut effects = self.commit_send(combined);
+        effects.push(self.queued_snapshot_effect());
+        effects
+    }
 }
 
 /// The system refinement to attach on the next send, or `None` (issue #80),
@@ -456,6 +599,22 @@ pub enum Effect {
     SetStatusText(String),
     /// Enable/disable the send button.
     SetSendSensitive(bool),
+    /// Replace the client's live composer widget text (cursor to end). The
+    /// reducer owns composer content for the message-queue flows: this loads a
+    /// recalled queued message for editing, and clears the composer (`""`) when
+    /// a submitted message is queued or an edit is cancelled. Distinct from the
+    /// passive [`composer_draft`](WindowState::composer_draft) store, which the
+    /// client snapshots on conversation switch.
+    SetComposerText(String),
+    /// Render-ready snapshot of the *current* conversation's queued-message
+    /// outbox: the queued texts in submit order, plus the outbox index currently
+    /// checked out for editing (loaded in the composer), if any. Emitted
+    /// whenever the queue or edit state changes, and on conversation load, so
+    /// the client repaints its "N queued" indicator / chips.
+    SetQueuedMessages {
+        messages: Vec<String>,
+        editing: Option<usize>,
+    },
     /// Repaint the sidebar conversation list.
     SetConversations(Vec<ConversationSummary>),
     /// Run `ensure_active_conversation` (selection sync + auto-load/-create).
@@ -611,6 +770,12 @@ impl std::fmt::Debug for Effect {
             Effect::ClearClient => f.write_str("ClearClient"),
             Effect::SetStatusText(t) => f.debug_tuple("SetStatusText").field(t).finish(),
             Effect::SetSendSensitive(b) => f.debug_tuple("SetSendSensitive").field(b).finish(),
+            Effect::SetComposerText(t) => f.debug_tuple("SetComposerText").field(t).finish(),
+            Effect::SetQueuedMessages { messages, editing } => f
+                .debug_struct("SetQueuedMessages")
+                .field("messages", messages)
+                .field("editing", editing)
+                .finish(),
             Effect::SetConversations(c) => f.debug_tuple("SetConversations").field(c).finish(),
             Effect::EnsureActiveConversation => f.write_str("EnsureActiveConversation"),
             Effect::LoadConversationIntoChat(d) => {
@@ -787,6 +952,14 @@ impl WindowState {
                     // conversation we left and must not linger over this one.
                     effects.push(Effect::ClearChatStatus);
                 }
+                // If this conversation had messages queued while a now-finished
+                // reply streamed (queued, then switched away before it completed
+                // — a backgrounded completion doesn't flush), flush them now that
+                // it's back in view and idle. Then resync the "N queued"
+                // indicator to this conversation's queue (usually empty), so
+                // chips from the previous conversation don't linger.
+                effects.extend(self.flush_outbox());
+                effects.push(self.queued_snapshot_effect());
                 effects
             }
             UiMessage::ConversationReloaded(detail) => {
@@ -872,62 +1045,152 @@ impl WindowState {
                 ]
             }
             UiMessage::SubmitPrompt { prompt } => {
-                // Single send-decision point (Phase-2): gate, draw the user's
-                // bubble optimistically, choose the per-turn refinement, and emit
-                // the RPC effect. The connection gate + the staged model override
-                // stay client-side (transport concerns the core doesn't own).
-                //
-                // Block a second send while a reply is still in flight *for the
-                // conversation we're sending into* (TUI-7). Each conversation owns
-                // its own stream now (Phase-2 Step-2b-ii), so a send to a
-                // different, idle conversation is allowed while another streams —
-                // interleaving only cross-wires the request-id claim *within* one
-                // conversation's single stream slot. The composer text is
-                // preserved client-side; surface why.
-                if self.current_stream().is_some() {
-                    return vec![Effect::SetStatusText(
-                        "A reply is still streaming — wait for it to finish (your text is \
-                         preserved)"
-                            .to_string(),
-                    )];
+                // Single send-decision point (Phase-2). Rather than *refuse* a
+                // send while a reply streams (the old TUI-7 gate), we QUEUE it:
+                // the user can keep hitting Enter as they think and the whole
+                // burst flushes as ONE combined turn when the reply finishes.
+                // The connection gate + staged model override stay client-side.
+                let Some(conversation_id) = self.current_conversation_id.clone() else {
+                    // No open conversation to send into: belt-and-braces no-op.
+                    return vec![];
+                };
+                let has_text = !prompt.trim().is_empty();
+
+                // (1) Finishing an edit of a checked-out queued message: reinsert
+                //     the edited text at its original slot (or drop it if
+                //     emptied) rather than sending now. The composer clears.
+                if let Some(edit) = self
+                    .open
+                    .get_mut(&conversation_id)
+                    .and_then(|m| m.editing.take())
+                {
+                    if let Some(model) = self.open.get_mut(&conversation_id) {
+                        if has_text {
+                            let at = edit.index.min(model.outbox.len());
+                            model.outbox.insert(at, prompt);
+                        }
+                        model.composer.clear();
+                    }
+                    let mut effects = vec![Effect::SetComposerText(String::new())];
+                    // Edit-then-Enter while idle means the user is done with the
+                    // batch: flush it as one. Still streaming → it stays queued.
+                    if self.current_stream().is_none() {
+                        effects.extend(self.flush_outbox());
+                    } else {
+                        effects.push(self.queued_snapshot_effect());
+                    }
+                    return effects;
                 }
-                // Nothing to send, or no open conversation to send into: ignore
-                // silently (the composer keeps its text; the action is gated
-                // upstream too, so this is a belt-and-braces no-op).
+
+                // (2) A reply is streaming into this conversation → QUEUE instead
+                //     of refusing. The Enter lands as a chip and the composer
+                //     clears; the batch flushes as one when the reply completes.
+                if self.current_stream().is_some() {
+                    if has_text && let Some(model) = self.open.get_mut(&conversation_id) {
+                        model.outbox.push(prompt);
+                        model.composer.clear();
+                    }
+                    return vec![
+                        Effect::SetComposerText(String::new()),
+                        self.queued_snapshot_effect(),
+                    ];
+                }
+
+                // (3) Idle but with a pending queue (e.g. the reply finished
+                //     between two Enters): append this message and flush the
+                //     whole batch as one combined send.
+                let has_queue = self
+                    .open
+                    .get(&conversation_id)
+                    .is_some_and(|m| !m.outbox.is_empty());
+                if has_queue {
+                    if has_text && let Some(model) = self.open.get_mut(&conversation_id) {
+                        model.outbox.push(prompt);
+                    }
+                    return self.flush_outbox();
+                }
+
+                // (4) Idle with an empty queue → the original single-send path.
+                //     An empty prompt here is a silent no-op (the composer keeps
+                //     its text; the action is gated upstream too).
                 if prompt.is_empty() {
                     return vec![];
                 }
+                self.commit_send(prompt)
+            }
+            UiMessage::EditQueued { index } => {
+                // Check out queued item `index` into the composer to edit it
+                // (up-arrow recall / a chip's edit affordance). Any
+                // already-checked-out item returns to the queue unchanged first
+                // — navigating between queued items discards the in-composer
+                // edits of the one you leave, like shell history.
                 let Some(conversation_id) = self.current_conversation_id.clone() else {
                     return vec![];
                 };
-                // Optimistic local echo of our own send (#1): draw the user bubble
-                // now so the turn feels instant. The daemon assigns the real id
-                // when it persists the turn; the echoed-back `UserMessageAdded` is
-                // de-duped by request_id, so an empty id here is correct.
-                if let Some(conv) = self.current_conversation_mut() {
-                    conv.messages.push(ChatMessage {
-                        id: String::new(),
-                        role: "user".to_string(),
-                        content: prompt.clone(),
-                        kind: MessageKind::Normal,
-                    });
+                let Some(model) = self.open.get_mut(&conversation_id) else {
+                    return vec![];
+                };
+                if let Some(prev) = model.editing.take() {
+                    let at = prev.index.min(model.outbox.len());
+                    model.outbox.insert(at, prev.original);
                 }
-                // The send is committed: drop this conversation's saved composer
-                // draft so a later switch-away snapshot can't resurrect the
-                // just-sent text (the client clears its live composer widget too).
-                if let Some(model) = self.open.get_mut(&conversation_id) {
-                    model.composer.clear();
+                if index >= model.outbox.len() {
+                    // Stale/out-of-range (the queue changed under a click): after
+                    // any reinsert there is nothing to check out — clear the
+                    // composer's edit state and resync.
+                    return vec![
+                        Effect::SetComposerText(String::new()),
+                        self.queued_snapshot_effect(),
+                    ];
                 }
-                // Per the conversation's `Adele:` level (#80) carry a system
-                // refinement so the reply is shaped for speech (OnDemand → brief;
-                // Always → speakable but full; Disabled → none). Decided here so
-                // the whole send decision is one tested place.
-                let system_refinement = refinement_for_send(self).map(str::to_string);
-                vec![Effect::SendPrompt {
-                    conversation_id,
-                    prompt,
-                    system_refinement,
-                }]
+                let text = model.outbox.remove(index);
+                model.editing = Some(QueuedEdit {
+                    index,
+                    original: text.clone(),
+                });
+                model.composer = text.clone();
+                vec![Effect::SetComposerText(text), self.queued_snapshot_effect()]
+            }
+            UiMessage::RemoveQueued { index } => {
+                // Drop queued item `index` without sending it (a chip's x).
+                let Some(conversation_id) = self.current_conversation_id.clone() else {
+                    return vec![];
+                };
+                let Some(model) = self.open.get_mut(&conversation_id) else {
+                    return vec![];
+                };
+                if index >= model.outbox.len() {
+                    return vec![];
+                }
+                model.outbox.remove(index);
+                // Keep an in-progress edit's reinsert slot consistent when an
+                // earlier queued item is removed out from under it.
+                if let Some(edit) = model.editing.as_mut()
+                    && index < edit.index
+                {
+                    edit.index -= 1;
+                }
+                vec![self.queued_snapshot_effect()]
+            }
+            UiMessage::CancelQueuedEdit => {
+                // Abandon an in-progress edit: return the checked-out message to
+                // the queue unchanged and clear the composer. No-op otherwise.
+                let Some(conversation_id) = self.current_conversation_id.clone() else {
+                    return vec![];
+                };
+                let Some(model) = self.open.get_mut(&conversation_id) else {
+                    return vec![];
+                };
+                let Some(edit) = model.editing.take() else {
+                    return vec![];
+                };
+                let at = edit.index.min(model.outbox.len());
+                model.outbox.insert(at, edit.original);
+                model.composer.clear();
+                vec![
+                    Effect::SetComposerText(String::new()),
+                    self.queued_snapshot_effect(),
+                ]
             }
             UiMessage::SendFailed {
                 conversation_id,
@@ -1169,6 +1432,11 @@ impl WindowState {
                 if let Some(id) = self.current_conversation_id.clone() {
                     effects.push(Effect::FetchScratchpad(id));
                 }
+                // The reply finished: flush any messages the user queued while it
+                // streamed as ONE combined follow-up turn. (Only reached for the
+                // in-view conversation — a backgrounded completion returned
+                // early above; its queue flushes when the user switches back.)
+                effects.extend(self.flush_outbox());
                 effects
             }
             UiMessage::StreamError { request_id, error } => {
@@ -1195,6 +1463,10 @@ impl WindowState {
                 let mut effects = vec![Effect::SetStatusText(format!("Error: {error}"))];
                 if is_active {
                     effects.insert(0, Effect::ClearChatStatus);
+                    // The turn failed, but the user's queued follow-ups are still
+                    // theirs to send: flush them as one combined turn now that
+                    // the conversation is idle again.
+                    effects.extend(self.flush_outbox());
                 }
                 effects
             }
@@ -1447,10 +1719,12 @@ impl WindowState {
                         effects.push(Effect::SubmitClientToolResult {
                             task_id,
                             tool_call_id,
-                            result: Ok("voice mode on (on-demand): your written reply is shown as \
+                            result: Ok(
+                                "voice mode on (on-demand): your written reply is shown as \
                                  text and not read aloud; speak by calling say_this, kept brief \
                                  and conversational"
-                                .to_string()),
+                                    .to_string(),
+                            ),
                         });
                         effects
                     }
@@ -1792,22 +2066,40 @@ mod tests {
     }
 
     #[test]
-    fn submit_prompt_is_blocked_while_a_reply_is_streaming() {
-        // TUI-7: a second send is refused mid-stream — no bubble, no RPC, just a
-        // status line explaining why (the client keeps the composer text).
+    fn submit_prompt_while_streaming_queues_instead_of_refusing() {
+        // Queue-while-busy: a send mid-stream is no longer refused — it is
+        // QUEUED. No bubble, no RPC yet; the composer clears and the message
+        // joins this conversation's outbox for a combined flush on completion.
         let mut state = mid_stream_state("c1", "c1");
         let before = state.current_conversation().unwrap().messages.len();
         let effects = state.apply(UiMessage::SubmitPrompt {
             prompt: "second".to_string(),
         });
         assert!(
-            matches!(effects.as_slice(), [Effect::SetStatusText(_)]),
-            "{effects:?}"
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::SetComposerText(t),
+                    Effect::SetQueuedMessages { messages, editing: None }
+                ] if t.is_empty() && messages == &["second".to_string()]
+            ),
+            "a mid-stream send clears the composer and queues the text: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { .. })),
+            "a queued send must not emit an RPC yet: {effects:?}"
         );
         assert_eq!(
             state.current_conversation().unwrap().messages.len(),
             before,
-            "a blocked send must not append a bubble"
+            "a queued send must not append a bubble yet"
+        );
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["second".to_string()],
+            "the text is now queued"
         );
     }
 
@@ -1925,9 +2217,11 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_send_preserves_the_saved_draft() {
-        // The send is gated mid-stream (TUI-7): nothing was sent, so the saved
-        // draft must survive (the client keeps its live composer text too).
+    fn a_queued_send_moves_the_draft_into_the_outbox() {
+        // A send mid-stream is queued, not refused: the text moves from the
+        // live composer into the outbox, so the saved draft is cleared (the
+        // client clears its live composer via SetComposerText) and the message
+        // now lives in the queue awaiting a combined flush.
         let mut state = mid_stream_state("c1", "c1");
         state.set_composer_draft("c1", "queued".to_string());
         state.apply(UiMessage::SubmitPrompt {
@@ -1935,8 +2229,13 @@ mod tests {
         });
         assert_eq!(
             state.composer_draft("c1"),
-            "queued",
-            "a blocked send must not clear the saved draft"
+            "",
+            "a queued send clears the saved draft (the text moved to the queue)"
+        );
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["queued".to_string()],
+            "the text is now in the outbox"
         );
     }
 
@@ -2409,12 +2708,12 @@ mod tests {
         assert_eq!(state.stream_of("c1").unwrap().buffer, "c1 partial ");
     }
 
-    /// TUI-7 preserved: a second send to the SAME conversation that is already
-    /// streaming is still blocked — its single stream slot renders one turn at a
-    /// time.
+    /// A second send to the SAME conversation that is already streaming is
+    /// queued (its single stream slot renders one turn at a time) — the burst
+    /// flushes as one combined follow-up when the reply finishes.
     #[test]
-    fn second_send_to_the_streaming_conversation_is_still_blocked() {
-        // c1 streams AND is the open conversation: a send into it is refused.
+    fn second_send_to_the_streaming_conversation_is_queued() {
+        // c1 streams AND is the open conversation: a send into it is queued.
         let mut state = WindowState::default()
             .with_stream(
                 "c1",
@@ -2430,14 +2729,459 @@ mod tests {
             prompt: "second".to_string(),
         });
         assert!(
-            matches!(effects.as_slice(), [Effect::SetStatusText(_)]),
-            "a send into the already-streaming open conversation must be blocked: {effects:?}"
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { .. })),
+            "a send into the already-streaming open conversation must not emit an RPC: {effects:?}"
+        );
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["second".to_string()],
+            "the send into the streaming conversation is queued"
         );
         assert_eq!(
             state.current_conversation().unwrap().messages.len(),
             before,
-            "a blocked send must not append a bubble"
+            "a queued send must not append a bubble yet"
         );
+    }
+
+    // --- Message queuing (queue-while-busy + edit) -----------------------
+
+    #[test]
+    fn queued_messages_flush_as_one_combined_send_on_stream_complete() {
+        // The headline behavior: two Enters while a reply streams become ONE
+        // newline-joined follow-up turn when the reply completes.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "check the weather".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "in Boston".to_string(),
+        });
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["check the weather".to_string(), "in Boston".to_string()],
+            "both sends are queued in submit order"
+        );
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        let sent = effects.iter().find_map(|e| match e {
+            Effect::SendPrompt {
+                conversation_id,
+                prompt,
+                ..
+            } => Some((conversation_id.clone(), prompt.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            sent,
+            Some(("c1".to_string(), "check the weather\nin Boston".to_string())),
+            "the whole queue flushes as ONE newline-joined send: {effects:?}"
+        );
+        // The combined send is emitted AFTER the reply is finalized.
+        let complete_at = effects
+            .iter()
+            .position(|e| matches!(e, Effect::CompleteStreaming(_)));
+        let send_at = effects
+            .iter()
+            .position(|e| matches!(e, Effect::SendPrompt { .. }));
+        assert!(
+            complete_at < send_at,
+            "the flush follows the finalized reply: {effects:?}"
+        );
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "the queue is cleared after flush"
+        );
+    }
+
+    #[test]
+    fn queue_flushes_on_stream_error_too() {
+        // A failed turn still flushes the user's queued follow-ups: they're the
+        // user's messages, not the failed reply's.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "two".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "boom".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { prompt, .. } if prompt == "one\ntwo")),
+            "a failed turn flushes the queued follow-ups as one: {effects:?}"
+        );
+        assert!(state.queued_messages_for_view().is_empty());
+    }
+
+    #[test]
+    fn flush_does_not_touch_the_live_composer() {
+        // The user may be mid-typing a fresh (not-yet-Entered) message when the
+        // reply completes. The flush sends only the committed queue and must NOT
+        // emit SetComposerText, so the live draft survives.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "queued".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "done".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { .. })),
+            "the queue flushed: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetComposerText(_))),
+            "flush must not touch the live composer (a fresh draft must survive): {effects:?}"
+        );
+    }
+
+    #[test]
+    fn submitting_while_idle_with_a_pending_queue_flushes_all_as_one() {
+        // Defensive path (3): a conversation left idle with a pending queue (as a
+        // backgrounded completion leaves it). The next Enter appends and flushes
+        // the whole batch as one.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "first".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "second".to_string(),
+        });
+        // Force idle WITHOUT flushing (as a backgrounded completion would).
+        state.reset_streaming_state();
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "third".to_string(),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SendPrompt { prompt, .. } if prompt == "first\nsecond\nthird"
+            )),
+            "an Enter on an idle conversation with a pending queue flushes all: {effects:?}"
+        );
+        assert!(state.queued_messages_for_view().is_empty());
+    }
+
+    #[test]
+    fn submitting_while_idle_with_no_queue_sends_immediately() {
+        // Regression: the original single-send path is unchanged when idle with
+        // an empty queue.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SendPrompt { prompt, .. }] if prompt == "hello"),
+            "an idle send with an empty queue goes out immediately: {effects:?}"
+        );
+        assert!(state.queued_messages_for_view().is_empty());
+    }
+
+    #[test]
+    fn editing_a_queued_message_checks_it_out_and_resubmit_reinserts_in_place() {
+        let mut state = mid_stream_state("c1", "c1");
+        for m in ["alpha", "bravo", "charlie"] {
+            state.apply(UiMessage::SubmitPrompt {
+                prompt: m.to_string(),
+            });
+        }
+        let effects = state.apply(UiMessage::EditQueued { index: 1 });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetComposerText(t) if t == "bravo")),
+            "the checked-out message loads into the composer: {effects:?}"
+        );
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["alpha".to_string(), "charlie".to_string()],
+            "the checked-out message leaves the visible queue"
+        );
+        assert_eq!(state.editing_queued_index(), Some(1));
+        // Edit and re-submit while still streaming → stays queued, reinserted at 1.
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "bravo EDITED".to_string(),
+        });
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &[
+                "alpha".to_string(),
+                "bravo EDITED".to_string(),
+                "charlie".to_string()
+            ],
+            "the edited message reinserts in its original slot"
+        );
+        assert_eq!(state.editing_queued_index(), None);
+    }
+
+    #[test]
+    fn edit_checkout_reports_the_editing_index_in_the_snapshot() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "x".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "y".to_string(),
+        });
+        let effects = state.apply(UiMessage::EditQueued { index: 0 });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SetQueuedMessages { editing: Some(0), messages } if messages == &["y".to_string()]
+            )),
+            "the snapshot reports the edited index and the remaining queue: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn editing_an_out_of_range_index_is_a_safe_noop() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "only".to_string(),
+        });
+        state.apply(UiMessage::EditQueued { index: 5 });
+        assert_eq!(state.queued_messages_for_view(), &["only".to_string()]);
+        assert_eq!(state.editing_queued_index(), None);
+    }
+
+    #[test]
+    fn checking_out_another_message_returns_the_previous_one_to_the_queue() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+        });
+        state.apply(UiMessage::EditQueued { index: 1 }); // check out "b"
+        assert_eq!(state.editing_queued_index(), Some(1));
+        assert_eq!(state.queued_messages_for_view(), &["a".to_string()]);
+        // Check out "a" without submitting: "b" returns to the queue first.
+        let effects = state.apply(UiMessage::EditQueued { index: 0 });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetComposerText(t) if t == "a")),
+            "the newly checked-out message loads: {effects:?}"
+        );
+        assert_eq!(state.editing_queued_index(), Some(0));
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["b".to_string()],
+            "the previously checked-out message is back in the queue"
+        );
+    }
+
+    #[test]
+    fn removing_a_queued_message_drops_it() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "keep".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "drop".to_string(),
+        });
+        let effects = state.apply(UiMessage::RemoveQueued { index: 1 });
+        assert_eq!(state.queued_messages_for_view(), &["keep".to_string()]);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SetQueuedMessages { messages, .. }] if messages == &["keep".to_string()]
+            ),
+            "removal emits a fresh queue snapshot: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn removing_an_out_of_range_index_is_ignored() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "only".to_string(),
+        });
+        let effects = state.apply(UiMessage::RemoveQueued { index: 9 });
+        assert!(
+            effects.is_empty(),
+            "an out-of-range remove is a no-op: {effects:?}"
+        );
+        assert_eq!(state.queued_messages_for_view(), &["only".to_string()]);
+    }
+
+    #[test]
+    fn removing_an_earlier_queued_item_shifts_the_edit_slot() {
+        let mut state = mid_stream_state("c1", "c1");
+        for m in ["a", "b", "c"] {
+            state.apply(UiMessage::SubmitPrompt {
+                prompt: m.to_string(),
+            });
+        }
+        state.apply(UiMessage::EditQueued { index: 2 }); // check out "c"; queue ["a","b"]
+        assert_eq!(state.editing_queued_index(), Some(2));
+        state.apply(UiMessage::RemoveQueued { index: 0 }); // remove "a"
+        assert_eq!(
+            state.editing_queued_index(),
+            Some(1),
+            "the reinsert slot shifts down when an earlier item is removed"
+        );
+        assert_eq!(state.queued_messages_for_view(), &["b".to_string()]);
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "c".to_string(),
+        });
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["b".to_string(), "c".to_string()],
+            "the edited message reinserts after the surviving item"
+        );
+    }
+
+    #[test]
+    fn cancelling_an_edit_restores_the_original_message() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "original".to_string(),
+        });
+        state.apply(UiMessage::EditQueued { index: 0 });
+        assert!(state.queued_messages_for_view().is_empty());
+        let effects = state.apply(UiMessage::CancelQueuedEdit);
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["original".to_string()],
+            "cancel returns the checked-out message to the queue unchanged"
+        );
+        assert_eq!(state.editing_queued_index(), None);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetComposerText(t) if t.is_empty())),
+            "cancel clears the composer: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_with_nothing_checked_out_is_a_noop() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "q".to_string(),
+        });
+        let effects = state.apply(UiMessage::CancelQueuedEdit);
+        assert!(
+            effects.is_empty(),
+            "cancel with no edit in progress is a no-op: {effects:?}"
+        );
+        assert_eq!(state.queued_messages_for_view(), &["q".to_string()]);
+    }
+
+    #[test]
+    fn submitting_an_emptied_edit_drops_the_message() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+        });
+        state.apply(UiMessage::EditQueued { index: 0 }); // check out "a"
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: String::new(),
+        });
+        assert_eq!(
+            state.queued_messages_for_view(),
+            &["b".to_string()],
+            "clearing a checked-out message and submitting drops it"
+        );
+        assert_eq!(state.editing_queued_index(), None);
+    }
+
+    #[test]
+    fn an_empty_submit_while_streaming_does_not_queue_a_blank() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "   ".to_string(),
+        });
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "a whitespace-only submit must not create a blank queued chip"
+        );
+    }
+
+    #[test]
+    fn queues_are_per_conversation() {
+        // Queue into c1 (streaming), then open c2 (idle): c1's queue must not
+        // appear for c2, and c1 keeps it while backgrounded.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "for c1".to_string(),
+        });
+        state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "c2 has its own empty queue"
+        );
+        assert_eq!(
+            state.queued_messages("c1"),
+            &["for c1".to_string()],
+            "c1 keeps its queue while backgrounded"
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_conversations_queue_flushes_on_switch_back() {
+        // Queue into c1 while it streams, switch away to c2, c1's reply completes
+        // while backgrounded (no flush), then switch back to c1 → the queue
+        // flushes as one.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "later".to_string(),
+        });
+        state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
+        let bg = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "c1 done".to_string(),
+        });
+        assert!(
+            !bg.iter().any(|e| matches!(e, Effect::SendPrompt { .. })),
+            "a backgrounded completion must not flush yet: {bg:?}"
+        );
+        assert_eq!(
+            state.queued_messages("c1"),
+            &["later".to_string()],
+            "the queue waits until the conversation is back in view"
+        );
+        let effects = state.apply(UiMessage::ConversationLoaded(detail(
+            "c1",
+            vec![msg("user", "hi")],
+        )));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SendPrompt { conversation_id, prompt, .. }
+                    if conversation_id == "c1" && prompt == "later"
+            )),
+            "switching back to an idle conversation flushes its queued messages: {effects:?}"
+        );
+        assert!(state.queued_messages("c1").is_empty());
+    }
+
+    #[test]
+    fn submitting_with_no_open_conversation_is_a_noop() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::SubmitPrompt {
+            prompt: "hi".to_string(),
+        });
+        assert!(effects.is_empty());
     }
 
     /// Multi-stream TUI-8: a disconnect drops EVERY conversation's in-flight
@@ -3151,10 +3895,18 @@ mod tests {
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(_),
+                Effect::SetQueuedMessages {
+                    messages,
+                    editing: None,
+                },
             ] => {
                 let roles: Vec<&str> = filtered.messages.iter().map(|m| m.role.as_str()).collect();
                 assert_eq!(roles, vec!["user", "assistant"]);
                 assert_eq!(filtered.messages[1].content, "answer");
+                assert!(
+                    messages.is_empty(),
+                    "a freshly-loaded conversation has an empty queue"
+                );
             }
             other => panic!("unexpected effects: {other:?}"),
         }
@@ -3247,6 +3999,7 @@ mod tests {
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(_),
+                Effect::SetQueuedMessages { editing: None, .. },
             ] => {
                 // Debug on: nothing is filtered out.
                 assert_eq!(filtered.messages.len(), 3);
@@ -3271,6 +4024,7 @@ mod tests {
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(conv),
+                Effect::SetQueuedMessages { editing: None, .. },
             ] => {
                 assert_eq!(sel.connection_id, "work");
                 assert_eq!(sel.model_id, "claude");
@@ -3698,12 +4452,17 @@ mod tests {
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
             "Adele Disabled must never produce a Speak effect: {effects:?}"
         );
-        let inline = effects.iter().any(|e| matches!(
-            e,
-            Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
-                if content == "the aside"
-        ));
-        assert!(inline, "expected the SpeechDisabled downgrade line: {effects:?}");
+        let inline = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::AddLocalMessage { content, kind: MessageKind::SpeechDisabled }
+                    if content == "the aside"
+            )
+        });
+        assert!(
+            inline,
+            "expected the SpeechDisabled downgrade line: {effects:?}"
+        );
         let resolved = effects.iter().any(|e| {
             matches!(
                 e,
@@ -3925,10 +4684,9 @@ mod tests {
             "the aside downgrades to a shown line: {effects:?}"
         );
         assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                Effect::SubmitClientToolResult { result: Ok(_), .. }
-            )),
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { result: Ok(_), .. })),
             "still resolves a result: {effects:?}"
         );
     }
@@ -4023,7 +4781,10 @@ mod tests {
             assert!(
                 !effects.iter().any(|e| matches!(
                     e,
-                    Effect::AddLocalMessage { kind: MessageKind::SpeechDisabled, .. }
+                    Effect::AddLocalMessage {
+                        kind: MessageKind::SpeechDisabled,
+                        ..
+                    }
                 )),
                 "no SpeechDisabled downgrade when spoken (You={voice_in}): {effects:?}"
             );
@@ -4334,7 +5095,10 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::AddLocalMessage { kind: MessageKind::SpeechDisabled, .. }
+                Effect::AddLocalMessage {
+                    kind: MessageKind::SpeechDisabled,
+                    ..
+                }
             )),
             "the aside downgrades to text: {effects:?}"
         );

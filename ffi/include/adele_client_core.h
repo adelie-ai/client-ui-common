@@ -63,6 +63,34 @@ void adele_core_connect(Core *core, const char *transport, const char *address);
 void adele_core_send_prompt(Core *core, const char *text);
 
 /*
+ Check out queued message `index` into the composer to edit it (up-arrow
+ recall / a chip's edit affordance). The text loads via a `composer_text` view
+ event; re-submitting reinserts it in place. An out-of-range index is ignored.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`].
+ */
+void adele_core_edit_queued(Core *core, uintptr_t index);
+
+/*
+ Remove queued message `index` (a chip's x) without sending it. An
+ out-of-range index is ignored.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`].
+ */
+void adele_core_remove_queued(Core *core, uintptr_t index);
+
+/*
+ Abandon an in-progress queued-message edit: the checked-out message returns
+ to the queue unchanged and the composer clears. A no-op when not editing.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`].
+ */
+void adele_core_cancel_queued_edit(Core *core);
+
+/*
  Open (load) a conversation by id.
 
  # Safety

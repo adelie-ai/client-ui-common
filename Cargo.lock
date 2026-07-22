@@ -248,6 +248,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
+ "clap_derive",
 ]
 
 [[package]]
@@ -260,6 +261,18 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -394,6 +407,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 name = "desktop-assistant-api-model"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "desktop-assistant-protocol",
  "serde",
  "serde_json",
@@ -419,6 +433,9 @@ dependencies = [
  "desktop-assistant-frame-codec",
  "desktop-assistant-mcp-client",
  "futures",
+ "iana-time-zone",
+ "libc",
+ "mcp-core",
  "reqwest",
  "rustls",
  "rustls-pki-types",
@@ -429,6 +446,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.7",
  "zbus",
 ]
 
@@ -1222,6 +1240,19 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "mcp-core"
+version = "0.1.0"
+source = "git+https://github.com/adelie-ai/mcp-core?rev=448b0e4a3e4dbfb04d56423d41077f0b114e6143#448b0e4a3e4dbfb04d56423d41077f0b114e6143"
+dependencies = [
+ "async-trait",
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "memchr"

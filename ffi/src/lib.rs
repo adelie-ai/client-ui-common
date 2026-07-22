@@ -122,6 +122,49 @@ pub unsafe extern "C" fn adele_core_send_prompt(core: *mut Core, text: *const c_
     core.send_intent(Intent::SendPrompt(unsafe { cstr_to_string(text) }));
 }
 
+/// Check out queued message `index` into the composer to edit it (up-arrow
+/// recall / a chip's edit affordance). The text loads via a `composer_text` view
+/// event; re-submitting reinserts it in place. An out-of-range index is ignored.
+///
+/// # Safety
+/// `core` must be a live handle from [`adele_core_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_edit_queued(core: *mut Core, index: usize) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::EditQueued(index));
+}
+
+/// Remove queued message `index` (a chip's x) without sending it. An
+/// out-of-range index is ignored.
+///
+/// # Safety
+/// `core` must be a live handle from [`adele_core_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_remove_queued(core: *mut Core, index: usize) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::RemoveQueued(index));
+}
+
+/// Abandon an in-progress queued-message edit: the checked-out message returns
+/// to the queue unchanged and the composer clears. A no-op when not editing.
+///
+/// # Safety
+/// `core` must be a live handle from [`adele_core_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_cancel_queued_edit(core: *mut Core) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::CancelQueuedEdit);
+}
+
 /// Open (load) a conversation by id.
 ///
 /// # Safety
