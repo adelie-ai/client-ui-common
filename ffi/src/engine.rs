@@ -40,16 +40,15 @@ use tokio::sync::mpsc;
 
 use crate::view_event::{ViewEvent, view_event_for_signal};
 
-/// Which `client-mcp.toml` surface this core resolves MCP servers (and
-/// `disabled_builtins`) for.
+/// The `client-mcp.toml` surface a core resolves MCP servers (and
+/// `disabled_builtins`) under when the client never declares one.
 ///
-/// **Known wart:** this cdylib now backs adele-mac as well as adele-kde, but the
-/// surface is still `"kde"` for both — so a Mac user's per-surface MCP selection
-/// is read from `[surfaces.kde]`. Kept as-is deliberately: changing it would
-/// silently repoint KDE's existing configs at a different section. Making the
-/// surface per-client (a build-time constant or an `adele_core_*` setter) is the
-/// proper fix and wants its own change.
-const MCP_SURFACE: &str = "kde";
+/// This cdylib backs both adele-kde and adele-mac, and the surface is what lets
+/// one machine-wide set of server *definitions* be enabled per client. It stays
+/// `"kde"` here so adele-kde — which predates the setter and never calls it —
+/// keeps reading `[surfaces.kde]` unchanged; every other client declares its own
+/// via [`Intent::SetMcpSurface`].
+pub const DEFAULT_MCP_SURFACE: &str = "kde";
 
 /// The C function the core calls with each view-event JSON string.
 ///
@@ -168,6 +167,13 @@ pub enum Intent {
     /// initializes it `true`, matching `ConnectionConfig::default()`; the KDE KCM
     /// checkbox flips it to opt out.
     SetShareClientContext(bool),
+    /// Declare which `client-mcp.toml` surface this client resolves its MCP
+    /// servers (and `disabled_builtins`) under, e.g. `"mac"`. Server definitions
+    /// are machine-wide; the surface is the per-client enable layer, so each
+    /// client must name its own or it silently adopts another's selection.
+    /// Staged on the actor and read when the next connect starts the MCP host.
+    /// An empty name is ignored, keeping [`DEFAULT_MCP_SURFACE`].
+    SetMcpSurface(String),
     /// Send an arbitrary management `api::Command` (serialized as JSON) over the
     /// connector; the `CommandResult` comes back as a `command_result` view event
     /// keyed by `request_id`. The generic channel for settings/management
@@ -274,6 +280,9 @@ struct Engine {
     /// `true` by default (matches `ConnectionConfig::default()`); the KDE KCM
     /// checkbox flips it to opt out.
     share_client_context: bool,
+    /// The `client-mcp.toml` surface this core resolves under; see
+    /// [`DEFAULT_MCP_SURFACE`].
+    mcp_surface: String,
 }
 
 /// Build the `SubmitPrompt` message for a user send, minting a fresh per-send
@@ -409,6 +418,10 @@ impl Engine {
             Intent::FetchTaskLogs(id) => self.spawn_fetch_task_logs(id),
             Intent::SetWsJwt(jwt) => self.ws_jwt = (!jwt.is_empty()).then_some(jwt),
             Intent::SetShareClientContext(enabled) => self.share_client_context = enabled,
+            // Ignore an empty name rather than resolving `[surfaces.]`, which
+            // would fall through to the `default` section and look like it worked.
+            Intent::SetMcpSurface(surface) if !surface.is_empty() => self.mcp_surface = surface,
+            Intent::SetMcpSurface(_) => {}
             Intent::SendCommand {
                 request_id,
                 command_json,
@@ -584,6 +597,7 @@ impl Engine {
         let tx = self.self_tx.clone();
         let ws_jwt = self.ws_jwt.clone();
         let share_client_context = self.share_client_context;
+        let mcp_surface = self.mcp_surface.clone();
         tokio::spawn(async move {
             let config = build_connection_config(mode, &address, ws_jwt, share_client_context);
             match Connector::connect(&config).await {
@@ -602,7 +616,7 @@ impl Engine {
                     // finds the host already in place (the channel is FIFO).
                     let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
                     let mcp_servers: Vec<_> = mcp_cfg
-                        .resolved_servers(MCP_SURFACE)
+                        .resolved_servers(&mcp_surface)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -623,7 +637,7 @@ impl Engine {
                             McpHost::start_with_disabled(
                                 &mcp_servers,
                                 mcp_builtins,
-                                mcp_cfg.surface_disabled_builtins(MCP_SURFACE),
+                                mcp_cfg.surface_disabled_builtins(&mcp_surface),
                             )
                             .await,
                         );
@@ -1013,6 +1027,7 @@ impl Core {
             // Default on, matching `ConnectionConfig::default()`; the KDE KCM
             // checkbox opts out via `SetShareClientContext(false)` (#549).
             share_client_context: true,
+            mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
         };
         runtime.spawn(engine.run(rx));
         Self {
