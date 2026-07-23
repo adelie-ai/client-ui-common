@@ -2723,6 +2723,133 @@ mod tests {
         );
     }
 
+    // --- retry a failed/timed-out turn (#138 item 3) --------------------------
+
+    /// Drive a direct send into `c1`, open its stream, then fail it.
+    fn send_then_fail(prompt: &str) -> WindowState {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        }
+        .with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: prompt.to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "t-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        state.apply(UiMessage::StreamError {
+            request_id: "r1".to_string(),
+            error: "the turn was abandoned".to_string(),
+        });
+        state
+    }
+
+    #[test]
+    fn stream_error_offers_retry_of_the_failed_prompt() {
+        // The timed-out/abandoned turn's prompt is offered back so the user can
+        // resend it ("try again") — the prompt is never dropped.
+        let mut state = send_then_fail("summarize the meeting notes");
+        assert_eq!(
+            state.take_pending_retry_prompt().as_deref(),
+            Some("summarize the meeting notes")
+        );
+    }
+
+    #[test]
+    fn retry_offer_is_consumed_once() {
+        let mut state = send_then_fail("hello");
+        assert_eq!(state.take_pending_retry_prompt().as_deref(), Some("hello"));
+        assert_eq!(
+            state.take_pending_retry_prompt(),
+            None,
+            "the offer is one-shot: a second take yields nothing"
+        );
+    }
+
+    #[test]
+    fn retry_is_not_offered_when_follow_ups_were_queued() {
+        // The user queued a follow-up while the turn streamed, then it failed.
+        // Their queued message is theirs to send (it flushes); we do not also
+        // shove the failed prompt back into the composer over the top of it.
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        }
+        .with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "first".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "t-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        // A second send while streaming is QUEUED, not sent.
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "second".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::StreamError {
+            request_id: "r1".to_string(),
+            error: "boom".to_string(),
+        });
+        assert_eq!(
+            state.take_pending_retry_prompt(),
+            None,
+            "queued follow-ups flush; the failed prompt is not re-offered on top"
+        );
+    }
+
+    #[test]
+    fn retry_is_not_offered_for_a_background_conversation_failure() {
+        // A turn on a conversation that is NOT in view fails; the open
+        // conversation's composer must not be touched.
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        }
+        .with_open(detail("c1", vec![]));
+        // A background turn on c2 (no bubble drawn in the open view).
+        state.apply(UiMessage::PromptSent {
+            task_id: "t-2".to_string(),
+            conversation_id: "c2".to_string(),
+        });
+        state.apply(UiMessage::StreamError {
+            request_id: "r2".to_string(),
+            error: "boom".to_string(),
+        });
+        assert_eq!(state.take_pending_retry_prompt(), None);
+    }
+
+    #[test]
+    fn a_successful_turn_offers_no_retry() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        }
+        .with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "t-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        state.apply(UiMessage::StreamComplete {
+            request_id: "r1".to_string(),
+            full_response: "hi there".to_string(),
+        });
+        assert_eq!(
+            state.take_pending_retry_prompt(),
+            None,
+            "a turn that finished has nothing to retry"
+        );
+    }
+
     // --- SubmitPrompt / SendFailed: the core-owned send decision ----------
 
     #[test]
