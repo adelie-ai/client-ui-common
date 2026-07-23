@@ -170,6 +170,15 @@ pub struct WindowState {
     /// [`current_conversation`](Self::current_conversation).
     open: HashMap<String, ConversationModel>,
     pub debug_enabled: bool,
+    /// A one-shot "try again" offer for the in-view turn that just failed
+    /// (#138 item 3): the failed prompt, set when a streaming turn errors/times
+    /// out for the open conversation with nothing queued, so a client can put it
+    /// back in the composer for a one-click resend. `None` otherwise. Consumed
+    /// via [`take_pending_retry_prompt`](Self::take_pending_retry_prompt); not
+    /// offered when follow-ups were queued (they flush instead), for a
+    /// background failure, or on success. Private — the offer is read once
+    /// through the taker so it can't linger and resurface later.
+    pending_retry_prompt: Option<String>,
 }
 
 impl WindowState {
@@ -344,6 +353,29 @@ impl WindowState {
         self.current_stream()
             .map(|s| s.task_id.clone())
             .filter(|t| !t.is_empty())
+    }
+
+    /// Take the one-shot "try again" offer for a just-failed in-view turn
+    /// (#138 item 3), if any — the failed prompt, for a client to drop back into
+    /// the composer for a one-click resend. Consuming it clears it, so a stale
+    /// offer can never resurface on a later, unrelated moment; a client should
+    /// only apply it when its composer is empty, so it never overwrites text the
+    /// user typed while waiting. Part of the shared public API.
+    pub fn take_pending_retry_prompt(&mut self) -> Option<String> {
+        self.pending_retry_prompt.take()
+    }
+
+    /// The content of the most recent `user` message in the open conversation —
+    /// the optimistic bubble of the turn just sent. Used to recover a failed
+    /// turn's prompt for the retry offer (#138). `None` when nothing is open or
+    /// the transcript holds no user message.
+    fn last_user_prompt_in_view(&self) -> Option<String> {
+        self.current_conversation()?
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
     }
 
     /// Drop *every* conversation's in-flight streaming state *without* finalizing
@@ -1713,7 +1745,18 @@ impl WindowState {
                     // The turn failed, but the user's queued follow-ups are still
                     // theirs to send: flush them as one combined turn now that
                     // the conversation is idle again.
-                    effects.extend(self.flush_outbox());
+                    let flush = self.flush_outbox();
+                    let had_queued_follow_ups = !flush.is_empty();
+                    effects.extend(flush);
+                    // Retry offer (#138 item 3): with no queued follow-up to send,
+                    // the failed prompt would otherwise be lost from the composer.
+                    // Offer it back for a one-click "try again" — recovered from
+                    // the optimistic user bubble still in the transcript. If
+                    // follow-ups were queued, the user has moved on; we flush
+                    // those instead of shoving the failed prompt over the top.
+                    if !had_queued_follow_ups {
+                        self.pending_retry_prompt = self.last_user_prompt_in_view();
+                    }
                 }
                 effects
             }
