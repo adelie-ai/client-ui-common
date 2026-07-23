@@ -48,6 +48,12 @@ pub struct ChatMessageDto {
     pub id: String,
     pub role: String,
     pub content: String,
+    /// Presentation metadata as an ABI token (`normal` / `spoken` /
+    /// `speech_disabled`). Projected so a client can render a Spoken or
+    /// SpeechDisabled affordance from the metadata instead of parsing
+    /// `content` — `MessageKind` carries no serde derive, so it travels as a
+    /// string like [`adele_output_str`] does for `AdeleOutput`.
+    pub kind: &'static str,
 }
 
 impl From<ChatMessage> for ChatMessageDto {
@@ -56,7 +62,34 @@ impl From<ChatMessage> for ChatMessageDto {
             id: m.id,
             role: m.role,
             content: m.content,
+            kind: message_kind_str(m.kind),
         }
+    }
+}
+
+/// The ABI token for a [`MessageKind`](api::client::MessageKind).
+pub fn message_kind_str(kind: api::client::MessageKind) -> &'static str {
+    match kind {
+        api::client::MessageKind::Normal => "normal",
+        api::client::MessageKind::Spoken => "spoken",
+        api::client::MessageKind::SpeechDisabled => "speech_disabled",
+    }
+}
+
+/// The [`ViewEvent`] a daemon signal produces *directly*, bypassing the
+/// reducer, or `None` when the reducer already covers it.
+///
+/// Why: nearly every signal becomes a `UiMessage` and reaches the view as an
+/// `Effect`. `KnowledgeChanged` is the exception — the knowledge browser is a
+/// self-contained widget rather than part of the conversation reducer, so the
+/// reducer drops the message and each client wires its own refresh at the
+/// window layer. This FFI *is* that layer for its clients, so it forwards the
+/// signal itself. Keep this list minimal: a signal the reducer already handles
+/// would otherwise reach the view twice.
+pub fn view_event_for_signal(sig: &api::SignalEvent) -> Option<ViewEvent> {
+    match sig {
+        api::SignalEvent::KnowledgeChanged => Some(ViewEvent::KnowledgeChanged),
+        _ => None,
     }
 }
 
@@ -230,6 +263,11 @@ pub enum ViewEvent {
     /// Recompute the side pane's per-conversation task view (the C++ side filters
     /// its own task list — this is the hint to refresh).
     RefreshSidePaneTasks,
+    /// The user's knowledge base changed — refetch it if a browser is open.
+    /// Forwarded straight from the daemon signal by [`view_event_for_signal`]
+    /// rather than produced by the reducer, which does not model the knowledge
+    /// browser.
+    KnowledgeChanged,
     /// Speak `text` (the C++ side may route this to `org.desktopAssistant.Voice`;
     /// the plasmoid has no embedded engine, so it is a no-op there).
     Speak { text: String },
@@ -413,6 +451,77 @@ mod tests {
         assert!(json.contains(r#""type":"queued_messages""#), "{json}");
         assert!(json.contains(r#""messages":["a","b"]"#), "{json}");
         assert!(json.contains(r#""editing":1"#), "{json}");
+    }
+
+    #[test]
+    fn chat_message_dto_projects_kind() {
+        // `ChatMessage` carries explicit presentation metadata (voice#126), but
+        // the DTO used to drop it — leaving an FFI client (adele-mac, adele-kde)
+        // unable to render a Spoken / SpeechDisabled affordance without parsing
+        // `content` back, which is exactly what the metadata exists to avoid.
+        let dto = ChatMessageDto::from(ChatMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: "hello".into(),
+            kind: api::client::MessageKind::Spoken,
+            idempotency_key: None,
+        });
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""kind":"spoken""#), "{json}");
+    }
+
+    #[test]
+    fn every_message_kind_has_a_distinct_abi_token() {
+        // One-way only: the C side never sets a message kind, so unlike
+        // `adele_output_*` there is no parse-back counterpart. The tokens are a
+        // wire contract a client matches on, so pin them literally.
+        assert_eq!(message_kind_str(api::client::MessageKind::Normal), "normal");
+        assert_eq!(message_kind_str(api::client::MessageKind::Spoken), "spoken");
+        assert_eq!(
+            message_kind_str(api::client::MessageKind::SpeechDisabled),
+            "speech_disabled"
+        );
+    }
+
+    #[test]
+    fn a_normal_message_still_carries_its_kind() {
+        // The common case must be explicit rather than an absent field, so a
+        // client reads one contract instead of "missing ⇒ normal".
+        let dto = ChatMessageDto::from(ChatMessage {
+            id: "m2".into(),
+            role: "user".into(),
+            content: "hi".into(),
+            kind: api::client::MessageKind::Normal,
+            idempotency_key: None,
+        });
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""kind":"normal""#), "{json}");
+    }
+
+    #[test]
+    fn knowledge_changed_signal_maps_to_a_view_event() {
+        // The conversation reducer deliberately ignores `KnowledgeChanged` (the
+        // knowledge browser is a self-contained widget), so gtk subscribes to the
+        // signal at its window layer. The FFI *is* the window-layer boundary for
+        // adele-mac / adele-kde, so it forwards the signal directly.
+        let ev = view_event_for_signal(&api::SignalEvent::KnowledgeChanged)
+            .expect("KnowledgeChanged is forwarded to the view");
+        assert_eq!(ev.to_json().unwrap(), r#"{"type":"knowledge_changed"}"#);
+    }
+
+    #[test]
+    fn unrelated_signals_are_not_forwarded_to_the_view() {
+        // Only signals the reducer drops on the floor need a direct forward;
+        // everything else must keep flowing through `signal_to_ui_message` alone,
+        // or the view would see it twice.
+        assert!(
+            view_event_for_signal(&api::SignalEvent::Chunk {
+                conversation_id: "c1".into(),
+                request_id: "r1".into(),
+                chunk: "hi".into(),
+            })
+            .is_none()
+        );
     }
 
     #[test]
