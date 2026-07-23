@@ -484,6 +484,56 @@ mod tests {
     }
 
     #[test]
+    fn inline_note_carries_structured_kind() {
+        // A `say_this` line generated DURING a turn reaches the view as
+        // `AddLocalMessage`. The kind used to be stringified into the note's
+        // text ("Spoken: …" / "(speech mode disabled) …") and parsed back by the
+        // client — the very round-trip the metadata exists to avoid. The event
+        // carries the kind as an ABI token and leaves `text` unmarked; a client
+        // renders whatever affordance it has (a badge, or its own marker).
+        let ev = ViewEvent::try_from_view_effect(Effect::AddLocalMessage {
+            content: "hello there".into(),
+            kind: api::client::MessageKind::Spoken,
+        })
+        .expect("AddLocalMessage is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"inline_note","text":"hello there","kind":"spoken"}"#
+        );
+    }
+
+    #[test]
+    fn a_speech_disabled_inline_note_is_unmarked_too() {
+        // The suppressed case travelled as a parenthetical prefix, which is the
+        // one most likely to be mistaken for prose the model wrote.
+        let ev = ViewEvent::try_from_view_effect(Effect::AddLocalMessage {
+            content: "hello there".into(),
+            kind: api::client::MessageKind::SpeechDisabled,
+        })
+        .expect("AddLocalMessage is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"inline_note","text":"hello there","kind":"speech_disabled"}"#
+        );
+    }
+
+    #[test]
+    fn an_ordinary_inline_note_carries_the_normal_token() {
+        // Notes that are not `say_this` lines (reconnect notices and the like)
+        // must state `normal` explicitly rather than omit the field, so a client
+        // reads one contract instead of "missing ⇒ normal".
+        let ev = ViewEvent::try_from_view_effect(Effect::AddLocalMessage {
+            content: "Reconnected to the daemon.".into(),
+            kind: api::client::MessageKind::Normal,
+        })
+        .expect("AddLocalMessage is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"inline_note","text":"Reconnected to the daemon.","kind":"normal"}"#
+        );
+    }
+
+    #[test]
     fn a_normal_message_still_carries_its_kind() {
         // The common case must be explicit rather than an absent field, so a
         // client reads one contract instead of "missing ⇒ normal".
