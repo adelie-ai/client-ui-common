@@ -587,4 +587,57 @@ mod tests {
         assert_eq!(adele_output_from_str("garbage"), AdeleOutput::Disabled);
         assert_eq!(adele_output_from_str(""), AdeleOutput::Disabled);
     }
+
+    // --- mcp_builtins (the built-in inventory read path) -----------------------
+
+    fn builtin_dto(name: &str, overridden_by: Option<&str>) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: name.to_string(),
+            namespace: name.to_string(),
+            kind: BUILTIN_KIND,
+            tool_count: 3,
+            overridden_by: overridden_by.map(str::to_string),
+            disabled_by_config: false,
+        }
+    }
+
+    /// The wire shape every client decodes. Pinned literally: the field names ARE
+    /// the ABI, and a rename would silently blank the panel rather than fail.
+    #[test]
+    fn mcp_builtins_event_carries_the_surface_and_every_row_field() {
+        let ev = ViewEvent::McpBuiltins {
+            surface: "mac".to_string(),
+            servers: vec![builtin_dto("fileio", None)],
+        };
+        assert_eq!(
+            ev.to_json().expect("serializes"),
+            r#"{"type":"mcp_builtins","surface":"mac","servers":[{"name":"fileio","namespace":"fileio","kind":"built_in","tool_count":3,"overridden_by":null,"disabled_by_config":false}]}"#
+        );
+    }
+
+    /// An override travels as the shadowing server's name, not a bare boolean, so
+    /// the panel can name it in the row's reason line.
+    #[test]
+    fn mcp_builtins_event_names_the_overriding_server() {
+        let ev = ViewEvent::McpBuiltins {
+            surface: "mac".to_string(),
+            servers: vec![builtin_dto("web", Some("web"))],
+        };
+        let json = ev.to_json().expect("serializes");
+        assert!(json.contains(r#""overridden_by":"web""#), "{json}");
+    }
+
+    /// A core with no built-ins linked still answers — with an empty list — so the
+    /// panel can tell "none compiled in" from "never asked".
+    #[test]
+    fn mcp_builtins_event_answers_empty_rather_than_silently() {
+        let ev = ViewEvent::McpBuiltins {
+            surface: "kde".to_string(),
+            servers: Vec::new(),
+        };
+        assert_eq!(
+            ev.to_json().expect("serializes"),
+            r#"{"type":"mcp_builtins","surface":"kde","servers":[]}"#
+        );
+    }
 }
