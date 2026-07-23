@@ -12,7 +12,10 @@
 //! Daemon signals arrive on the same channel too (a pump maps each
 //! [`SignalEvent`](desktop_assistant_api_model::SignalEvent) →
 //! [`UiMessage`] via [`signal_to_ui_message`]), so live cross-client turns flow
-//! through the identical path. The actor never blocks: `apply` + `emit` +
+//! through the identical path. A signal the reducer does not model is also
+//! forwarded straight to the view by
+//! [`view_event_for_signal`](crate::view_event::view_event_for_signal), since no
+//! `Effect` would ever carry it. The actor never blocks: `apply` + `emit` +
 //! `tokio::spawn` are all synchronous, so the loop returns to `recv` immediately.
 //!
 //! The reducer is transport-free (it carries no `Connector`): the actor owns the
@@ -35,7 +38,7 @@ use desktop_assistant_client_common::{
 };
 use tokio::sync::mpsc;
 
-use crate::view_event::ViewEvent;
+use crate::view_event::{ViewEvent, view_event_for_signal};
 
 /// Which `client-mcp.toml` surface this core resolves MCP servers (and
 /// `disabled_builtins`) for.
@@ -191,6 +194,11 @@ enum CoreMsg {
     InstallMcpHost(Arc<McpHost>),
     /// The connect task failed before producing a connector.
     ConnectFailed(String),
+    /// A view event produced outside the reducer — the signal pump's direct
+    /// forward (see [`view_event_for_signal`]). Routed through the actor rather
+    /// than emitted from the pump so every callback into the C side still
+    /// happens on the one actor task.
+    EmitView(ViewEvent),
 }
 
 /// Wrap a reducer message as a (boxed) channel item.
@@ -292,6 +300,7 @@ impl Engine {
                 CoreMsg::Intent(intent) => self.handle_intent(intent),
                 CoreMsg::Ui(boxed) => self.dispatch(*boxed),
                 CoreMsg::InstallConnector(conn) => self.connector = Some(conn),
+                CoreMsg::EmitView(ev) => self.sink.emit(&ev),
                 CoreMsg::InstallMcpHost(host) => {
                     // Shut down any prior host before adopting the new one.
                     self.shutdown_mcp_host();
@@ -631,6 +640,14 @@ impl Engine {
                         let tx2 = tx.clone();
                         tokio::spawn(async move {
                             while let Some(sig) = rx.recv().await {
+                                // A signal the reducer does not model (today only
+                                // `KnowledgeChanged`) also goes straight to the
+                                // view, since no `Effect` would ever carry it.
+                                if let Some(ev) = view_event_for_signal(&sig)
+                                    && tx2.send(CoreMsg::EmitView(ev)).is_err()
+                                {
+                                    break;
+                                }
                                 if tx2.send(ui(signal_to_ui_message(sig))).is_err() {
                                     break;
                                 }

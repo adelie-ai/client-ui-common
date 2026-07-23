@@ -48,6 +48,12 @@ pub struct ChatMessageDto {
     pub id: String,
     pub role: String,
     pub content: String,
+    /// Presentation metadata as an ABI token (`normal` / `spoken` /
+    /// `speech_disabled`). Projected so a client can render a Spoken or
+    /// SpeechDisabled affordance from the metadata instead of parsing
+    /// `content` — `MessageKind` carries no serde derive, so it travels as a
+    /// string like [`adele_output_str`] does for `AdeleOutput`.
+    pub kind: &'static str,
 }
 
 impl From<ChatMessage> for ChatMessageDto {
@@ -56,7 +62,34 @@ impl From<ChatMessage> for ChatMessageDto {
             id: m.id,
             role: m.role,
             content: m.content,
+            kind: message_kind_str(m.kind),
         }
+    }
+}
+
+/// The ABI token for a [`MessageKind`](api::client::MessageKind).
+pub fn message_kind_str(kind: api::client::MessageKind) -> &'static str {
+    match kind {
+        api::client::MessageKind::Normal => "normal",
+        api::client::MessageKind::Spoken => "spoken",
+        api::client::MessageKind::SpeechDisabled => "speech_disabled",
+    }
+}
+
+/// The [`ViewEvent`] a daemon signal produces *directly*, bypassing the
+/// reducer, or `None` when the reducer already covers it.
+///
+/// Why: nearly every signal becomes a `UiMessage` and reaches the view as an
+/// `Effect`. `KnowledgeChanged` is the exception — the knowledge browser is a
+/// self-contained widget rather than part of the conversation reducer, so the
+/// reducer drops the message and each client wires its own refresh at the
+/// window layer. This FFI *is* that layer for its clients, so it forwards the
+/// signal itself. Keep this list minimal: a signal the reducer already handles
+/// would otherwise reach the view twice.
+pub fn view_event_for_signal(sig: &api::SignalEvent) -> Option<ViewEvent> {
+    match sig {
+        api::SignalEvent::KnowledgeChanged => Some(ViewEvent::KnowledgeChanged),
+        _ => None,
     }
 }
 
@@ -230,6 +263,11 @@ pub enum ViewEvent {
     /// Recompute the side pane's per-conversation task view (the C++ side filters
     /// its own task list — this is the hint to refresh).
     RefreshSidePaneTasks,
+    /// The user's knowledge base changed — refetch it if a browser is open.
+    /// Forwarded straight from the daemon signal by [`view_event_for_signal`]
+    /// rather than produced by the reducer, which does not model the knowledge
+    /// browser.
+    KnowledgeChanged,
     /// Speak `text` (the C++ side may route this to `org.desktopAssistant.Voice`;
     /// the plasmoid has no embedded engine, so it is a no-op there).
     Speak { text: String },
