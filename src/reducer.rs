@@ -1358,13 +1358,16 @@ impl WindowState {
                 // Case 1 / Case 1b for keyed sends; the keyless fallbacks below
                 // stay for voice turns, other clients, and pre-key clients.
                 //
-                // Phase-1 limitation: the optimistic bubble's key lives only in
-                // memory. After a transcript RELOAD or a switch-away-and-back the
-                // detail is rebuilt from `MessageView`, which sets
-                // `idempotency_key: None` (the key is not persisted on the message
-                // row yet), so this exact-key match no longer fires and the
-                // content compare (Case 1b / Case 2) is the reload fallback.
-                // Persisting the key on the row is tracked as follow-up #570.
+                // Reconnect-interleave: this scan covers ALL loaded conversation
+                // messages, not just an in-memory optimistic bubble. So once the
+                // daemon persists the key on the message row and surfaces it on
+                // reload, a row rebuilt by a transcript RELOAD or a
+                // switch-away-and-back (real id, no optimistic bubble, no stream)
+                // still exact-key-matches its echo here — closing the reload hole
+                // that the content compare (Case 1b) could not, since Case 1b only
+                // rescues the empty-id optimistic bubble. Keyless turns (voice,
+                // other clients, pre-key clients) still fall to the content
+                // compare below. (Refs #570)
                 if let Some(key) = idempotency_key.as_deref()
                     && self
                         .open
@@ -2243,6 +2246,95 @@ mod tests {
         assert_eq!(
             user_bubbles, 1,
             "exactly one user bubble via the keyless content fallback"
+        );
+    }
+
+    #[test]
+    fn reloaded_keyed_user_row_dedupes_matching_echo() {
+        // Reconnect-interleave hole (#570): after a transcript reload the detail
+        // is rebuilt from persisted rows — each with a REAL server id (not the
+        // empty placeholder of an in-memory optimistic bubble) and, once the
+        // daemon persists+surfaces the key, its idempotency key. No optimistic
+        // bubble and no stream survive the reload. When our own send's echo then
+        // arrives, Case 0 scans ALL loaded messages for an exact key match and
+        // dedupes it — closing the hole. Without the persisted key this reloaded
+        // real-id row would fail Case 1b's `id.is_empty()` guard and fall through
+        // to Case 2, drawing a duplicate user bubble.
+        let mut state = WindowState::default().with_open(detail(
+            "c1",
+            vec![ChatMessage {
+                id: "m1".to_string(),
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                kind: MessageKind::Normal,
+                idempotency_key: Some("K".to_string()),
+            }],
+        ));
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "R".to_string(),
+            // Daemon-normalized content differs from the stored row — proving the
+            // dedup is an exact-key match on the reloaded row, not a content
+            // compare.
+            content: "normalized-differently".to_string(),
+            idempotency_key: Some("K".to_string()),
+        });
+        assert!(
+            !echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "a keyed echo matching a reloaded row's key must not draw a second bubble: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "exactly one user bubble (the reloaded row) — the reconnect-interleave hole is closed"
+        );
+    }
+
+    #[test]
+    fn reloaded_keyless_user_row_still_falls_back() {
+        // Counterpart to the keyed reload test: with NO persisted key on the
+        // reloaded row (and none on the echo), Case 0 cannot fire. The content
+        // fallback (Case 1b) only rescues an optimistic bubble still carrying the
+        // empty-id placeholder, so a reloaded row with a REAL id falls through to
+        // Case 2 even when the content matches exactly — the daemon-persisted copy
+        // is redrawn. This pins the still-open keyless reload behavior that
+        // persisting the key (the keyed test above) closes.
+        let mut state = WindowState::default().with_open(detail(
+            "c1",
+            vec![ChatMessage {
+                id: "m1".to_string(),
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                kind: MessageKind::Normal,
+                idempotency_key: None,
+            }],
+        ));
+        let echo = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "R".to_string(),
+            content: "hello".to_string(),
+            idempotency_key: None,
+        });
+        assert!(
+            echo.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
+            "without a persisted key the reloaded real-id row is not deduped — Case 2 redraws it: {echo:?}"
+        );
+        let user_bubbles = state
+            .current_conversation()
+            .expect("c1 is open")
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        assert_eq!(
+            user_bubbles, 2,
+            "the keyless reload hole remains: the persisted row plus a redrawn duplicate"
         );
     }
 
