@@ -189,6 +189,23 @@ void adele_core_set_ws_jwt(Core *core, const char *jwt);
 void adele_core_set_share_client_context(Core *core, bool enabled);
 
 /*
+ Declare which `client-mcp.toml` surface this client resolves its MCP servers
+ (and `disabled_builtins`) under — `"mac"`, `"kde"`, … Server *definitions* are
+ machine-wide; the surface is the per-client enable layer, so one set of
+ servers can be configured once and switched on per client.
+
+ Call this once before [`adele_core_connect`]; it is read when the connect
+ starts the client MCP host, so a later change applies on the next
+ (re)connect. A NULL or empty name is ignored and the core keeps its default
+ surface (`kde`), which is what adele-kde relies on by never calling this.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`]; `surface` must be NULL
+ or a valid NUL-terminated UTF-8 string, borrowed for the call.
+ */
+void adele_core_set_mcp_surface(Core *core, const char *surface);
+
+/*
  Send an arbitrary management command (an `api::Command` serialized as JSON)
  over the connector. The `CommandResult` is delivered later as a
  `command_result` view event carrying the same `request_id`, so the caller can
