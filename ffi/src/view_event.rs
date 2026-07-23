@@ -416,6 +416,77 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_dto_projects_kind() {
+        // `ChatMessage` carries explicit presentation metadata (voice#126), but
+        // the DTO used to drop it — leaving an FFI client (adele-mac, adele-kde)
+        // unable to render a Spoken / SpeechDisabled affordance without parsing
+        // `content` back, which is exactly what the metadata exists to avoid.
+        let dto = ChatMessageDto::from(ChatMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: "hello".into(),
+            kind: api::client::MessageKind::Spoken,
+            idempotency_key: None,
+        });
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""kind":"spoken""#), "{json}");
+    }
+
+    #[test]
+    fn every_message_kind_has_a_distinct_abi_token() {
+        // One-way only: the C side never sets a message kind, so unlike
+        // `adele_output_*` there is no parse-back counterpart. The tokens are a
+        // wire contract a client matches on, so pin them literally.
+        assert_eq!(message_kind_str(api::client::MessageKind::Normal), "normal");
+        assert_eq!(message_kind_str(api::client::MessageKind::Spoken), "spoken");
+        assert_eq!(
+            message_kind_str(api::client::MessageKind::SpeechDisabled),
+            "speech_disabled"
+        );
+    }
+
+    #[test]
+    fn a_normal_message_still_carries_its_kind() {
+        // The common case must be explicit rather than an absent field, so a
+        // client reads one contract instead of "missing ⇒ normal".
+        let dto = ChatMessageDto::from(ChatMessage {
+            id: "m2".into(),
+            role: "user".into(),
+            content: "hi".into(),
+            kind: api::client::MessageKind::Normal,
+            idempotency_key: None,
+        });
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""kind":"normal""#), "{json}");
+    }
+
+    #[test]
+    fn knowledge_changed_signal_maps_to_a_view_event() {
+        // The conversation reducer deliberately ignores `KnowledgeChanged` (the
+        // knowledge browser is a self-contained widget), so gtk subscribes to the
+        // signal at its window layer. The FFI *is* the window-layer boundary for
+        // adele-mac / adele-kde, so it forwards the signal directly.
+        let ev = view_event_for_signal(&api::SignalEvent::KnowledgeChanged)
+            .expect("KnowledgeChanged is forwarded to the view");
+        assert_eq!(ev.to_json().unwrap(), r#"{"type":"knowledge_changed"}"#);
+    }
+
+    #[test]
+    fn unrelated_signals_are_not_forwarded_to_the_view() {
+        // Only signals the reducer drops on the floor need a direct forward;
+        // everything else must keep flowing through `signal_to_ui_message` alone,
+        // or the view would see it twice.
+        assert!(
+            view_event_for_signal(&api::SignalEvent::Chunk {
+                conversation_id: "c1".into(),
+                request_id: "r1".into(),
+                chunk: "hi".into(),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
     fn adele_output_round_trips_through_the_abi_tokens() {
         for level in [
             AdeleOutput::Disabled,
