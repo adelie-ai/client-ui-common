@@ -271,9 +271,19 @@ pub enum ViewEvent {
     /// Speak `text` (the C++ side may route this to `org.desktopAssistant.Voice`;
     /// the plasmoid has no embedded engine, so it is a no-op there).
     Speak { text: String },
-    /// Render an inline transcript note (e.g. a `(speech mode disabled) …`
-    /// downgrade).
-    InlineNote { text: String },
+    /// Render an inline transcript note — a line the client generated itself
+    /// rather than received from the daemon (a `say_this` the voice tool spoke,
+    /// the same line when speech is off, a local notice).
+    InlineNote {
+        text: String,
+        /// Presentation metadata as an ABI token (`normal` / `spoken` /
+        /// `speech_disabled`), the same contract [`ChatMessageDto::kind`]
+        /// carries for a reloaded transcript. Why here too: this is the *live*
+        /// path for the same lines, and a client that had to recover the kind
+        /// by matching a marker in `text` would classify by prose — silently
+        /// falling back to `normal` the moment the wording moved.
+        kind: &'static str,
+    },
     /// Reflect the active conversation's `Adele:` level on the dropdown after the
     /// model drove it (`request_voice` / `stop_voice`).
     AdeleOutputDropdown { level: &'static str },
@@ -331,18 +341,8 @@ impl ViewEvent {
             Effect::RefreshSidePaneTasks => ViewEvent::RefreshSidePaneTasks,
             Effect::Speak(text) => ViewEvent::Speak { text },
             Effect::AddLocalMessage { content, kind } => ViewEvent::InlineNote {
-                // Interim kde presentation (voice#126): QML has no dedicated
-                // Spoken / SpeechDisabled affordance yet (tracked as a follow-up),
-                // so render the explicit `kind` metadata as a text marker here at
-                // the FFI boundary — acting on the metadata at the presentation
-                // layer rather than baking it into `content` or parsing it back.
-                text: match kind {
-                    api::client::MessageKind::Spoken => format!("Spoken: {content}"),
-                    api::client::MessageKind::SpeechDisabled => {
-                        format!("(speech mode disabled) {content}")
-                    }
-                    api::client::MessageKind::Normal => content,
-                },
+                text: content,
+                kind: message_kind_str(kind),
             },
             Effect::SetAdeleOutputDropdown(level) => ViewEvent::AdeleOutputDropdown {
                 level: adele_output_str(level),
@@ -480,6 +480,56 @@ mod tests {
         assert_eq!(
             message_kind_str(api::client::MessageKind::SpeechDisabled),
             "speech_disabled"
+        );
+    }
+
+    #[test]
+    fn inline_note_carries_structured_kind() {
+        // A `say_this` line generated DURING a turn reaches the view as
+        // `AddLocalMessage`. The kind used to be stringified into the note's
+        // text ("Spoken: …" / "(speech mode disabled) …") and parsed back by the
+        // client — the very round-trip the metadata exists to avoid. The event
+        // carries the kind as an ABI token and leaves `text` unmarked; a client
+        // renders whatever affordance it has (a badge, or its own marker).
+        let ev = ViewEvent::try_from_view_effect(Effect::AddLocalMessage {
+            content: "hello there".into(),
+            kind: api::client::MessageKind::Spoken,
+        })
+        .expect("AddLocalMessage is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"inline_note","text":"hello there","kind":"spoken"}"#
+        );
+    }
+
+    #[test]
+    fn a_speech_disabled_inline_note_is_unmarked_too() {
+        // The suppressed case travelled as a parenthetical prefix, which is the
+        // one most likely to be mistaken for prose the model wrote.
+        let ev = ViewEvent::try_from_view_effect(Effect::AddLocalMessage {
+            content: "hello there".into(),
+            kind: api::client::MessageKind::SpeechDisabled,
+        })
+        .expect("AddLocalMessage is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"inline_note","text":"hello there","kind":"speech_disabled"}"#
+        );
+    }
+
+    #[test]
+    fn an_ordinary_inline_note_carries_the_normal_token() {
+        // Notes that are not `say_this` lines (reconnect notices and the like)
+        // must state `normal` explicitly rather than omit the field, so a client
+        // reads one contract instead of "missing ⇒ normal".
+        let ev = ViewEvent::try_from_view_effect(Effect::AddLocalMessage {
+            content: "Reconnected to the daemon.".into(),
+            kind: api::client::MessageKind::Normal,
+        })
+        .expect("AddLocalMessage is a view effect");
+        assert_eq!(
+            ev.to_json().unwrap(),
+            r#"{"type":"inline_note","text":"Reconnected to the daemon.","kind":"normal"}"#
         );
     }
 
