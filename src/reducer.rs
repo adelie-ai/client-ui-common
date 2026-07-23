@@ -124,6 +124,13 @@ struct ConversationModel {
     /// Enter-presses ("I hit enter as I think") becomes a single turn, not
     /// several. Empty when nothing is queued.
     outbox: Vec<QueuedMessage>,
+    /// Messages from a flush that has been sent but not yet acked, parked here so
+    /// a failed or abandoned flush can restore them to `outbox` for retry rather
+    /// than dropping them (#25). Empty except between a flush's `SendPrompt` and
+    /// its `PromptSent` (cleared) or `SendFailed` (restored). Invisible to the
+    /// view — the optimistic bubble represents the in-flight send, so the queue
+    /// indicator reads `outbox` only (keeps the #24 no-double-render fix).
+    pending_flush: Vec<QueuedMessage>,
     /// Set when the user has pulled a queued message back into the composer to
     /// edit it (up-arrow recall / a chip's edit affordance): the outbox slot it
     /// was checked out from (so a re-submit reinserts it in place) and its
@@ -544,6 +551,12 @@ impl WindowState {
         let Some(model) = self.open.get_mut(&id) else {
             return vec![];
         };
+        // A flush is already in flight (sent, awaiting ack): its queue lives in
+        // `pending_flush` until acked or restored on failure (#25). Don't start a
+        // second overlapping flush.
+        if !model.pending_flush.is_empty() {
+            return vec![];
+        }
         if model.editing.is_some() || model.outbox.is_empty() {
             return vec![];
         }
@@ -556,6 +569,10 @@ impl WindowState {
         // The combined turn adopts the FIRST queued message's key (#570), so its
         // echo still dedupes by exact match; `None` when the queue was keyless.
         let combined_key = queued.first().and_then(|q| q.idempotency_key.clone());
+        // Hold the queued messages until the send is acked (#25): a failed or
+        // abandoned flush restores them to `outbox` for retry instead of dropping
+        // them. (Was `mem::take`-and-discard — the source of the loss.)
+        model.pending_flush = queued;
         let mut effects = self.commit_send(combined, combined_key);
         effects.push(self.queued_snapshot_effect());
         effects
@@ -1314,7 +1331,26 @@ impl WindowState {
                 {
                     conv.messages.pop();
                 }
-                vec![]
+                // Restore a failed flush's queued messages so the user can retry
+                // (#25): a flush parked them in `pending_flush`; put them back at
+                // the front of the outbox (they were queued before anything typed
+                // since). A direct send leaves `pending_flush` empty, so this is a
+                // no-op there — no phantom queue entries.
+                let requeued = match self.open.get_mut(&conversation_id) {
+                    Some(model) if !model.pending_flush.is_empty() => {
+                        let restored = std::mem::take(&mut model.pending_flush);
+                        for (i, msg) in restored.into_iter().enumerate() {
+                            model.outbox.insert(i, msg);
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if requeued && self.is_active_conversation(&conversation_id) {
+                    vec![self.queued_snapshot_effect()]
+                } else {
+                    vec![]
+                }
             }
             UiMessage::PromptSent {
                 task_id: _,
@@ -1339,7 +1375,12 @@ impl WindowState {
                     say_this_spoken_this_turn: false,
                     external: false,
                 };
-                self.open.entry(conversation_id).or_default().stream = Some(stream);
+                let model = self.open.entry(conversation_id).or_default();
+                // The daemon accepted the send (#25): the flush is now its
+                // responsibility, so drop the client-side copy held for
+                // restore-on-failure. No-op for a direct send (empty).
+                model.pending_flush.clear();
+                model.stream = Some(stream);
                 vec![]
             }
             UiMessage::UserMessageAdded {
@@ -3427,6 +3468,124 @@ mod tests {
             "a failed turn flushes the queued follow-ups as one: {effects:?}"
         );
         assert!(state.queued_messages_for_view().is_empty());
+    }
+
+    // --- #25: queued prompts must survive a failed/abandoned flush ---
+
+    #[test]
+    fn queued_prompts_survive_flush_failure() {
+        // #25: when an abandoned turn flushes the queue as one combined send but
+        // that send then ALSO fails (the backend is still wedged), the user's
+        // queued prompts must NOT vanish — they return to the queue so the user
+        // can retry ("try again"). Today `flush_outbox` `mem::take`s the queue
+        // and `SendFailed` never restores it, so they are lost.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "two".to_string(),
+            idempotency_key: None,
+        });
+        // The 90s watchdog abandons the turn -> the reducer flushes the queue.
+        let flushed = state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "no response from the daemon for 90s; the turn was abandoned".to_string(),
+        });
+        assert!(
+            flushed
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { prompt, .. } if prompt == "one\n\ntwo")),
+            "abandonment flushes the queued follow-ups as one combined send: {flushed:?}"
+        );
+        // That combined send also fails (backend still wedged).
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "one\n\ntwo".to_string(),
+        });
+        // The queued prompts must survive for retry.
+        assert_eq!(
+            state.queued_messages_for_view(),
+            vec!["one".to_string(), "two".to_string()],
+            "queued prompts must return to the queue after a failed flush so the user can try again"
+        );
+    }
+
+    #[test]
+    fn flush_ack_discards_pending_so_a_later_failure_does_not_resurrect() {
+        // Once the flush is acked (PromptSent), the held copy is discarded; a
+        // stale/duplicate SendFailed arriving afterwards must not resurrect an
+        // already-sent message.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "boom".to_string(),
+        });
+        // The flush was accepted by the daemon.
+        state.apply(UiMessage::PromptSent {
+            task_id: "t1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        // A late/duplicate failure must not re-queue an already-sent message.
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "one".to_string(),
+        });
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "an acked flush must not be resurrected by a later SendFailed"
+        );
+    }
+
+    #[test]
+    fn direct_send_failure_leaves_the_queue_untouched() {
+        // A failed *direct* send (nothing was ever queued) must not fabricate
+        // queue entries — the pending-flush restore applies only to flushes.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.current_conversation_id = Some("c1".to_string());
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "hello".to_string(),
+        });
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "a failed direct send must not create phantom queued messages"
+        );
+    }
+
+    #[test]
+    fn a_flush_in_flight_blocks_a_second_overlapping_flush() {
+        // Stage the sent-but-unacked window directly (same-module access): no
+        // stream, a prior flush parked in `pending_flush`, and a freshly-queued
+        // message in the outbox. A flush must NOT fire a second overlapping send
+        // — the in-flight flush owns the queue until it is acked or restored.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.current_conversation_id = Some("c1".to_string());
+        {
+            let model = state.open.get_mut("c1").expect("open model for c1");
+            model.pending_flush = vec![QueuedMessage {
+                text: "in-flight".to_string(),
+                idempotency_key: None,
+            }];
+            model.outbox = vec![QueuedMessage {
+                text: "new".to_string(),
+                idempotency_key: None,
+            }];
+        }
+        let effects = state.flush_outbox();
+        assert!(
+            effects.is_empty(),
+            "a flush must not fire while one is already in flight: {effects:?}"
+        );
     }
 
     #[test]
