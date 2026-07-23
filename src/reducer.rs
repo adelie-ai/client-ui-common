@@ -3337,6 +3337,98 @@ mod tests {
         assert!(state.queued_messages_for_view().is_empty());
     }
 
+    // --- #25: queued prompts must survive a failed/abandoned flush ---
+
+    #[test]
+    fn queued_prompts_survive_flush_failure() {
+        // #25: when an abandoned turn flushes the queue as one combined send but
+        // that send then ALSO fails (the backend is still wedged), the user's
+        // queued prompts must NOT vanish — they return to the queue so the user
+        // can retry ("try again"). Today `flush_outbox` `mem::take`s the queue
+        // and `SendFailed` never restores it, so they are lost.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "two".to_string(),
+            idempotency_key: None,
+        });
+        // The 90s watchdog abandons the turn -> the reducer flushes the queue.
+        let flushed = state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "no response from the daemon for 90s; the turn was abandoned".to_string(),
+        });
+        assert!(
+            flushed
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { prompt, .. } if prompt == "one\n\ntwo")),
+            "abandonment flushes the queued follow-ups as one combined send: {flushed:?}"
+        );
+        // That combined send also fails (backend still wedged).
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "one\n\ntwo".to_string(),
+        });
+        // The queued prompts must survive for retry.
+        assert_eq!(
+            state.queued_messages_for_view(),
+            vec!["one".to_string(), "two".to_string()],
+            "queued prompts must return to the queue after a failed flush so the user can try again"
+        );
+    }
+
+    #[test]
+    fn flush_ack_discards_pending_so_a_later_failure_does_not_resurrect() {
+        // Once the flush is acked (PromptSent), the held copy is discarded; a
+        // stale/duplicate SendFailed arriving afterwards must not resurrect an
+        // already-sent message.
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "one".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "boom".to_string(),
+        });
+        // The flush was accepted by the daemon.
+        state.apply(UiMessage::PromptSent {
+            task_id: "t1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        // A late/duplicate failure must not re-queue an already-sent message.
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "one".to_string(),
+        });
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "an acked flush must not be resurrected by a later SendFailed"
+        );
+    }
+
+    #[test]
+    fn direct_send_failure_leaves_the_queue_untouched() {
+        // A failed *direct* send (nothing was ever queued) must not fabricate
+        // queue entries — the pending-flush restore applies only to flushes.
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.current_conversation_id = Some("c1".to_string());
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: None,
+        });
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "hello".to_string(),
+        });
+        assert!(
+            state.queued_messages_for_view().is_empty(),
+            "a failed direct send must not create phantom queued messages"
+        );
+    }
+
     #[test]
     fn flush_does_not_touch_the_live_composer() {
         // The user may be mid-typing a fresh (not-yet-Entered) message when the
