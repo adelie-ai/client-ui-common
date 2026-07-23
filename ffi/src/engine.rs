@@ -37,6 +37,17 @@ use tokio::sync::mpsc;
 
 use crate::view_event::ViewEvent;
 
+/// Which `client-mcp.toml` surface this core resolves MCP servers (and
+/// `disabled_builtins`) for.
+///
+/// **Known wart:** this cdylib now backs adele-mac as well as adele-kde, but the
+/// surface is still `"kde"` for both — so a Mac user's per-surface MCP selection
+/// is read from `[surfaces.kde]`. Kept as-is deliberately: changing it would
+/// silently repoint KDE's existing configs at a different section. Making the
+/// surface per-client (a build-time constant or an `adele_core_*` setter) is the
+/// proper fix and wants its own change.
+const MCP_SURFACE: &str = "kde";
+
 /// The C function the core calls with each view-event JSON string.
 ///
 /// `user_data` is the opaque pointer passed to `adele_core_new`; `json` is a
@@ -580,15 +591,33 @@ impl Engine {
                     // yields no host, degrading cleanly. Install it in the actor
                     // BEFORE the signal pump starts so a `ClientToolCall` always
                     // finds the host already in place (the channel is FIFO).
-                    let mcp_servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
-                        .resolved_servers("kde")
+                    let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
+                    let mcp_servers: Vec<_> = mcp_cfg
+                        .resolved_servers(MCP_SURFACE)
                         .into_iter()
                         .cloned()
                         .collect();
-                    let mcp_host = if mcp_servers.is_empty() {
+                    // Compiled-in built-ins (da#538), hosted in-process with no
+                    // subprocess. Empty unless this cdylib was built with an
+                    // `mcp-*` feature — adele-kde's default build links none, so
+                    // its behavior is unchanged; adele-mac opts in via
+                    // `just build-with-mcp`. `start_with_disabled` centralizes
+                    // both the override (a configured server of the same name
+                    // shadows the built-in) and the per-surface
+                    // `disabled_builtins` opt-out.
+                    let mcp_builtins = crate::builtins::builtin_servers();
+                    // Host if there is anything to host (configured OR built-in).
+                    let mcp_host = if mcp_servers.is_empty() && mcp_builtins.is_empty() {
                         None
                     } else {
-                        let host = Arc::new(McpHost::start(&mcp_servers).await);
+                        let host = Arc::new(
+                            McpHost::start_with_disabled(
+                                &mcp_servers,
+                                mcp_builtins,
+                                mcp_cfg.surface_disabled_builtins(MCP_SURFACE),
+                            )
+                            .await,
+                        );
                         let _ = tx.send(CoreMsg::InstallMcpHost(Arc::clone(&host)));
                         Some(host)
                     };
