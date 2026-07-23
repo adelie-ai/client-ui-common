@@ -1172,7 +1172,65 @@ mod share_context_tests {
             staged_override: None,
             ws_jwt: None,
             share_client_context: true,
+            mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
         }
+    }
+
+    /// A fresh engine resolves MCP config under `kde`, so adele-kde — which
+    /// never calls the setter — keeps reading `[surfaces.kde]` exactly as before.
+    #[test]
+    fn mcp_surface_defaults_to_kde() {
+        assert_eq!(
+            test_engine().mcp_surface,
+            DEFAULT_MCP_SURFACE,
+            "the default surface must stay kde for back-compat"
+        );
+    }
+
+    /// `SetMcpSurface` stages the client's own surface, so adele-mac resolves
+    /// `[surfaces.mac]` instead of silently sharing KDE's server selection.
+    #[test]
+    fn intent_stores_the_client_surface() {
+        let mut engine = test_engine();
+        engine.handle_intent(Intent::SetMcpSurface("mac".into()));
+        assert_eq!(engine.mcp_surface, "mac");
+    }
+
+    /// An empty surface is ignored rather than resolving `[surfaces.]` — a
+    /// client that passes nothing keeps the default instead of silently
+    /// falling through to the `default` section.
+    #[test]
+    fn empty_surface_is_ignored() {
+        let mut engine = test_engine();
+        engine.handle_intent(Intent::SetMcpSurface(String::new()));
+        assert_eq!(engine.mcp_surface, DEFAULT_MCP_SURFACE);
+    }
+
+    /// The staged surface is what the connect path resolves servers under.
+    #[test]
+    fn staged_surface_selects_that_surfaces_servers() {
+        let cfg = ClientMcpConfig::from_toml(
+            r#"
+[[servers]]
+name = "mac-only"
+command = "/bin/true"
+
+[surfaces.kde]
+enabled = []
+
+[surfaces.mac]
+enabled = ["mac-only"]
+"#,
+        )
+        .expect("fixture parses");
+        let mut engine = test_engine();
+        engine.handle_intent(Intent::SetMcpSurface("mac".into()));
+        let names: Vec<&str> = cfg
+            .resolved_servers(&engine.mcp_surface)
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["mac-only"], "must resolve the mac surface, not kde");
     }
 
     /// A fresh engine shares context by default, matching `ConnectionConfig::default()`.
