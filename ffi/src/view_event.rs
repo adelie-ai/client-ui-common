@@ -76,6 +76,43 @@ pub fn message_kind_str(kind: api::client::MessageKind) -> &'static str {
     }
 }
 
+/// The `kind` token every built-in row carries, matching the shared panel
+/// view-model's `ServerKind::BuiltIn`.
+///
+/// Why a constant field rather than an implied kind: a client renders one merged
+/// list of daemon, external-client, and built-in rows, and the chip text comes
+/// from the row's kind. Stamping it here means the kind is decided once, by the
+/// core that actually hosts the server, instead of each client inferring
+/// "built-in" from which array the row arrived in.
+pub const BUILTIN_KIND: &str = "built_in";
+
+/// One built-in (compiled-in, in-process) MCP server's panel status.
+///
+/// Mirrors `client-ui-common`'s `BuiltinServerDto` — the shape the shared
+/// MCP-servers view-model already merges and sorts — and carries the two
+/// *orthogonal* reasons a built-in can render disabled: shadowed by a same-name
+/// external server ([`overridden_by`](Self::overridden_by)), or turned off for
+/// this surface ([`disabled_by_config`](Self::disabled_by_config)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuiltinServerDto {
+    /// Server name — also the key an external client-run server of the same name
+    /// overrides.
+    pub name: String,
+    /// The built-in's tool namespace (e.g. `"fileio"`).
+    pub namespace: String,
+    /// Always [`BUILTIN_KIND`].
+    pub kind: &'static str,
+    /// When hosted, the tools actually registered; when not, the number this
+    /// built-in would have advertised.
+    pub tool_count: u32,
+    /// `Some(name)` when a configured client-mcp server of the same name shadows
+    /// this built-in (external wins); `None` when nothing shadows it.
+    pub overridden_by: Option<String>,
+    /// `true` when this surface's `[surfaces.<name>].disabled_builtins` names it.
+    /// Orthogonal to [`overridden_by`](Self::overridden_by) — both can be set.
+    pub disabled_by_config: bool,
+}
+
 /// The [`ViewEvent`] a daemon signal produces *directly*, bypassing the
 /// reducer, or `None` when the reducer already covers it.
 ///
@@ -287,6 +324,22 @@ pub enum ViewEvent {
     /// Reflect the active conversation's `Adele:` level on the dropdown after the
     /// model drove it (`request_voice` / `stop_voice`).
     AdeleOutputDropdown { level: &'static str },
+    /// This client's compiled-in ("built-in") MCP servers and their status under
+    /// the declared `client-mcp.toml` surface — the reply to
+    /// `adele_core_request_mcp_builtins`, and re-emitted after
+    /// `adele_core_set_mcp_builtin_disabled` so a toggle resyncs the panel.
+    ///
+    /// Executor-emitted (no `Effect` carries it): built-ins are a property of how
+    /// this cdylib was built plus what is on disk, not of the conversation
+    /// reducer. `servers` is empty on a core built with no `mcp-*` feature —
+    /// adele-kde's build — which is the honest answer, not a missing one.
+    ///
+    /// `surface` echoes which section was resolved, so a client can tell it is
+    /// reading its own (`mac`) rather than silently inheriting another's.
+    McpBuiltins {
+        surface: String,
+        servers: Vec<BuiltinServerDto>,
+    },
 }
 
 impl ViewEvent {

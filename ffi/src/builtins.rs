@@ -19,7 +19,8 @@
 //!
 //! [`McpHost::start_with_disabled`]: desktop_assistant_client_common::mcp_host::McpHost::start_with_disabled
 
-use desktop_assistant_client_common::mcp_host::BuiltinServer;
+use crate::view_event::{BUILTIN_KIND, BuiltinServerDto};
+use desktop_assistant_client_common::mcp_host::{BuiltinServer, BuiltinStatus};
 #[cfg(any(
     feature = "mcp-fileio",
     feature = "mcp-terminal",
@@ -110,6 +111,82 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
     ));
 
     out
+}
+
+/// Project a running host's [`McpHost::builtin_status`] into the panel rows the
+/// C side renders.
+///
+/// This is the authoritative source when a connection is up: the host reports
+/// the tools it actually registered and the override/disable decisions it
+/// actually made. Order is preserved — it is the order the built-ins were
+/// passed, which is the panel's stable tiebreak for equal names.
+///
+/// [`McpHost::builtin_status`]: desktop_assistant_client_common::mcp_host::McpHost::builtin_status
+pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
+    status
+        .into_iter()
+        .map(|s| BuiltinServerDto {
+            name: s.name,
+            namespace: s.namespace,
+            kind: BUILTIN_KIND,
+            // Saturate rather than wrap: a count that cannot fit is absurd, and a
+            // wrapped one would render as a plausible lie.
+            tool_count: u32::try_from(s.tool_count).unwrap_or(u32::MAX),
+            overridden_by: s.overridden_by,
+            disabled_by_config: s.disabled_by_config,
+        })
+        .collect()
+}
+
+/// Derive the same panel rows with **no running host**, from the compiled-in set
+/// plus the caller's view of the client config.
+///
+/// Why this exists: the MCP host starts on connect, but the settings panel is
+/// opened before and between connections. Without this the panel would show no
+/// built-in rows while disconnected even though the servers are linked in. The
+/// override + disable bookkeeping mirrors [`McpHost::start_with_disabled`]'s,
+/// which owns it for the hosted case:
+///
+/// - `configured` — the names of the client-mcp servers **this surface hosts**
+///   (i.e. `ClientMcpConfig::resolved_servers`). A same-name server shadows the
+///   built-in, so it reports `overridden_by`.
+/// - `disabled` — this surface's `disabled_builtins` list.
+///
+/// `tool_count` comes from the built-in itself, so the row shows a real number
+/// rather than a placeholder zero.
+///
+/// [`McpHost::start_with_disabled`]: desktop_assistant_client_common::mcp_host::McpHost::start_with_disabled
+pub fn compiled_builtin_dtos(configured: &[String], disabled: &[String]) -> Vec<BuiltinServerDto> {
+    builtin_servers()
+        .into_iter()
+        .map(|builtin| {
+            let overridden = configured.contains(&builtin.name);
+            let disabled_by_config = disabled.contains(&builtin.name);
+            BuiltinServerDto {
+                kind: BUILTIN_KIND,
+                tool_count: u32::try_from(builtin.service.tools().len()).unwrap_or(u32::MAX),
+                overridden_by: overridden.then(|| builtin.name.clone()),
+                disabled_by_config,
+                name: builtin.name,
+                namespace: builtin.namespace,
+            }
+        })
+        .collect()
+}
+
+/// Re-derive each row's `disabled_by_config` from the surface's **current**
+/// `disabled_builtins` list.
+///
+/// Why: a running host records the disabled set once, at start — built-ins are
+/// fixed until the client relaunches — so a snapshot taken from
+/// [`builtin_dtos`] reflects config-at-connect, not later edits. After a live
+/// toggle the panel must show the *pending* state. This corrects only that flag;
+/// the tool count and `overridden_by` describe the running host and are left
+/// alone.
+pub fn apply_disabled_overlay(dtos: &mut [BuiltinServerDto], disabled: &[String]) {
+    for dto in dtos.iter_mut() {
+        dto.disabled_by_config = disabled.contains(&dto.name);
+    }
 }
 
 #[cfg(test)]

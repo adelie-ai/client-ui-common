@@ -22,6 +22,7 @@
 //! connector directly, installs it on connect, and drops it on
 //! [`Effect::ClearClient`].
 
+use std::path::Path;
 use std::sync::Arc;
 
 use client_ui_common::{
@@ -174,6 +175,20 @@ pub enum Intent {
     /// Staged on the actor and read when the next connect starts the MCP host.
     /// An empty name is ignored, keeping [`DEFAULT_MCP_SURFACE`].
     SetMcpSurface(String),
+    /// Ask for this client's compiled-in ("built-in") MCP servers and their
+    /// status under the declared surface, delivered as a
+    /// [`ViewEvent::McpBuiltins`]. Answerable with no connection: built-ins are a
+    /// property of how this cdylib was built plus what `client-mcp.toml` says.
+    RequestMcpBuiltins,
+    /// Turn one built-in on or off **for this client's surface**, by writing
+    /// `[surfaces.<surface>].disabled_builtins` in the shared `client-mcp.toml`.
+    ///
+    /// The Rust side owns that file — every client surface on the machine reads
+    /// it — so the write goes through here rather than through each client's own
+    /// parser. Takes effect on the next connect (the running host is fixed at
+    /// start); the refreshed [`ViewEvent::McpBuiltins`] that follows shows the
+    /// pending state so the panel is honest in the meantime.
+    SetMcpBuiltinDisabled { name: String, disabled: bool },
     /// Send an arbitrary management `api::Command` (serialized as JSON) over the
     /// connector; the `CommandResult` comes back as a `command_result` view event
     /// keyed by `request_id`. The generic channel for settings/management
@@ -203,8 +218,10 @@ enum CoreMsg {
     /// A view event produced outside the reducer — the signal pump's direct
     /// forward (see [`view_event_for_signal`]). Routed through the actor rather
     /// than emitted from the pump so every callback into the C side still
-    /// happens on the one actor task.
-    EmitView(ViewEvent),
+    /// happens on the one actor task. Boxed for the same reason [`Self::Ui`] is:
+    /// a `ViewEvent` is far larger than every other variant, and these are
+    /// queued (clippy::large_enum_variant).
+    EmitView(Box<ViewEvent>),
 }
 
 /// Wrap a reducer message as a (boxed) channel item.
@@ -255,6 +272,72 @@ fn build_connection_config(
         config.ws_jwt = ws_jwt;
     }
     config
+}
+
+/// Build the `mcp_builtins` view event for `surface`, reading the client MCP
+/// config at `path`.
+///
+/// Two sources, one shape. When a host is running (`host` is `Some`) its
+/// `builtin_status()` is authoritative — it reports the tools actually
+/// registered and the decisions actually made. With no host the same rows are
+/// derived from the compiled-in set plus the config, so the panel is answerable
+/// before the first connect.
+///
+/// In both cases the disable flag is re-derived from the config as it is *now*:
+/// the running host froze that decision at start, and a toggle made since must
+/// show as pending rather than not at all.
+///
+/// Takes the path explicitly so the on-disk behavior is testable without
+/// touching the developer's real `~/.config/adele/client-mcp.toml`.
+fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> ViewEvent {
+    let cfg = ClientMcpConfig::load(path);
+    let disabled = cfg.surface_disabled_builtins(surface);
+    let mut servers = match host {
+        Some(host) => crate::builtins::builtin_dtos(host.builtin_status()),
+        None => {
+            let configured: Vec<String> = cfg
+                .resolved_servers(surface)
+                .into_iter()
+                .map(|s| s.name.clone())
+                .collect();
+            crate::builtins::compiled_builtin_dtos(&configured, disabled)
+        }
+    };
+    crate::builtins::apply_disabled_overlay(&mut servers, disabled);
+    ViewEvent::McpBuiltins {
+        surface: surface.to_string(),
+        servers,
+    }
+}
+
+/// Add or remove `name` in one surface's `disabled_builtins` list in the client
+/// MCP config at `path`.
+///
+/// **Fail-closed on a malformed file.** [`ClientMcpConfig::load`] is deliberately
+/// tolerant — an unparseable config degrades to an empty one so a bad file never
+/// stops a client connecting — but saving that empty config back would erase
+/// every server definition on the machine, for every surface. The edit path
+/// therefore parses strictly and refuses rather than replacing what it could not
+/// read. A file that is merely *absent* is fine: that is a first write.
+///
+/// An empty `name` is refused for the same reason: a blank entry is inert noise
+/// every other client sharing the file would then carry.
+fn write_builtin_disabled(
+    path: &Path,
+    surface: &str,
+    name: &str,
+    disabled: bool,
+) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("built-in server name must not be empty".to_string());
+    }
+    let mut cfg = match std::fs::read_to_string(path) {
+        Ok(contents) => ClientMcpConfig::from_toml(&contents)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ClientMcpConfig::default(),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    cfg.set_builtin_disabled(surface, name, disabled);
+    cfg.save(path)
 }
 
 /// The actor: owns the reducer state + the connector, runs effects.
@@ -422,11 +505,54 @@ impl Engine {
             // would fall through to the `default` section and look like it worked.
             Intent::SetMcpSurface(surface) if !surface.is_empty() => self.mcp_surface = surface,
             Intent::SetMcpSurface(_) => {}
+            Intent::RequestMcpBuiltins => self.spawn_emit_mcp_builtins(),
+            Intent::SetMcpBuiltinDisabled { name, disabled } => {
+                self.spawn_set_mcp_builtin_disabled(name, disabled)
+            }
             Intent::SendCommand {
                 request_id,
                 command_json,
             } => self.spawn_send_command(request_id, command_json),
         }
+    }
+
+    /// Answer [`Intent::RequestMcpBuiltins`] with the current built-in inventory.
+    ///
+    /// Off the actor loop because it reads `client-mcp.toml` from disk (and, with
+    /// no host, constructs the compiled-in services to count their tools).
+    fn spawn_emit_mcp_builtins(&self) {
+        let sink = self.sink;
+        let surface = self.mcp_surface.clone();
+        let host = self.mcp_host.clone();
+        tokio::spawn(async move {
+            sink.emit(&mcp_builtins_event_at(
+                &default_client_mcp_path(),
+                host.as_deref(),
+                &surface,
+            ));
+        });
+    }
+
+    /// Answer [`Intent::SetMcpBuiltinDisabled`]: write this surface's opt-out,
+    /// then re-emit the inventory so the panel resyncs.
+    ///
+    /// The refreshed inventory is emitted on failure too — the panel must fall
+    /// back to the truth on disk rather than keep an optimistic toggle that never
+    /// landed.
+    fn spawn_set_mcp_builtin_disabled(&self, name: String, disabled: bool) {
+        let sink = self.sink;
+        let surface = self.mcp_surface.clone();
+        let host = self.mcp_host.clone();
+        tokio::spawn(async move {
+            let path = default_client_mcp_path();
+            if let Err(err) = write_builtin_disabled(&path, &surface, &name, disabled) {
+                tracing::warn!("failed to update built-in '{name}' for surface '{surface}': {err}");
+                sink.emit(&ViewEvent::Toast {
+                    text: format!("Could not update built-in server: {err}"),
+                });
+            }
+            sink.emit(&mcp_builtins_event_at(&path, host.as_deref(), &surface));
+        });
     }
 
     /// Send an arbitrary management command over the connector and emit its
@@ -658,7 +784,7 @@ impl Engine {
                                 // `KnowledgeChanged`) also goes straight to the
                                 // view, since no `Effect` would ever carry it.
                                 if let Some(ev) = view_event_for_signal(&sig)
-                                    && tx2.send(CoreMsg::EmitView(ev)).is_err()
+                                    && tx2.send(CoreMsg::EmitView(Box::new(ev))).is_err()
                                 {
                                     break;
                                 }

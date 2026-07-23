@@ -367,6 +367,63 @@ pub unsafe extern "C" fn adele_core_set_mcp_surface(core: *mut Core, surface: *c
     core.send_intent(Intent::SetMcpSurface(unsafe { cstr_to_string(surface) }));
 }
 
+/// Ask for this client's compiled-in ("built-in") MCP servers and their status
+/// under the surface declared via [`adele_core_set_mcp_surface`]. The answer
+/// arrives as an `mcp_builtins` view event carrying, per server: `name`,
+/// `namespace`, `kind`, `tool_count`, `overridden_by` (the same-name external
+/// server shadowing it, or null), and `disabled_by_config` (this surface's
+/// opt-out).
+///
+/// Answerable with **no connection**: which servers are built in is a property of
+/// how this cdylib was built (`--features mcp-*`) plus what `client-mcp.toml`
+/// says, so a settings panel can call this before the first connect. A core built
+/// with no `mcp-*` feature — adele-kde's — answers with an empty list, which is
+/// the honest "none linked in" rather than a missing reply.
+///
+/// # Safety
+/// `core` must be a live handle from [`adele_core_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_request_mcp_builtins(core: *mut Core) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::RequestMcpBuiltins);
+}
+
+/// Turn one built-in MCP server off (`disabled = true`) or back on for **this
+/// client's surface**, by writing `[surfaces.<surface>].disabled_builtins` in the
+/// shared `client-mcp.toml`.
+///
+/// The write goes through the core because that file is machine-wide: every Adele
+/// client on the box reads the same one, and a second independent writer would be
+/// a correctness hazard for all of them. Only the declared surface's section is
+/// touched, so opting out here never disturbs another client's selection.
+///
+/// Takes effect on the next [`adele_core_connect`] — a running MCP host is fixed
+/// at start. An `mcp_builtins` view event follows either way (including on
+/// failure, which also emits a `toast`), carrying the pending state so the panel
+/// stays honest in the meantime. A NULL or empty `name` is refused.
+///
+/// # Safety
+/// `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
+/// valid NUL-terminated UTF-8 string, borrowed for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_set_mcp_builtin_disabled(
+    core: *mut Core,
+    name: *const c_char,
+    disabled: bool,
+) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::SetMcpBuiltinDisabled {
+        name: unsafe { cstr_to_string(name) },
+        disabled,
+    });
+}
+
 /// Send an arbitrary management command (an `api::Command` serialized as JSON)
 /// over the connector. The `CommandResult` is delivered later as a
 /// `command_result` view event carrying the same `request_id`, so the caller can
