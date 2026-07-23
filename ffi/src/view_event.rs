@@ -271,9 +271,19 @@ pub enum ViewEvent {
     /// Speak `text` (the C++ side may route this to `org.desktopAssistant.Voice`;
     /// the plasmoid has no embedded engine, so it is a no-op there).
     Speak { text: String },
-    /// Render an inline transcript note (e.g. a `(speech mode disabled) …`
-    /// downgrade).
-    InlineNote { text: String },
+    /// Render an inline transcript note — a line the client generated itself
+    /// rather than received from the daemon (a `say_this` the voice tool spoke,
+    /// the same line when speech is off, a local notice).
+    InlineNote {
+        text: String,
+        /// Presentation metadata as an ABI token (`normal` / `spoken` /
+        /// `speech_disabled`), the same contract [`ChatMessageDto::kind`]
+        /// carries for a reloaded transcript. Why here too: this is the *live*
+        /// path for the same lines, and a client that had to recover the kind
+        /// by matching a marker in `text` would classify by prose — silently
+        /// falling back to `normal` the moment the wording moved.
+        kind: &'static str,
+    },
     /// Reflect the active conversation's `Adele:` level on the dropdown after the
     /// model drove it (`request_voice` / `stop_voice`).
     AdeleOutputDropdown { level: &'static str },
@@ -331,18 +341,8 @@ impl ViewEvent {
             Effect::RefreshSidePaneTasks => ViewEvent::RefreshSidePaneTasks,
             Effect::Speak(text) => ViewEvent::Speak { text },
             Effect::AddLocalMessage { content, kind } => ViewEvent::InlineNote {
-                // Interim kde presentation (voice#126): QML has no dedicated
-                // Spoken / SpeechDisabled affordance yet (tracked as a follow-up),
-                // so render the explicit `kind` metadata as a text marker here at
-                // the FFI boundary — acting on the metadata at the presentation
-                // layer rather than baking it into `content` or parsing it back.
-                text: match kind {
-                    api::client::MessageKind::Spoken => format!("Spoken: {content}"),
-                    api::client::MessageKind::SpeechDisabled => {
-                        format!("(speech mode disabled) {content}")
-                    }
-                    api::client::MessageKind::Normal => content,
-                },
+                text: content,
+                kind: message_kind_str(kind),
             },
             Effect::SetAdeleOutputDropdown(level) => ViewEvent::AdeleOutputDropdown {
                 level: adele_output_str(level),
