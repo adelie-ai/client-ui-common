@@ -110,11 +110,10 @@ pub enum UiMessage {
     /// `request_id` — that is server-generated and arrives embedded in
     /// the first `AssistantDelta`. See issue #31.
     PromptSent {
-        // Staged for streaming-chunk correlation (#31): consumer currently
-        // ignores it (`PromptSent { task_id: _ }`), but the ack value is kept
-        // on the message so the streaming work can correlate without a wire
-        // change. See the variant doc above and issues #114/#31.
-        #[allow(dead_code)]
+        /// The daemon-registered background-task id for this turn — the handle
+        /// `CancelBackgroundTask { id }` acts on. The reducer records it on the
+        /// open conversation's stream so a view can offer **Cancel** for the
+        /// in-flight turn (#138); empty string for a legacy id-less `Ack`.
         task_id: String,
         /// The conversation the prompt was sent into, captured **at send
         /// time** (GTK-2, "the stream knows its conversation"). The reducer
