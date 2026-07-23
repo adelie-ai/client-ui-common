@@ -57,6 +57,14 @@ struct StreamState {
     /// originator (e.g. the voice daemon) already speaks the reply, so narrating
     /// again here would double-speak.
     external: bool,
+    /// The daemon-registered background-task id for this turn — the handle
+    /// `CancelBackgroundTask { id }` acts on (#138) — captured from the
+    /// `PromptSent` ack at send time so a view can offer **Cancel** while the
+    /// turn is in flight (surfaced via [`WindowState::active_task_id_for_view`]).
+    /// Empty when unknown: a legacy daemon's id-less ack, or an
+    /// [`external`](Self::external) turn adopted from elsewhere (this client
+    /// never received that turn's ack, so it holds no handle to cancel it).
+    task_id: String,
 }
 
 /// Separator used to fold several queued messages into one combined prompt on
@@ -320,6 +328,22 @@ impl WindowState {
     /// construction. Part of the shared public API.
     pub fn streaming_is_active_for_view(&self) -> bool {
         self.current_stream().is_some()
+    }
+
+    /// The background-task id of the turn streaming into the *open* conversation,
+    /// or `None` when the open conversation has no in-flight turn, the turn
+    /// carries no cancel handle (a legacy daemon's id-less ack), or it is an
+    /// adopted [`external`](StreamState::external) turn this client never sent.
+    /// This is the handle a view offers **Cancel** for
+    /// (`CancelBackgroundTask { id }`, #138), so its `Some`/`None` also answers
+    /// "should a Cancel affordance show for the open turn?". It clears with the
+    /// stream: both `StreamComplete` and `StreamError` take the stream, so a
+    /// finished or abandoned turn is no longer cancelable. Part of the shared
+    /// public API.
+    pub fn active_task_id_for_view(&self) -> Option<String> {
+        self.current_stream()
+            .map(|s| s.task_id.clone())
+            .filter(|t| !t.is_empty())
     }
 
     /// Drop *every* conversation's in-flight streaming state *without* finalizing
@@ -1353,7 +1377,7 @@ impl WindowState {
                 }
             }
             UiMessage::PromptSent {
-                task_id: _,
+                task_id,
                 conversation_id,
             } => {
                 // The wire ack carries either a `task_id` (post-#114
@@ -1369,11 +1393,17 @@ impl WindowState {
                 // The stream lives on its OWN conversation's model now (Phase-2
                 // Step-2b-ii), so it keeps streaming independently if the user
                 // switches away — and another conversation may stream alongside.
+                //
+                // Record the `task_id` on the stream (#138): it is the
+                // background-task handle Cancel acts on, so it lets a view offer
+                // Cancel for this turn until the stream terminates (empty for a
+                // legacy id-less ack — no Cancel then).
                 let stream = StreamState {
                     request_id: None,
                     buffer: String::new(),
                     say_this_spoken_this_turn: false,
                     external: false,
+                    task_id,
                 };
                 let model = self.open.entry(conversation_id).or_default();
                 // The daemon accepted the send (#25): the flush is now its
@@ -1480,6 +1510,10 @@ impl WindowState {
                         buffer: String::new(),
                         say_this_spoken_this_turn: false,
                         external: true,
+                        // Adopted from elsewhere: this client never received the
+                        // turn's ack, so it holds no task id and cannot cancel it
+                        // (#138).
+                        task_id: String::new(),
                     };
                     self.open.entry(conversation_id).or_default().stream = Some(stream);
                     if let Some(conv) = self.current_conversation_mut() {
