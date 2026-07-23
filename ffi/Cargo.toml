@@ -20,6 +20,38 @@ warnings = "deny"
 [lints.clippy]
 all = "deny"
 
+# Compiled-in ("built-in") MCP servers hosted in-process (da#538), the same
+# mechanism adele-gtk and adele-tui use — but **default-OFF here**. This cdylib
+# is linked by BOTH adele-kde and adele-mac, and KDE's canonical build must stay
+# byte-identical: with no feature selected, none of the server crates are linked
+# and the engine hosts exactly what `client-mcp.toml` configures, as before.
+#
+# adele-mac opts in from its justfile (`just build-with-mcp …`), which is what
+# makes a Mac build ship the core set (or the broad set) compiled in.
+[features]
+default = []
+builtin-core = ["mcp-fileio", "mcp-terminal", "mcp-tasks", "mcp-web"]
+mcp-fileio = ["dep:fileio-mcp"]
+mcp-terminal = ["dep:terminal-mcp"]
+mcp-tasks = ["dep:tasks-mcp"]
+mcp-web = ["dep:web-mcp"]
+
+# The "broad set" — the same fleet Adele ships on the daemon, minus the core-4.
+# Hosted in-process exactly like the core set; opt-in via this umbrella or a
+# single `mcp-*`.
+builtin-extras = [
+    "mcp-weather",
+    "mcp-internet-radio",
+    "mcp-openstreetmap",
+    "mcp-geocode",
+    "mcp-skills",
+]
+mcp-weather = ["dep:weather-forecast-mcp"]
+mcp-internet-radio = ["dep:internet-radio-mcp"]
+mcp-openstreetmap = ["dep:openstreetmap-mcp"]
+mcp-geocode = ["dep:geocode-mcp"]
+mcp-skills = ["dep:skills-mcp"]
+
 [dependencies]
 # The shared view-agnostic reducer (WindowState/Effect/UiMessage) + its
 # re-exports (AdeleOutput, ContextUsageView, SelectedModel, the signal->message
@@ -39,6 +71,21 @@ desktop-assistant-api-model = { path = "../../desktop-assistant/crates/api-model
 desktop-assistant-client-common = { path = "../../desktop-assistant/crates/client-common", features = [
     "mcp-host",
 ] }
+
+# The built-in MCP server libs (see `[features]` above). Each exposes a
+# `build_service()` the engine hands to `McpHost::start_with_disabled` for
+# in-process hosting — no subprocess. Optional + feature-gated, so a default
+# build (adele-kde's) links none of them. Sibling path-deps, two levels up
+# because this member sits under `client-ui-common/`.
+fileio-mcp = { path = "../../fileio-mcp", optional = true }
+terminal-mcp = { path = "../../terminal-mcp", optional = true }
+tasks-mcp = { path = "../../tasks-mcp", optional = true }
+web-mcp = { path = "../../web-mcp", optional = true }
+weather-forecast-mcp = { path = "../../weather-forecast-mcp", optional = true }
+internet-radio-mcp = { path = "../../internet-radio-mcp", optional = true }
+openstreetmap-mcp = { path = "../../openstreetmap-mcp", optional = true }
+geocode-mcp = { path = "../../geocode-mcp", optional = true }
+skills-mcp = { path = "../../skills-mcp", optional = true }
 
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }

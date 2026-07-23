@@ -23,6 +23,7 @@
 //! All string arguments are borrowed for the duration of the call and copied;
 //! the caller retains ownership.
 
+mod builtins;
 mod engine;
 mod view_event;
 

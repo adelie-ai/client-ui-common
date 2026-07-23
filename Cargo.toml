@@ -38,3 +38,26 @@ adele-voice-client-common = { path = "../voice/crates/client-voice", default-fea
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Collapse mcp-core to a SINGLE source, exactly as adele-gtk/adele-tui do.
+# `client-common` pins mcp-core to a git rev while the built-in server libs the
+# `ffi` member optionally links (fileio/terminal/tasks/web + the broad set)
+# float the same git dep unpinned. Two git sources would split
+# `mcp_core::McpService` into two incompatible types (E0308) the moment a
+# built-in's `Arc<dyn McpService>` is handed to `BuiltinServer::new`. Patching
+# the URL to the local checkout resolves every consumer to one mcp-core.
+#
+# Lives at the workspace ROOT because cargo only honors `[patch]` there — the
+# same table in `ffi/Cargo.toml` would be silently ignored.
+#
+# CONSEQUENCE, and it is not feature-gated: `[patch]` applies to EVERY build of
+# this workspace, including the default (no `mcp-*` features) one adele-kde
+# links. So the default build no longer resolves client-common's pinned mcp-core
+# rev from git — it resolves `../mcp-core` — and this workspace now REQUIRES that
+# sibling checkout to build at all. adele-gtk and adele-tui already carry the
+# identical patch and requirement, and adele-kde's `client-build` already assumes
+# the sibling layout, so this aligns client-ui-common with them rather than
+# introducing a new convention. What is unchanged for adele-kde is the linked
+# code: a default build still compiles in zero built-in MCP servers.
+[patch."https://github.com/adelie-ai/mcp-core"]
+mcp-core = { path = "../mcp-core" }
