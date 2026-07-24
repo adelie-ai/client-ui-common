@@ -19,7 +19,8 @@
 //!
 //! [`McpHost::start_with_disabled`]: desktop_assistant_client_common::mcp_host::McpHost::start_with_disabled
 
-use desktop_assistant_client_common::mcp_host::BuiltinServer;
+use crate::view_event::{BUILTIN_KIND, BuiltinServerDto};
+use desktop_assistant_client_common::mcp_host::{BuiltinServer, BuiltinStatus};
 #[cfg(any(
     feature = "mcp-fileio",
     feature = "mcp-terminal",
@@ -112,9 +113,248 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
     out
 }
 
+/// Project a running host's [`McpHost::builtin_status`] into the panel rows the
+/// C side renders.
+///
+/// This is the authoritative source when a connection is up: the host reports
+/// the tools it actually registered and the override/disable decisions it
+/// actually made. Order is preserved — it is the order the built-ins were
+/// passed, which is the panel's stable tiebreak for equal names.
+///
+/// [`McpHost::builtin_status`]: desktop_assistant_client_common::mcp_host::McpHost::builtin_status
+pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
+    status
+        .into_iter()
+        .map(|s| BuiltinServerDto {
+            name: s.name,
+            namespace: s.namespace,
+            kind: BUILTIN_KIND,
+            // Saturate rather than wrap: a count that cannot fit is absurd, and a
+            // wrapped one would render as a plausible lie.
+            tool_count: u32::try_from(s.tool_count).unwrap_or(u32::MAX),
+            overridden_by: s.overridden_by,
+            disabled_by_config: s.disabled_by_config,
+        })
+        .collect()
+}
+
+/// Derive the same panel rows with **no running host**, from the compiled-in set
+/// plus the caller's view of the client config.
+///
+/// Why this exists: the MCP host starts on connect, but the settings panel is
+/// opened before and between connections. Without this the panel would show no
+/// built-in rows while disconnected even though the servers are linked in. The
+/// override + disable bookkeeping mirrors [`McpHost::start_with_disabled`]'s,
+/// which owns it for the hosted case:
+///
+/// - `configured` — the names of the client-mcp servers **this surface hosts**
+///   (i.e. `ClientMcpConfig::resolved_servers`). A same-name server shadows the
+///   built-in, so it reports `overridden_by`.
+/// - `disabled` — this surface's `disabled_builtins` list.
+///
+/// `tool_count` comes from the built-in itself, so the row shows a real number
+/// rather than a placeholder zero.
+///
+/// [`McpHost::start_with_disabled`]: desktop_assistant_client_common::mcp_host::McpHost::start_with_disabled
+pub fn compiled_builtin_dtos(configured: &[String], disabled: &[String]) -> Vec<BuiltinServerDto> {
+    builtin_servers()
+        .into_iter()
+        .map(|builtin| {
+            let overridden = configured.contains(&builtin.name);
+            let disabled_by_config = disabled.contains(&builtin.name);
+            BuiltinServerDto {
+                kind: BUILTIN_KIND,
+                tool_count: u32::try_from(builtin.service.tools().len()).unwrap_or(u32::MAX),
+                overridden_by: overridden.then(|| builtin.name.clone()),
+                disabled_by_config,
+                name: builtin.name,
+                namespace: builtin.namespace,
+            }
+        })
+        .collect()
+}
+
+/// Re-derive each row's `disabled_by_config` from the surface's **current**
+/// `disabled_builtins` list.
+///
+/// Why: a running host records the disabled set once, at start — built-ins are
+/// fixed until the client relaunches — so a snapshot taken from
+/// [`builtin_dtos`] reflects config-at-connect, not later edits. After a live
+/// toggle the panel must show the *pending* state. This corrects only that flag;
+/// the tool count and `overridden_by` describe the running host and are left
+/// alone.
+pub fn apply_disabled_overlay(dtos: &mut [BuiltinServerDto], disabled: &[String]) {
+    for dto in dtos.iter_mut() {
+        dto.disabled_by_config = disabled.contains(&dto.name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_client_common::mcp_host::BuiltinStatus;
+
+    /// A [`BuiltinStatus`] as a running [`McpHost`] would report it.
+    ///
+    /// [`McpHost`]: desktop_assistant_client_common::mcp_host::McpHost
+    fn status(name: &str, overridden_by: Option<&str>, disabled_by_config: bool) -> BuiltinStatus {
+        BuiltinStatus {
+            name: name.to_string(),
+            namespace: name.to_string(),
+            tool_count: 7,
+            overridden_by: overridden_by.map(str::to_string),
+            disabled_by_config,
+        }
+    }
+
+    // --- builtin_dtos: the live-host projection --------------------------------
+
+    /// Every field the panel reads must survive the projection, including the
+    /// two reason flags — dropping either would render a shadowed or opted-out
+    /// built-in as active.
+    #[test]
+    fn builtin_dtos_carry_every_panel_field() {
+        let dtos = builtin_dtos(vec![status("fileio", Some("fileio"), true)]);
+        let dto = dtos.first().expect("one status in, one dto out");
+        assert_eq!(dto.name, "fileio");
+        assert_eq!(dto.namespace, "fileio");
+        assert_eq!(dto.tool_count, 7);
+        assert_eq!(dto.overridden_by.as_deref(), Some("fileio"));
+        assert!(dto.disabled_by_config);
+    }
+
+    /// The kind is stamped by the core, not inferred by each client: a row that
+    /// came through this path is a built-in by construction.
+    #[test]
+    fn builtin_dtos_stamp_the_built_in_kind() {
+        let dtos = builtin_dtos(vec![status("web", None, false)]);
+        assert_eq!(dtos[0].kind, BUILTIN_KIND);
+    }
+
+    /// Order is the panel's stable identity for equal names, so it must be the
+    /// order the host reported (which is the order the built-ins were passed).
+    #[test]
+    fn builtin_dtos_preserve_host_order() {
+        let dtos = builtin_dtos(vec![
+            status("fileio", None, false),
+            status("terminal", None, false),
+            status("web", None, false),
+        ]);
+        let names: Vec<&str> = dtos.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["fileio", "terminal", "web"]);
+    }
+
+    // --- apply_disabled_overlay ------------------------------------------------
+
+    /// A running host records the disabled set once, at start. After a live
+    /// toggle the panel must show the *pending* state, so the flag is re-derived
+    /// from the current config rather than trusted from the snapshot.
+    #[test]
+    fn overlay_flags_builtins_named_in_the_surface_disabled_set() {
+        let mut dtos = builtin_dtos(vec![
+            status("fileio", None, false),
+            status("web", None, false),
+        ]);
+        apply_disabled_overlay(&mut dtos, &["web".to_string()]);
+        assert!(!dtos[0].disabled_by_config, "fileio was not named");
+        assert!(dtos[1].disabled_by_config, "web was named");
+    }
+
+    /// The overlay is authoritative in BOTH directions: re-enabling must clear a
+    /// flag the snapshot still carries, or the row would stay dimmed forever.
+    #[test]
+    fn overlay_clears_a_flag_the_snapshot_still_carries() {
+        let mut dtos = builtin_dtos(vec![status("web", None, true)]);
+        apply_disabled_overlay(&mut dtos, &[]);
+        assert!(!dtos[0].disabled_by_config);
+    }
+
+    /// The overlay corrects only the disable flag — the override and the tool
+    /// count describe the *running* host and must not be invented from config.
+    #[test]
+    fn overlay_leaves_override_and_tool_count_alone() {
+        let mut dtos = builtin_dtos(vec![status("web", Some("web"), false)]);
+        apply_disabled_overlay(&mut dtos, &["web".to_string()]);
+        assert!(dtos[0].disabled_by_config);
+        assert_eq!(dtos[0].overridden_by.as_deref(), Some("web"));
+        assert_eq!(dtos[0].tool_count, 7);
+    }
+
+    // --- compiled_builtin_dtos: the pre-connect derivation ---------------------
+
+    /// The panel is opened before (and between) connections, when no host exists.
+    /// A feature-less build must then report nothing — the same answer a running
+    /// host would give — so the panel never implies built-ins that aren't linked.
+    #[cfg(not(any(
+        feature = "mcp-fileio",
+        feature = "mcp-terminal",
+        feature = "mcp-tasks",
+        feature = "mcp-web",
+        feature = "mcp-weather",
+        feature = "mcp-internet-radio",
+        feature = "mcp-openstreetmap",
+        feature = "mcp-geocode",
+        feature = "mcp-skills"
+    )))]
+    #[test]
+    fn compiled_dtos_are_empty_without_a_single_mcp_feature() {
+        assert!(compiled_builtin_dtos(&[], &[]).is_empty());
+    }
+
+    /// Without a host, the override bookkeeping `McpHost::start_with_disabled`
+    /// would do has to be derived here — otherwise a shadowed built-in reads as
+    /// active until the next connect.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn compiled_dtos_flag_an_external_server_of_the_same_name() {
+        let dtos = compiled_builtin_dtos(&["fileio".to_string()], &[]);
+        let fileio = dtos
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("fileio is compiled in under this feature");
+        assert_eq!(fileio.overridden_by.as_deref(), Some("fileio"));
+    }
+
+    /// A configured server with a *different* name shadows nothing — the match
+    /// is by name, not "any external server exists".
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn compiled_dtos_ignore_an_unrelated_external_server() {
+        let dtos = compiled_builtin_dtos(&["something-else".to_string()], &[]);
+        let fileio = dtos
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("compiled in");
+        assert!(fileio.overridden_by.is_none());
+    }
+
+    /// The per-surface opt-out must be visible with no host, too.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn compiled_dtos_flag_a_config_disabled_builtin() {
+        let dtos = compiled_builtin_dtos(&[], &["fileio".to_string()]);
+        let fileio = dtos
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("compiled in");
+        assert!(fileio.disabled_by_config);
+        assert!(fileio.overridden_by.is_none(), "disable is not an override");
+    }
+
+    /// Tool counts come from the built-in itself, so a pre-connect panel shows a
+    /// real number rather than a placeholder zero.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn compiled_dtos_report_a_real_tool_count() {
+        let dtos = compiled_builtin_dtos(&[], &[]);
+        let fileio = dtos
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("compiled in");
+        assert!(fileio.tool_count > 0, "fileio advertises tools");
+        assert_eq!(fileio.namespace, "fileio");
+        assert_eq!(fileio.kind, BUILTIN_KIND);
+    }
 
     /// The KDE-preserving default: with no `mcp-*` feature selected, nothing is
     /// compiled in, so the set is empty and the engine's host decision collapses

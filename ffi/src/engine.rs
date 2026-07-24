@@ -22,6 +22,7 @@
 //! connector directly, installs it on connect, and drops it on
 //! [`Effect::ClearClient`].
 
+use std::path::Path;
 use std::sync::Arc;
 
 use client_ui_common::{
@@ -174,6 +175,20 @@ pub enum Intent {
     /// Staged on the actor and read when the next connect starts the MCP host.
     /// An empty name is ignored, keeping [`DEFAULT_MCP_SURFACE`].
     SetMcpSurface(String),
+    /// Ask for this client's compiled-in ("built-in") MCP servers and their
+    /// status under the declared surface, delivered as a
+    /// [`ViewEvent::McpBuiltins`]. Answerable with no connection: built-ins are a
+    /// property of how this cdylib was built plus what `client-mcp.toml` says.
+    RequestMcpBuiltins,
+    /// Turn one built-in on or off **for this client's surface**, by writing
+    /// `[surfaces.<surface>].disabled_builtins` in the shared `client-mcp.toml`.
+    ///
+    /// The Rust side owns that file — every client surface on the machine reads
+    /// it — so the write goes through here rather than through each client's own
+    /// parser. Takes effect on the next connect (the running host is fixed at
+    /// start); the refreshed [`ViewEvent::McpBuiltins`] that follows shows the
+    /// pending state so the panel is honest in the meantime.
+    SetMcpBuiltinDisabled { name: String, disabled: bool },
     /// Send an arbitrary management `api::Command` (serialized as JSON) over the
     /// connector; the `CommandResult` comes back as a `command_result` view event
     /// keyed by `request_id`. The generic channel for settings/management
@@ -203,8 +218,10 @@ enum CoreMsg {
     /// A view event produced outside the reducer — the signal pump's direct
     /// forward (see [`view_event_for_signal`]). Routed through the actor rather
     /// than emitted from the pump so every callback into the C side still
-    /// happens on the one actor task.
-    EmitView(ViewEvent),
+    /// happens on the one actor task. Boxed for the same reason [`Self::Ui`] is:
+    /// a `ViewEvent` is far larger than every other variant, and these are
+    /// queued (clippy::large_enum_variant).
+    EmitView(Box<ViewEvent>),
 }
 
 /// Wrap a reducer message as a (boxed) channel item.
@@ -255,6 +272,72 @@ fn build_connection_config(
         config.ws_jwt = ws_jwt;
     }
     config
+}
+
+/// Build the `mcp_builtins` view event for `surface`, reading the client MCP
+/// config at `path`.
+///
+/// Two sources, one shape. When a host is running (`host` is `Some`) its
+/// `builtin_status()` is authoritative — it reports the tools actually
+/// registered and the decisions actually made. With no host the same rows are
+/// derived from the compiled-in set plus the config, so the panel is answerable
+/// before the first connect.
+///
+/// In both cases the disable flag is re-derived from the config as it is *now*:
+/// the running host froze that decision at start, and a toggle made since must
+/// show as pending rather than not at all.
+///
+/// Takes the path explicitly so the on-disk behavior is testable without
+/// touching the developer's real `~/.config/adele/client-mcp.toml`.
+fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> ViewEvent {
+    let cfg = ClientMcpConfig::load(path);
+    let disabled = cfg.surface_disabled_builtins(surface);
+    let mut servers = match host {
+        Some(host) => crate::builtins::builtin_dtos(host.builtin_status()),
+        None => {
+            let configured: Vec<String> = cfg
+                .resolved_servers(surface)
+                .into_iter()
+                .map(|s| s.name.clone())
+                .collect();
+            crate::builtins::compiled_builtin_dtos(&configured, disabled)
+        }
+    };
+    crate::builtins::apply_disabled_overlay(&mut servers, disabled);
+    ViewEvent::McpBuiltins {
+        surface: surface.to_string(),
+        servers,
+    }
+}
+
+/// Add or remove `name` in one surface's `disabled_builtins` list in the client
+/// MCP config at `path`.
+///
+/// **Fail-closed on a malformed file.** [`ClientMcpConfig::load`] is deliberately
+/// tolerant — an unparseable config degrades to an empty one so a bad file never
+/// stops a client connecting — but saving that empty config back would erase
+/// every server definition on the machine, for every surface. The edit path
+/// therefore parses strictly and refuses rather than replacing what it could not
+/// read. A file that is merely *absent* is fine: that is a first write.
+///
+/// An empty `name` is refused for the same reason: a blank entry is inert noise
+/// every other client sharing the file would then carry.
+fn write_builtin_disabled(
+    path: &Path,
+    surface: &str,
+    name: &str,
+    disabled: bool,
+) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("built-in server name must not be empty".to_string());
+    }
+    let mut cfg = match std::fs::read_to_string(path) {
+        Ok(contents) => ClientMcpConfig::from_toml(&contents)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ClientMcpConfig::default(),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    cfg.set_builtin_disabled(surface, name, disabled);
+    cfg.save(path)
 }
 
 /// The actor: owns the reducer state + the connector, runs effects.
@@ -422,11 +505,54 @@ impl Engine {
             // would fall through to the `default` section and look like it worked.
             Intent::SetMcpSurface(surface) if !surface.is_empty() => self.mcp_surface = surface,
             Intent::SetMcpSurface(_) => {}
+            Intent::RequestMcpBuiltins => self.spawn_emit_mcp_builtins(),
+            Intent::SetMcpBuiltinDisabled { name, disabled } => {
+                self.spawn_set_mcp_builtin_disabled(name, disabled)
+            }
             Intent::SendCommand {
                 request_id,
                 command_json,
             } => self.spawn_send_command(request_id, command_json),
         }
+    }
+
+    /// Answer [`Intent::RequestMcpBuiltins`] with the current built-in inventory.
+    ///
+    /// Off the actor loop because it reads `client-mcp.toml` from disk (and, with
+    /// no host, constructs the compiled-in services to count their tools).
+    fn spawn_emit_mcp_builtins(&self) {
+        let sink = self.sink;
+        let surface = self.mcp_surface.clone();
+        let host = self.mcp_host.clone();
+        tokio::spawn(async move {
+            sink.emit(&mcp_builtins_event_at(
+                &default_client_mcp_path(),
+                host.as_deref(),
+                &surface,
+            ));
+        });
+    }
+
+    /// Answer [`Intent::SetMcpBuiltinDisabled`]: write this surface's opt-out,
+    /// then re-emit the inventory so the panel resyncs.
+    ///
+    /// The refreshed inventory is emitted on failure too — the panel must fall
+    /// back to the truth on disk rather than keep an optimistic toggle that never
+    /// landed.
+    fn spawn_set_mcp_builtin_disabled(&self, name: String, disabled: bool) {
+        let sink = self.sink;
+        let surface = self.mcp_surface.clone();
+        let host = self.mcp_host.clone();
+        tokio::spawn(async move {
+            let path = default_client_mcp_path();
+            if let Err(err) = write_builtin_disabled(&path, &surface, &name, disabled) {
+                tracing::warn!("failed to update built-in '{name}' for surface '{surface}': {err}");
+                sink.emit(&ViewEvent::Toast {
+                    text: format!("Could not update built-in server: {err}"),
+                });
+            }
+            sink.emit(&mcp_builtins_event_at(&path, host.as_deref(), &surface));
+        });
     }
 
     /// Send an arbitrary management command over the connector and emit its
@@ -658,7 +784,7 @@ impl Engine {
                                 // `KnowledgeChanged`) also goes straight to the
                                 // view, since no `Effect` would ever carry it.
                                 if let Some(ev) = view_event_for_signal(&sig)
-                                    && tx2.send(CoreMsg::EmitView(ev)).is_err()
+                                    && tx2.send(CoreMsg::EmitView(Box::new(ev))).is_err()
                                 {
                                     break;
                                 }
@@ -1363,5 +1489,315 @@ mod idempotency_key_tests {
                 "each key must be a v4 (random) UUID"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_builtin_tests {
+    //! Cover the built-in MCP inventory read/write paths the panels drive
+    //! (adele-mac#12): projecting the compiled-in set + the client's config into
+    //! a `mcp_builtins` view event, and writing one built-in's per-surface
+    //! opt-out back into `client-mcp.toml`.
+    //!
+    //! Both take an explicit path so the on-disk behavior is testable without
+    //! touching the developer's real `~/.config/adele/client-mcp.toml`; the
+    //! actor supplies `default_client_mcp_path()`.
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A temp dir plus the config path inside it. The dir guard must stay alive
+    /// for the test, so it is returned alongside the path.
+    fn temp_config(contents: Option<&str>) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("client-mcp.toml");
+        if let Some(contents) = contents {
+            std::fs::write(&path, contents).expect("seed the config");
+        }
+        (dir, path)
+    }
+
+    fn reload(path: &std::path::Path) -> ClientMcpConfig {
+        let contents = std::fs::read_to_string(path).expect("config was written");
+        ClientMcpConfig::from_toml(&contents).expect("written config re-parses")
+    }
+
+    fn servers_of(ev: &ViewEvent) -> &[crate::view_event::BuiltinServerDto] {
+        match ev {
+            ViewEvent::McpBuiltins { servers, .. } => servers,
+            other => panic!("expected an mcp_builtins event, got {other:?}"),
+        }
+    }
+
+    fn surface_of(ev: &ViewEvent) -> &str {
+        match ev {
+            ViewEvent::McpBuiltins { surface, .. } => surface,
+            other => panic!("expected an mcp_builtins event, got {other:?}"),
+        }
+    }
+
+    // --- write path: the per-surface opt-out ----------------------------------
+
+    /// The whole point of the `mac` surface: an opt-out written from the Mac's
+    /// panel must land in `[surfaces.mac]` and leave every other client's
+    /// section — they share this one file — untouched.
+    #[test]
+    fn disabling_a_builtin_writes_the_named_surface_only() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[surfaces.kde]
+enabled = []
+disabled_builtins = ["terminal"]
+"#,
+        ));
+
+        write_builtin_disabled(&path, "mac", "fileio", true).expect("write succeeds");
+
+        let cfg = reload(&path);
+        assert_eq!(cfg.surface_disabled_builtins("mac"), ["fileio".to_string()]);
+        assert_eq!(
+            cfg.surface_disabled_builtins("kde"),
+            ["terminal".to_string()],
+            "another surface's opt-outs must survive verbatim"
+        );
+    }
+
+    /// Re-enabling is the same write in reverse: the name leaves the list, and
+    /// the surface is left with an empty (not absent-by-accident) selection.
+    #[test]
+    fn re_enabling_a_builtin_removes_it_from_the_surface() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[surfaces.mac]
+enabled = []
+disabled_builtins = ["fileio", "web"]
+"#,
+        ));
+
+        write_builtin_disabled(&path, "mac", "fileio", false).expect("write succeeds");
+
+        assert_eq!(
+            reload(&path).surface_disabled_builtins("mac"),
+            ["web".to_string()],
+            "only the named built-in is re-enabled"
+        );
+    }
+
+    /// Disabling twice must not duplicate the entry.
+    #[test]
+    fn disabling_a_builtin_twice_is_idempotent() {
+        let (_dir, path) = temp_config(None);
+        write_builtin_disabled(&path, "mac", "web", true).expect("first write");
+        write_builtin_disabled(&path, "mac", "web", true).expect("second write");
+        assert_eq!(
+            reload(&path).surface_disabled_builtins("mac"),
+            ["web".to_string()]
+        );
+    }
+
+    /// `client-mcp.toml` is machine-wide and holds every surface's server
+    /// definitions. A built-in toggle must rewrite it in place, never replace it
+    /// — losing the `[[servers]]` block would break every other client.
+    #[test]
+    fn disabling_a_builtin_preserves_the_shared_server_definitions() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "notes"
+command = "/usr/bin/notes-mcp"
+namespace = "notes"
+
+[surfaces.tui]
+enabled = ["notes"]
+"#,
+        ));
+
+        write_builtin_disabled(&path, "mac", "fileio", true).expect("write succeeds");
+
+        let cfg = reload(&path);
+        let defined: Vec<&str> = cfg
+            .list_defined_servers()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(defined, ["notes"], "the shared definitions must survive");
+        assert_eq!(cfg.surface_enabled_names("tui"), ["notes".to_string()]);
+    }
+
+    /// A surface with no section yet gets one materialized, rather than the
+    /// opt-out silently falling into `[surfaces.default]`.
+    #[test]
+    fn disabling_a_builtin_materializes_a_missing_surface_section() {
+        let (_dir, path) = temp_config(None);
+
+        write_builtin_disabled(&path, "mac", "tasks", true).expect("write succeeds");
+
+        let cfg = reload(&path);
+        assert_eq!(cfg.surface_disabled_builtins("mac"), ["tasks".to_string()]);
+        assert!(
+            cfg.surface_disabled_builtins("default").is_empty(),
+            "the inheritance fallback must not be edited as a side effect"
+        );
+    }
+
+    /// Fail-closed on a malformed file. The tolerant loader the read path uses
+    /// degrades an unparseable config to an EMPTY one; saving that back would
+    /// erase every server definition on the machine, so the edit path must
+    /// refuse instead — and leave the bytes exactly as they were.
+    #[test]
+    fn a_malformed_config_is_refused_rather_than_overwritten() {
+        let original = "this is not = valid toml [[[";
+        let (_dir, path) = temp_config(Some(original));
+
+        let err = write_builtin_disabled(&path, "mac", "fileio", true)
+            .expect_err("a malformed config must not be silently replaced");
+        assert!(!err.is_empty(), "the failure must explain itself");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file still there"),
+            original,
+            "the user's file must be left byte-identical"
+        );
+    }
+
+    // --- read path: the mcp_builtins event ------------------------------------
+
+    /// The event names the surface it resolved under, so a client can verify it
+    /// is reading its own section rather than another client's.
+    #[test]
+    fn builtins_event_reports_the_surface_it_resolved() {
+        let (_dir, path) = temp_config(None);
+        let ev = mcp_builtins_event_at(&path, None, "mac");
+        assert_eq!(surface_of(&ev), "mac");
+    }
+
+    /// A missing `client-mcp.toml` is the common case on a fresh machine: the
+    /// read path must still answer (with the compiled-in set, nothing disabled)
+    /// rather than error or hang the panel.
+    #[test]
+    fn builtins_event_survives_a_missing_config() {
+        let (_dir, path) = temp_config(None);
+        let ev = mcp_builtins_event_at(&path, None, "mac");
+        for dto in servers_of(&ev) {
+            assert!(!dto.disabled_by_config);
+            assert!(dto.overridden_by.is_none());
+        }
+    }
+
+    /// A core with no `mcp-*` feature — adele-kde's build — reports no built-ins
+    /// at all, so its panel renders none.
+    #[cfg(not(any(
+        feature = "mcp-fileio",
+        feature = "mcp-terminal",
+        feature = "mcp-tasks",
+        feature = "mcp-web",
+        feature = "mcp-weather",
+        feature = "mcp-internet-radio",
+        feature = "mcp-openstreetmap",
+        feature = "mcp-geocode",
+        feature = "mcp-skills"
+    )))]
+    #[test]
+    fn builtins_event_is_empty_on_a_default_featured_core() {
+        let (_dir, path) = temp_config(None);
+        assert!(servers_of(&mcp_builtins_event_at(&path, None, "mac")).is_empty());
+    }
+
+    /// The surface's own `disabled_builtins` list drives the flag — read back
+    /// live, so a toggle is reflected before the next connect restarts the host.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn builtins_event_flags_a_builtin_disabled_for_this_surface() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[surfaces.mac]
+enabled = []
+disabled_builtins = ["fileio"]
+"#,
+        ));
+        let ev = mcp_builtins_event_at(&path, None, "mac");
+        let fileio = servers_of(&ev)
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("fileio is compiled in under this feature");
+        assert!(fileio.disabled_by_config);
+    }
+
+    /// Another surface's opt-out must not dim this client's row.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn builtins_event_ignores_another_surfaces_opt_out() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[surfaces.kde]
+enabled = []
+disabled_builtins = ["fileio"]
+"#,
+        ));
+        let ev = mcp_builtins_event_at(&path, None, "mac");
+        let fileio = servers_of(&ev)
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("compiled in");
+        assert!(!fileio.disabled_by_config);
+    }
+
+    /// External beats built-in: a configured client-mcp server of the same name
+    /// this surface hosts shadows the built-in, and the row says which one.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn builtins_event_marks_an_externally_overridden_builtin() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "fileio"
+command = "/usr/bin/fileio-mcp"
+
+[surfaces.mac]
+enabled = ["fileio"]
+"#,
+        ));
+        let ev = mcp_builtins_event_at(&path, None, "mac");
+        let fileio = servers_of(&ev)
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("compiled in");
+        assert_eq!(fileio.overridden_by.as_deref(), Some("fileio"));
+    }
+
+    /// A same-name server this surface does NOT enable hosts nothing, so it
+    /// shadows nothing — the built-in stays active.
+    #[cfg(feature = "mcp-fileio")]
+    #[test]
+    fn builtins_event_ignores_a_same_name_server_this_surface_does_not_host() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "fileio"
+command = "/usr/bin/fileio-mcp"
+
+[surfaces.kde]
+enabled = ["fileio"]
+
+[surfaces.mac]
+enabled = []
+"#,
+        ));
+        let ev = mcp_builtins_event_at(&path, None, "mac");
+        let fileio = servers_of(&ev)
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("compiled in");
+        assert!(fileio.overridden_by.is_none());
+    }
+
+    // --- intent wiring ---------------------------------------------------------
+
+    /// An empty built-in name is refused rather than written: a blank entry in
+    /// `disabled_builtins` is inert noise every other client sharing the file
+    /// would then carry, and it can only come from a caller bug.
+    #[test]
+    fn an_empty_builtin_name_is_not_written() {
+        let (_dir, path) = temp_config(None);
+        write_builtin_disabled(&path, "mac", "", true).expect_err("an empty name is rejected");
+        assert!(!path.exists(), "nothing should have been written");
     }
 }

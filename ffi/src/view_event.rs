@@ -76,6 +76,43 @@ pub fn message_kind_str(kind: api::client::MessageKind) -> &'static str {
     }
 }
 
+/// The `kind` token every built-in row carries, matching the shared panel
+/// view-model's `ServerKind::BuiltIn`.
+///
+/// Why a constant field rather than an implied kind: a client renders one merged
+/// list of daemon, external-client, and built-in rows, and the chip text comes
+/// from the row's kind. Stamping it here means the kind is decided once, by the
+/// core that actually hosts the server, instead of each client inferring
+/// "built-in" from which array the row arrived in.
+pub const BUILTIN_KIND: &str = "built_in";
+
+/// One built-in (compiled-in, in-process) MCP server's panel status.
+///
+/// Mirrors `client-ui-common`'s `BuiltinServerDto` — the shape the shared
+/// MCP-servers view-model already merges and sorts — and carries the two
+/// *orthogonal* reasons a built-in can render disabled: shadowed by a same-name
+/// external server ([`overridden_by`](Self::overridden_by)), or turned off for
+/// this surface ([`disabled_by_config`](Self::disabled_by_config)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuiltinServerDto {
+    /// Server name — also the key an external client-run server of the same name
+    /// overrides.
+    pub name: String,
+    /// The built-in's tool namespace (e.g. `"fileio"`).
+    pub namespace: String,
+    /// Always [`BUILTIN_KIND`].
+    pub kind: &'static str,
+    /// When hosted, the tools actually registered; when not, the number this
+    /// built-in would have advertised.
+    pub tool_count: u32,
+    /// `Some(name)` when a configured client-mcp server of the same name shadows
+    /// this built-in (external wins); `None` when nothing shadows it.
+    pub overridden_by: Option<String>,
+    /// `true` when this surface's `[surfaces.<name>].disabled_builtins` names it.
+    /// Orthogonal to [`overridden_by`](Self::overridden_by) — both can be set.
+    pub disabled_by_config: bool,
+}
+
 /// The [`ViewEvent`] a daemon signal produces *directly*, bypassing the
 /// reducer, or `None` when the reducer already covers it.
 ///
@@ -287,6 +324,22 @@ pub enum ViewEvent {
     /// Reflect the active conversation's `Adele:` level on the dropdown after the
     /// model drove it (`request_voice` / `stop_voice`).
     AdeleOutputDropdown { level: &'static str },
+    /// This client's compiled-in ("built-in") MCP servers and their status under
+    /// the declared `client-mcp.toml` surface — the reply to
+    /// `adele_core_request_mcp_builtins`, and re-emitted after
+    /// `adele_core_set_mcp_builtin_disabled` so a toggle resyncs the panel.
+    ///
+    /// Executor-emitted (no `Effect` carries it): built-ins are a property of how
+    /// this cdylib was built plus what is on disk, not of the conversation
+    /// reducer. `servers` is empty on a core built with no `mcp-*` feature —
+    /// adele-kde's build — which is the honest answer, not a missing one.
+    ///
+    /// `surface` echoes which section was resolved, so a client can tell it is
+    /// reading its own (`mac`) rather than silently inheriting another's.
+    McpBuiltins {
+        surface: String,
+        servers: Vec<BuiltinServerDto>,
+    },
 }
 
 impl ViewEvent {
@@ -586,5 +639,58 @@ mod tests {
         // Unknown / empty ⇒ the safe default.
         assert_eq!(adele_output_from_str("garbage"), AdeleOutput::Disabled);
         assert_eq!(adele_output_from_str(""), AdeleOutput::Disabled);
+    }
+
+    // --- mcp_builtins (the built-in inventory read path) -----------------------
+
+    fn builtin_dto(name: &str, overridden_by: Option<&str>) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: name.to_string(),
+            namespace: name.to_string(),
+            kind: BUILTIN_KIND,
+            tool_count: 3,
+            overridden_by: overridden_by.map(str::to_string),
+            disabled_by_config: false,
+        }
+    }
+
+    /// The wire shape every client decodes. Pinned literally: the field names ARE
+    /// the ABI, and a rename would silently blank the panel rather than fail.
+    #[test]
+    fn mcp_builtins_event_carries_the_surface_and_every_row_field() {
+        let ev = ViewEvent::McpBuiltins {
+            surface: "mac".to_string(),
+            servers: vec![builtin_dto("fileio", None)],
+        };
+        assert_eq!(
+            ev.to_json().expect("serializes"),
+            r#"{"type":"mcp_builtins","surface":"mac","servers":[{"name":"fileio","namespace":"fileio","kind":"built_in","tool_count":3,"overridden_by":null,"disabled_by_config":false}]}"#
+        );
+    }
+
+    /// An override travels as the shadowing server's name, not a bare boolean, so
+    /// the panel can name it in the row's reason line.
+    #[test]
+    fn mcp_builtins_event_names_the_overriding_server() {
+        let ev = ViewEvent::McpBuiltins {
+            surface: "mac".to_string(),
+            servers: vec![builtin_dto("web", Some("web"))],
+        };
+        let json = ev.to_json().expect("serializes");
+        assert!(json.contains(r#""overridden_by":"web""#), "{json}");
+    }
+
+    /// A core with no built-ins linked still answers — with an empty list — so the
+    /// panel can tell "none compiled in" from "never asked".
+    #[test]
+    fn mcp_builtins_event_answers_empty_rather_than_silently() {
+        let ev = ViewEvent::McpBuiltins {
+            surface: "kde".to_string(),
+            servers: Vec::new(),
+        };
+        assert_eq!(
+            ev.to_json().expect("serializes"),
+            r#"{"type":"mcp_builtins","surface":"kde","servers":[]}"#
+        );
     }
 }
