@@ -343,19 +343,33 @@ fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> 
 /// touching the developer's real `~/.config/adele/client-mcp.toml`.
 ///
 /// [`McpHost::tool_counts`]: desktop_assistant_client_common::mcp_host::McpHost::tool_counts
-fn mcp_client_servers_event_at(path: &Path, _host: Option<&McpHost>, surface: &str) -> ViewEvent {
-    // Spec stub: lists the surface's servers by name but does not yet derive the
-    // transport, the live running/error status, or the tool counts. The tests
-    // below pin the behavior the implementation must deliver.
-    let servers = ClientMcpConfig::load(path)
+fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> ViewEvent {
+    let cfg = ClientMcpConfig::load(path);
+    let counts = host.map(|h| h.tool_counts());
+    let servers = cfg
         .resolved_servers(surface)
         .into_iter()
-        .map(|s| ClientServerDto {
-            name: s.name.clone(),
-            transport: String::new(),
-            status: String::new(),
-            tool_count: 0,
-            namespace: None,
+        .map(|s| {
+            let namespace_key = s.namespace.clone().unwrap_or_else(|| s.name.clone());
+            let transport = if s.http.is_some() { "http" } else { "stdio" };
+            // With a running host, a resolved server the host is serving reports
+            // its live tool count; one the host never started is absent from the
+            // tally and is surfaced as an error rather than a silent zero.
+            let (status, tool_count) = match &counts {
+                None => ("enabled", 0),
+                Some(counts) => match counts.get(&namespace_key) {
+                    // Saturate rather than wrap: a count that cannot fit is absurd.
+                    Some(&n) => ("running", u32::try_from(n).unwrap_or(u32::MAX)),
+                    None => ("error", 0),
+                },
+            };
+            ClientServerDto {
+                name: s.name.clone(),
+                transport: transport.to_string(),
+                status: status.to_string(),
+                tool_count,
+                namespace: s.namespace.clone(),
+            }
         })
         .collect();
     ViewEvent::McpClientServers {
