@@ -225,6 +225,26 @@ void adele_core_set_mcp_surface(Core *core, const char *surface);
 void adele_core_request_mcp_builtins(Core *core);
 
 /*
+ Ask for this client's external client-run MCP servers — the `client-mcp.toml`
+ servers the surface declared via [`adele_core_set_mcp_surface`] hosts on the
+ edge — and their status. The answer arrives as an `mcp_client_servers` view
+ event carrying, per server: `name`, `transport` (`stdio`/`http`), `status`,
+ `tool_count`, and `namespace` (or null).
+
+ The sibling of [`adele_core_request_mcp_builtins`], and like it answerable with
+ **no connection**: which external servers this surface hosts is a property of
+ `client-mcp.toml`, so a settings panel can call this before the first connect.
+ The server list is complete offline (each row reports `enabled` with a `0`
+ tool count); the live tool counts and running/error status fill in once a
+ connection has started the client MCP host. A surface that enables no external
+ servers answers with an empty list — the honest "none configured".
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`].
+ */
+void adele_core_request_mcp_client_servers(Core *core);
+
+/*
  Turn one built-in MCP server off (`disabled = true`) or back on for **this
  client's surface**, by writing `[surfaces.<surface>].disabled_builtins` in the
  shared `client-mcp.toml`.

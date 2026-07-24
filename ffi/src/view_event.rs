@@ -113,6 +113,36 @@ pub struct BuiltinServerDto {
     pub disabled_by_config: bool,
 }
 
+/// One external client-run MCP server's panel status.
+///
+/// Mirrors `client-ui-common`'s `ClientServerDto` — the shape the shared
+/// MCP-servers view-model merges — for a server this client runs on the edge (an
+/// external subprocess over stdio, or a remote endpoint over HTTP, configured in
+/// `client-mcp.toml`), as opposed to a compiled-in [`BuiltinServerDto`].
+///
+/// The server list is derived from the config alone, so the panel can render it
+/// with no connection; the live [`tool_count`](Self::tool_count) and the
+/// running/error [`status`](Self::status) fill in only once a connection has
+/// started the client MCP host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientServerDto {
+    /// Server name as shown in the panel — also the key a same-name built-in it
+    /// overrides.
+    pub name: String,
+    /// Transport: `"stdio"` (spawns a command) or `"http"` (reaches an endpoint).
+    pub transport: String,
+    /// Display status: `"enabled"` when configured but no host is running yet,
+    /// `"running"` once a host serves it, `"error"` when a running host failed to
+    /// start it.
+    pub status: String,
+    /// Tools the server currently exposes; `0` until a host is running.
+    pub tool_count: u32,
+    /// The server's tool namespace (`cfg.namespace`), or `None` when it declares
+    /// none — the client then falls back to the name, which is also the key the
+    /// host tallies tool counts under.
+    pub namespace: Option<String>,
+}
+
 /// The [`ViewEvent`] a daemon signal produces *directly*, bypassing the
 /// reducer, or `None` when the reducer already covers it.
 ///
@@ -339,6 +369,20 @@ pub enum ViewEvent {
     McpBuiltins {
         surface: String,
         servers: Vec<BuiltinServerDto>,
+    },
+    /// This client's external client-run MCP servers — the `client-mcp.toml`
+    /// servers this `surface` hosts on the edge — and their live status. The
+    /// reply to `adele_core_request_mcp_client_servers`.
+    ///
+    /// Executor-emitted (no `Effect` carries it), the sibling of [`McpBuiltins`]:
+    /// the server list comes from the config so it is answerable with no
+    /// connection, and each row's `tool_count` plus its running/error status fill
+    /// in from the live MCP host once a connection has started one. `surface`
+    /// echoes which section was resolved. `servers` is empty when the surface
+    /// enables no external servers — the honest answer, not a missing one.
+    McpClientServers {
+        surface: String,
+        servers: Vec<ClientServerDto>,
     },
 }
 
@@ -691,6 +735,64 @@ mod tests {
         assert_eq!(
             ev.to_json().expect("serializes"),
             r#"{"type":"mcp_builtins","surface":"kde","servers":[]}"#
+        );
+    }
+
+    // --- mcp_client_servers (the external client-run read path) ----------------
+
+    fn client_dto(
+        name: &str,
+        transport: &str,
+        status: &str,
+        namespace: Option<&str>,
+    ) -> ClientServerDto {
+        ClientServerDto {
+            name: name.to_string(),
+            transport: transport.to_string(),
+            status: status.to_string(),
+            tool_count: 4,
+            namespace: namespace.map(str::to_string),
+        }
+    }
+
+    /// The wire shape every client decodes. Pinned literally: the field names ARE
+    /// the ABI, and a rename would silently blank the panel rather than fail.
+    #[test]
+    fn mcp_client_servers_event_carries_the_surface_and_every_row_field() {
+        let ev = ViewEvent::McpClientServers {
+            surface: "mac".to_string(),
+            servers: vec![client_dto("browser", "stdio", "running", Some("web"))],
+        };
+        assert_eq!(
+            ev.to_json().expect("serializes"),
+            r#"{"type":"mcp_client_servers","surface":"mac","servers":[{"name":"browser","transport":"stdio","status":"running","tool_count":4,"namespace":"web"}]}"#
+        );
+    }
+
+    /// A server with no configured namespace travels with an explicit null, so a
+    /// client can fall back to the name deterministically rather than guess.
+    #[test]
+    fn mcp_client_servers_event_carries_a_null_namespace() {
+        let ev = ViewEvent::McpClientServers {
+            surface: "mac".to_string(),
+            servers: vec![client_dto("git", "http", "enabled", None)],
+        };
+        let json = ev.to_json().expect("serializes");
+        assert!(json.contains(r#""namespace":null"#), "{json}");
+        assert!(json.contains(r#""transport":"http""#), "{json}");
+    }
+
+    /// A surface that hosts no external servers still answers — with an empty
+    /// list — so the panel can tell "none configured" from "never asked".
+    #[test]
+    fn mcp_client_servers_event_answers_empty_rather_than_silently() {
+        let ev = ViewEvent::McpClientServers {
+            surface: "kde".to_string(),
+            servers: Vec::new(),
+        };
+        assert_eq!(
+            ev.to_json().expect("serializes"),
+            r#"{"type":"mcp_client_servers","surface":"kde","servers":[]}"#
         );
     }
 }
