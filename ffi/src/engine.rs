@@ -39,7 +39,7 @@ use desktop_assistant_client_common::{
 };
 use tokio::sync::mpsc;
 
-use crate::view_event::{ViewEvent, view_event_for_signal};
+use crate::view_event::{ClientServerDto, ViewEvent, view_event_for_signal};
 
 /// The `client-mcp.toml` surface a core resolves MCP servers (and
 /// `disabled_builtins`) under when the client never declares one.
@@ -180,6 +180,13 @@ pub enum Intent {
     /// [`ViewEvent::McpBuiltins`]. Answerable with no connection: built-ins are a
     /// property of how this cdylib was built plus what `client-mcp.toml` says.
     RequestMcpBuiltins,
+    /// Ask for this client's external client-run MCP servers (the
+    /// `client-mcp.toml` servers the declared surface hosts on the edge) and
+    /// their live status, delivered as a [`ViewEvent::McpClientServers`]. The
+    /// sibling of [`RequestMcpBuiltins`]: answerable with no connection (the
+    /// server list is a property of what `client-mcp.toml` says), with the live
+    /// tool counts filling in once a connection has started the MCP host.
+    RequestMcpClientServers,
     /// Turn one built-in on or off **for this client's surface**, by writing
     /// `[surfaces.<surface>].disabled_builtins` in the shared `client-mcp.toml`.
     ///
@@ -305,6 +312,67 @@ fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> 
     };
     crate::builtins::apply_disabled_overlay(&mut servers, disabled);
     ViewEvent::McpBuiltins {
+        surface: surface.to_string(),
+        servers,
+    }
+}
+
+/// Build the `mcp_client_servers` view event for `surface`, reading the client
+/// MCP config at `path`.
+///
+/// The sibling of [`mcp_builtins_event_at`], same "config + optional host"
+/// shape. The server list is the surface's *external* set —
+/// [`ClientMcpConfig::resolved_servers`], which already filters to the servers
+/// this surface enables and that are themselves enabled — so the panel lists
+/// them before the first connect. Each row's transport is read straight from the
+/// definition (`http` when an HTTP endpoint is configured, else `stdio`).
+///
+/// The status and tool count depend on whether a host is running:
+///
+/// - **No host** (`host` is `None`): every resolved server reports `enabled`
+///   (configured and switched on, not yet started) with a `0` tool count.
+/// - **Host running**: a server whose namespace the host tallies is `running`
+///   with its live tool count; a resolved server the host did NOT start — it
+///   failed to launch or list its tools — is absent from the tally and reports
+///   `error`.
+///
+/// The tool-count key is the server's namespace (`cfg.namespace`, or its name
+/// when unset), matching [`McpHost::tool_counts`]'s key exactly.
+///
+/// Takes the path explicitly so the on-disk behavior is testable without
+/// touching the developer's real `~/.config/adele/client-mcp.toml`.
+///
+/// [`McpHost::tool_counts`]: desktop_assistant_client_common::mcp_host::McpHost::tool_counts
+fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> ViewEvent {
+    let cfg = ClientMcpConfig::load(path);
+    let counts = host.map(|h| h.tool_counts());
+    let servers = cfg
+        .resolved_servers(surface)
+        .into_iter()
+        .map(|s| {
+            let namespace_key = s.namespace.clone().unwrap_or_else(|| s.name.clone());
+            let transport = if s.http.is_some() { "http" } else { "stdio" };
+            // With a running host, a resolved server the host is serving reports
+            // its live tool count; one the host never started is absent from the
+            // tally and is surfaced as an error rather than a silent zero.
+            let (status, tool_count) = match &counts {
+                None => ("enabled", 0),
+                Some(counts) => match counts.get(&namespace_key) {
+                    // Saturate rather than wrap: a count that cannot fit is absurd.
+                    Some(&n) => ("running", u32::try_from(n).unwrap_or(u32::MAX)),
+                    None => ("error", 0),
+                },
+            };
+            ClientServerDto {
+                name: s.name.clone(),
+                transport: transport.to_string(),
+                status: status.to_string(),
+                tool_count,
+                namespace: s.namespace.clone(),
+            }
+        })
+        .collect();
+    ViewEvent::McpClientServers {
         surface: surface.to_string(),
         servers,
     }
@@ -506,6 +574,7 @@ impl Engine {
             Intent::SetMcpSurface(surface) if !surface.is_empty() => self.mcp_surface = surface,
             Intent::SetMcpSurface(_) => {}
             Intent::RequestMcpBuiltins => self.spawn_emit_mcp_builtins(),
+            Intent::RequestMcpClientServers => self.spawn_emit_mcp_client_servers(),
             Intent::SetMcpBuiltinDisabled { name, disabled } => {
                 self.spawn_set_mcp_builtin_disabled(name, disabled)
             }
@@ -526,6 +595,25 @@ impl Engine {
         let host = self.mcp_host.clone();
         tokio::spawn(async move {
             sink.emit(&mcp_builtins_event_at(
+                &default_client_mcp_path(),
+                host.as_deref(),
+                &surface,
+            ));
+        });
+    }
+
+    /// Answer [`Intent::RequestMcpClientServers`] with the current external
+    /// client-run inventory.
+    ///
+    /// Off the actor loop because it reads `client-mcp.toml` from disk (and, when
+    /// a host is running, tallies its live tool counts). The sibling of
+    /// [`spawn_emit_mcp_builtins`](Self::spawn_emit_mcp_builtins).
+    fn spawn_emit_mcp_client_servers(&self) {
+        let sink = self.sink;
+        let surface = self.mcp_surface.clone();
+        let host = self.mcp_host.clone();
+        tokio::spawn(async move {
+            sink.emit(&mcp_client_servers_event_at(
                 &default_client_mcp_path(),
                 host.as_deref(),
                 &surface,
@@ -1799,5 +1887,238 @@ enabled = []
         let (_dir, path) = temp_config(None);
         write_builtin_disabled(&path, "mac", "", true).expect_err("an empty name is rejected");
         assert!(!path.exists(), "nothing should have been written");
+    }
+}
+
+#[cfg(test)]
+mod mcp_client_server_tests {
+    //! Cover the external client-run MCP inventory read path the panel drives
+    //! (adele-mac#3): projecting the surface's `client-mcp.toml` servers into a
+    //! `mcp_client_servers` view event — the sibling of the built-in read path.
+    //!
+    //! Unlike built-ins, this population comes purely from config plus the live
+    //! host, so it is feature-independent (no `mcp-*` gating): the tests configure
+    //! external servers in TOML directly. The path is taken explicitly so the
+    //! on-disk behavior is testable without touching the developer's real
+    //! `~/.config/adele/client-mcp.toml`.
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A minimal `/bin/sh` fake MCP server (one `echo` tool): answers
+    /// `initialize`, lists a single tool, and replies to `tools/call`. Enough for
+    /// a real [`McpHost`] to start it and tally one tool.
+    const FAKE_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf %s "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"f","version":"0"}}}\n' "$id" ;;
+    *'"method":"notifications/initialized"'*) : ;;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    fn temp_config(contents: Option<&str>) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("client-mcp.toml");
+        if let Some(contents) = contents {
+            std::fs::write(&path, contents).expect("seed the config");
+        }
+        (dir, path)
+    }
+
+    fn servers_of(ev: &ViewEvent) -> &[ClientServerDto] {
+        match ev {
+            ViewEvent::McpClientServers { servers, .. } => servers,
+            other => panic!("expected an mcp_client_servers event, got {other:?}"),
+        }
+    }
+
+    fn surface_of(ev: &ViewEvent) -> &str {
+        match ev {
+            ViewEvent::McpClientServers { surface, .. } => surface,
+            other => panic!("expected an mcp_client_servers event, got {other:?}"),
+        }
+    }
+
+    /// The event names the surface it resolved under, so a client can verify it
+    /// is reading its own section rather than another client's.
+    #[test]
+    fn client_servers_event_reports_the_surface_it_resolved() {
+        let (_dir, path) = temp_config(None);
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        assert_eq!(surface_of(&ev), "mac");
+    }
+
+    /// A missing `client-mcp.toml`, or a surface that enables no external
+    /// servers, answers with an empty list rather than erroring or hanging.
+    #[test]
+    fn client_servers_event_is_empty_with_no_config() {
+        let (_dir, path) = temp_config(None);
+        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+    }
+
+    /// The default core → empty client list (the acceptance spec's baseline): no
+    /// external servers configured means no client rows, on any build.
+    #[test]
+    fn client_servers_event_lists_configured_servers_offline() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "browser"
+command = "/usr/bin/browser-mcp"
+namespace = "web"
+
+[[servers]]
+name = "remote"
+namespace = "rem"
+[servers.http]
+url = "https://example.test/mcp"
+
+[surfaces.mac]
+enabled = ["browser", "remote"]
+"#,
+        ));
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let servers = servers_of(&ev);
+        assert_eq!(servers.len(), 2);
+
+        let browser = servers
+            .iter()
+            .find(|s| s.name == "browser")
+            .expect("browser resolved for this surface");
+        // Offline: listed as enabled, no live tools yet, stdio transport.
+        assert_eq!(browser.status, "enabled");
+        assert_eq!(browser.tool_count, 0);
+        assert_eq!(browser.transport, "stdio");
+        assert_eq!(browser.namespace.as_deref(), Some("web"));
+
+        let remote = servers
+            .iter()
+            .find(|s| s.name == "remote")
+            .expect("remote resolved for this surface");
+        // An HTTP endpoint reports the http transport honestly, never a guess.
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.status, "enabled");
+        assert_eq!(remote.namespace.as_deref(), Some("rem"));
+    }
+
+    /// A server this surface does NOT enable is another surface's concern and
+    /// must not appear in this client's list.
+    #[test]
+    fn client_servers_event_respects_the_surface_selection() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "browser"
+command = "/usr/bin/browser-mcp"
+
+[surfaces.kde]
+enabled = ["browser"]
+
+[surfaces.mac]
+enabled = []
+"#,
+        ));
+        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+    }
+
+    /// A defined-but-disabled server hosts nothing, so it is excluded exactly as
+    /// `resolved_servers` excludes it — the list is the *hosted* set, not the
+    /// defined set.
+    #[test]
+    fn client_servers_event_excludes_a_disabled_definition() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "browser"
+command = "/usr/bin/browser-mcp"
+enabled = false
+
+[surfaces.mac]
+enabled = ["browser"]
+"#,
+        ));
+        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+    }
+
+    /// A missing namespace travels as `None` so the client can fall back to the
+    /// name itself — the same key the host tallies counts under.
+    #[test]
+    fn client_servers_event_carries_no_namespace_when_unset() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "browser"
+command = "/usr/bin/browser-mcp"
+
+[surfaces.mac]
+enabled = ["browser"]
+"#,
+        ));
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let browser = &servers_of(&ev)[0];
+        assert!(browser.namespace.is_none());
+    }
+
+    /// A running host fills in the live tool count and flips the status to
+    /// `running`; a resolved server the host could not start reports `error`
+    /// rather than a silent zero. Both are exercised in one host so the join is
+    /// covered end to end.
+    #[tokio::test]
+    async fn client_servers_event_reflects_a_running_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.sh");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+        let cfg_path = dir.path().join("client-mcp.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[[servers]]
+name = "good"
+command = "/bin/sh"
+args = ["{}"]
+namespace = "ns"
+
+[[servers]]
+name = "broken"
+command = "/nonexistent/definitely-not-a-real-binary"
+namespace = "broke"
+
+[surfaces.mac]
+enabled = ["good", "broken"]
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+
+        let servers: Vec<_> = ClientMcpConfig::load(&cfg_path)
+            .resolved_servers("mac")
+            .into_iter()
+            .cloned()
+            .collect();
+        let host = McpHost::start(&servers).await;
+
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let rows = servers_of(&ev);
+
+        let good = rows.iter().find(|s| s.name == "good").expect("good listed");
+        assert_eq!(good.status, "running", "a hosted server is running");
+        assert_eq!(good.tool_count, 1, "its one echo tool is counted live");
+
+        let broken = rows
+            .iter()
+            .find(|s| s.name == "broken")
+            .expect("broken listed");
+        assert_eq!(
+            broken.status, "error",
+            "a resolved server the host did not start is an error, not a silent zero"
+        );
+        assert_eq!(broken.tool_count, 0);
+
+        host.shutdown().await;
     }
 }
