@@ -531,6 +531,7 @@ dependencies = [
 name = "client-ui-ffi"
 version = "0.1.0"
 dependencies = [
+ "adele-markdown",
  "cbindgen",
  "client-ui-common",
  "desktop-assistant-api-model",

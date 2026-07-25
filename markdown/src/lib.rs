@@ -21,8 +21,11 @@
 //! must stay `wasm32`-clean, and the HTML parser this pulls in is native-only
 //! territory. Consumers depend on this crate directly.
 
+use pulldown_cmark::{Options, Parser, html};
+
 pub mod bubble;
 pub mod chat_page;
+mod csp;
 
 /// Convert markdown text to HTML and sanitize the result.
 ///
@@ -42,6 +45,15 @@ pub mod chat_page;
 ///
 /// Combined with the SHA-256-pinned CSP `script-src` in the page templates,
 /// this gives two independent layers against hostile assistant output.
-pub fn markdown_to_html(_input: &str) -> String {
-    todo!("lift from gtk-client::markdown")
+pub fn markdown_to_html(input: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(input, options);
+    let mut raw = String::new();
+    html::push_html(&mut raw, parser);
+
+    ammonia::clean(&raw)
 }
