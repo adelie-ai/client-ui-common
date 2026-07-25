@@ -15,6 +15,7 @@ fn main() {
     // Re-run when the ABI surface or the cbindgen config changes.
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/engine.rs");
+    println!("cargo:rerun-if-changed=src/markdown.rs");
     println!("cargo:rerun-if-changed=src/view_event.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 

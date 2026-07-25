@@ -47,13 +47,36 @@ fn render_markdown_returns_a_sanitized_html_fragment() {
 fn render_markdown_neutralizes_hostile_input() {
     let html = render(
         adele_core_render_markdown,
-        "<script>alert(1)</script>ok <img src=x onerror=alert(2)> [q](javascript:alert(3))",
+        "<script>alert(1)</script>ok <img src=x onerror=alert(2)>\n\n[q](javascript:alert(3))",
     );
     let lower = html.to_ascii_lowercase();
-    for bad in ["<script", "onerror", "javascript:", "alert("] {
+    for bad in [
+        "<script",
+        "onerror",
+        "alert(1)",
+        "alert(2)",
+        "href=\"javascript:",
+    ] {
         assert!(!lower.contains(bad), "{bad} survived: {html}");
     }
     assert!(html.contains("ok"), "{html}");
+}
+
+#[test]
+fn render_markdown_strips_the_href_from_a_javascript_link() {
+    // What "neutralized" means for a link: the anchor may survive as inert
+    // markup, but it must carry no `href` at all — there is nothing to
+    // navigate to, so nothing to execute. Asserting "the substring
+    // `javascript:` never appears anywhere" would be asserting the wrong
+    // thing: an unparsed link (one sharing a line with a raw-HTML *block*)
+    // comes out as escaped literal text, which is inert by construction.
+    let html = render(
+        adele_core_render_markdown,
+        "<b>x</b> [q](javascript:alert(3))",
+    );
+    assert!(html.contains("<a "), "the anchor itself may remain: {html}");
+    assert!(!html.contains("href"), "but with no href: {html}");
+    assert!(html.contains(">q</a>"), "link text survives: {html}");
 }
 
 #[test]

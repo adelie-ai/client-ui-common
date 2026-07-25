@@ -278,6 +278,69 @@ void adele_core_set_mcp_builtin_disabled(Core *core, const char *name, bool disa
  */
 void adele_core_send_command(Core *core, const char *request_id, const char *command_json);
 
+/*
+ Render untrusted markdown into a **sanitized HTML fragment**.
+
+ This is what a host streams into an already-loaded page (via the page's
+ update function — see [`adele_core_markdown_set_content_function`]) so a
+ growing reply never reloads the document.
+
+ Returns a caller-owned string to release with [`adele_core_string_free`];
+ null input renders as the empty string. Never returns null.
+
+ # Safety
+ `text` must be null or point to a valid NUL-terminated C string that stays
+ valid for the duration of the call.
+ */
+char *adele_core_render_markdown(const char *text);
+
+/*
+ Render untrusted markdown into a **complete, CSP-locked page** for a single
+ message bubble: transparent background, system-appearance aware, no network,
+ self-reporting height, and an in-place update hook.
+
+ This is what a host loads once per message (with a null base URL); subsequent
+ updates go through [`adele_core_render_markdown`] plus the page's update
+ function, which keeps the pinned script hash — and therefore the page —
+ unchanged.
+
+ Returns a caller-owned string to release with [`adele_core_string_free`];
+ null input renders an empty bubble. Never returns null.
+
+ # Safety
+ `text` must be null or point to a valid NUL-terminated C string that stays
+ valid for the duration of the call.
+ */
+char *adele_core_render_markdown_document(const char *text);
+
+/*
+ Name of the script-message handler the bubble page posts its pixel height
+ to. The host must register a handler under exactly this name; an embedded
+ engine does not self-size inside a native stack view.
+
+ Returns a `'static` pointer — do not free it.
+ */
+const char *adele_core_markdown_height_handler_name(void);
+
+/*
+ Name of the global function the host calls (through host-side script
+ evaluation) to swap a new render into an already-loaded bubble page.
+
+ Returns a `'static` pointer — do not free it.
+ */
+const char *adele_core_markdown_set_content_function(void);
+
+/*
+ Free a string returned by [`adele_core_render_markdown`] or
+ [`adele_core_render_markdown_document`]. Null is a no-op.
+
+ # Safety
+ `text` must be null, or a pointer returned by one of those two functions and
+ not yet freed. Do not pass the `'static` pointers from the bridge-name
+ accessors.
+ */
+void adele_core_string_free(char *text);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
