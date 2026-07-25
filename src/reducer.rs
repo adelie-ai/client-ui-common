@@ -563,6 +563,9 @@ impl WindowState {
                 content: prompt.clone(),
                 kind: MessageKind::Normal,
                 idempotency_key: idempotency_key.clone(),
+                // No server id (see above), so there is no UUIDv7 to recover a
+                // time from: `None` rather than a fabricated local clock reading.
+                created_at_ms: None,
             });
         }
         // NB: does NOT clear the saved composer draft. A *direct* send consumes
@@ -1561,6 +1564,9 @@ impl WindowState {
                             // An externally-initiated turn (voice / another
                             // client): not our optimistic send, so no key (#570).
                             idempotency_key: None,
+                            // No server id (see above), so there is no UUIDv7 to recover a
+                            // time from: `None` rather than a fabricated local clock reading.
+                            created_at_ms: None,
                         });
                     }
                     return vec![Effect::AddUserMessage(content)];
@@ -1697,6 +1703,9 @@ impl WindowState {
                         kind: MessageKind::Normal,
                         // Assistant replies never carry a send idempotency key.
                         idempotency_key: None,
+                        // No server id (see above), so there is no UUIDv7 to recover a
+                        // time from: `None` rather than a fabricated local clock reading.
+                        created_at_ms: None,
                     });
                 }
                 let mut effects = vec![Effect::ClearChatStatus];
@@ -2082,6 +2091,9 @@ impl WindowState {
                             content: full.clone(),
                             kind: MessageKind::Normal,
                             idempotency_key: None,
+                            // No server id (see above), so there is no UUIDv7 to recover a
+                            // time from: `None` rather than a fabricated local clock reading.
+                            created_at_ms: None,
                         });
                     }
                     effects.push(Effect::CompleteStreaming(full));
@@ -2226,6 +2238,9 @@ mod tests {
             content: content.to_string(),
             kind: MessageKind::Normal,
             idempotency_key: None,
+            // No server id (see above), so there is no UUIDv7 to recover a
+            // time from: `None` rather than a fabricated local clock reading.
+            created_at_ms: None,
         }
     }
 
@@ -2257,6 +2272,7 @@ mod tests {
                 context_limit: None,
                 capabilities: api::ModelCapabilitiesView::default(),
             },
+            notices: Vec::new(),
         }
     }
 
@@ -2386,6 +2402,9 @@ mod tests {
                 content: "hello".to_string(),
                 kind: MessageKind::Normal,
                 idempotency_key: Some("K".to_string()),
+                // No server id (see above), so there is no UUIDv7 to recover a
+                // time from: `None` rather than a fabricated local clock reading.
+                created_at_ms: None,
             }],
         ));
         let echo = state.apply(UiMessage::UserMessageAdded {
@@ -2431,6 +2450,9 @@ mod tests {
                 content: "hello".to_string(),
                 kind: MessageKind::Normal,
                 idempotency_key: None,
+                // No server id (see above), so there is no UUIDv7 to recover a
+                // time from: `None` rather than a fabricated local clock reading.
+                created_at_ms: None,
             }],
         ));
         let echo = state.apply(UiMessage::UserMessageAdded {
