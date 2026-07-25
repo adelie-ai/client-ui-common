@@ -88,10 +88,31 @@ fn renders_strikethrough() {
 }
 
 #[test]
-fn renders_task_lists() {
+fn renders_task_lists_with_a_visible_checked_state() {
+    // `pulldown_cmark` renders a task-list marker as `<input type="checkbox">`,
+    // which the sanitizer drops — an input is a form control, not text. Dropping
+    // it silently is a data loss, not a style choice: a done item and a pending
+    // one come out as identical bullets, which is the entire content of a task
+    // list. So the marker is emitted as a text glyph instead, before
+    // sanitization, and survives it.
     let html = markdown_to_html("- [ ] todo\n- [x] done");
     assert!(html.contains("<ul>"), "{html}");
     assert!(html.contains("todo") && html.contains("done"), "{html}");
+    assert!(html.contains('\u{2610}'), "unchecked marker renders: {html}");
+    assert!(html.contains('\u{2611}'), "checked marker renders: {html}");
+    assert!(
+        !html.to_ascii_lowercase().contains("<input"),
+        "and it is still not a form control: {html}"
+    );
+}
+
+#[test]
+fn a_task_marker_glyph_in_ordinary_text_is_not_confused_for_a_marker() {
+    // The glyphs carry no meaning of their own — they are only ever emitted for
+    // a real task-list marker, so text that happens to contain one is untouched.
+    let html = markdown_to_html("just a \u{2611} in prose");
+    assert!(html.contains("just a \u{2611} in prose"), "{html}");
+    assert!(!html.contains("<ul>"), "{html}");
 }
 
 #[test]
