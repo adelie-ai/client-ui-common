@@ -98,7 +98,10 @@ fn renders_task_lists_with_a_visible_checked_state() {
     let html = markdown_to_html("- [ ] todo\n- [x] done");
     assert!(html.contains("<ul>"), "{html}");
     assert!(html.contains("todo") && html.contains("done"), "{html}");
-    assert!(html.contains('\u{2610}'), "unchecked marker renders: {html}");
+    assert!(
+        html.contains('\u{2610}'),
+        "unchecked marker renders: {html}"
+    );
     assert!(html.contains('\u{2611}'), "checked marker renders: {html}");
     assert!(
         !html.to_ascii_lowercase().contains("<input"),

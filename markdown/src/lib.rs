@@ -21,7 +21,7 @@
 //! must stay `wasm32`-clean, and the HTML parser this pulls in is native-only
 //! territory. Consumers depend on this crate directly.
 
-use pulldown_cmark::{Options, Parser, html};
+use pulldown_cmark::{Event, Options, Parser, html};
 
 pub mod bubble;
 pub mod chat_page;
@@ -51,9 +51,32 @@ pub fn markdown_to_html(input: &str) -> String {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
 
-    let parser = Parser::new_ext(input, options);
+    let parser = Parser::new_ext(input, options).map(task_marker_as_text);
     let mut raw = String::new();
     html::push_html(&mut raw, parser);
 
     ammonia::clean(&raw)
+}
+
+/// Ballot-box glyphs for a task-list item's state.
+///
+/// `pulldown_cmark` renders a task marker as `<input type="checkbox">`, which
+/// the sanitizer removes — correctly, since an input is a form control, not
+/// text, and admitting form controls to keep it would widen the allowlist for
+/// every reply. But dropping it loses the one thing a task list says: a done
+/// item and a pending one become identical bullets.
+///
+/// Emitting the state as *text* before sanitization keeps the meaning and needs
+/// no allowlist change. The glyphs are ordinary characters, so a reply that
+/// merely contains one is unaffected — they only appear here for a real marker.
+const UNCHECKED_MARKER: &str = "\u{2610} "; // ☐
+const CHECKED_MARKER: &str = "\u{2611} "; // ☑
+
+/// Replace a task-list marker event with its text equivalent.
+fn task_marker_as_text(event: Event<'_>) -> Event<'_> {
+    match event {
+        Event::TaskListMarker(true) => Event::Text(CHECKED_MARKER.into()),
+        Event::TaskListMarker(false) => Event::Text(UNCHECKED_MARKER.into()),
+        other => other,
+    }
 }
