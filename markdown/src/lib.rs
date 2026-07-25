@@ -1,0 +1,47 @@
+//! Shared markdown → sanitized-HTML pipeline for Adelie's webview chat clients.
+//!
+//! Assistant replies are **untrusted input**. The reducer deliberately ships raw
+//! Markdown and treats presentation as the client's job, so every client that
+//! renders that text in an HTML engine (WebKitGTK on Linux, `WKWebView` on
+//! macOS) is one careless `innerHTML` away from arbitrary script execution in a
+//! window that also talks to the daemon.
+//!
+//! This crate owns the two independent layers that close that hole, so there is
+//! exactly one security-reviewed copy rather than one per client:
+//!
+//! 1. [`markdown_to_html`] renders Markdown and then **sanitizes the rendered
+//!    HTML** with [`ammonia`], stripping `<script>`, event handlers, and unsafe
+//!    URL schemes while keeping the text around them.
+//! 2. The page templates ([`chat_page::html_template`], [`bubble::document`])
+//!    serve their inline script under a **SHA-256-pinned CSP `script-src`**, so
+//!    the engine refuses to execute anything else — including markup that
+//!    somehow survived layer 1.
+//!
+//! Why the crate is separate from the `client-ui-common` reducer: the reducer
+//! must stay `wasm32`-clean, and the HTML parser this pulls in is native-only
+//! territory. Consumers depend on this crate directly.
+
+pub mod bubble;
+pub mod chat_page;
+
+/// Convert markdown text to HTML and sanitize the result.
+///
+/// Two reasons to sanitize after `pulldown_cmark` rather than before:
+///
+/// 1. Raw HTML embedded in markdown (`<script>...</script>`, `<img onerror=...>`,
+///    `<a href="javascript:...">`) is emitted verbatim by `pulldown_cmark`'s
+///    HTML renderer. Stripping `Event::Html` / `Event::InlineHtml` works for
+///    block-form attacks but loses adjacent legitimate text when the attacker
+///    puts both on one line (e.g. `<script>x</script>hello` — pulldown-cmark
+///    treats the entire run as a single HTML block). [`ammonia`] parses the
+///    rendered HTML and strips dangerous constructs while preserving text.
+/// 2. `ammonia`'s default builder whitelists the exact tags markdown produces
+///    (headings, lists, code, links with safe URL schemes, etc.) and removes
+///    event handlers, `<script>`, `<style>`, `<iframe>`, `<form>`, and any
+///    `href` / `src` whose scheme isn't in the safe allowlist.
+///
+/// Combined with the SHA-256-pinned CSP `script-src` in the page templates,
+/// this gives two independent layers against hostile assistant output.
+pub fn markdown_to_html(_input: &str) -> String {
+    todo!("lift from gtk-client::markdown")
+}

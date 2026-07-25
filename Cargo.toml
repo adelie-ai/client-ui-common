@@ -3,7 +3,13 @@
 # The reducer stays transport-free and wasm-clean (built with `-p
 # client-ui-common --target wasm32`); the `ffi` member is native-only (it pulls
 # the `client-common` transport + tokio) and is what `adele-kde` links against.
-members = ["ffi"]
+#
+# `markdown` is the shared markdown -> sanitized-HTML pipeline + CSP-pinned page
+# templates the webview-based clients (adele-gtk, adele-mac) render assistant
+# replies through. It is deliberately a SEPARATE member rather than part of the
+# reducer: it pulls an HTML parser (`ammonia`/`html5ever`), which has no place in
+# the wasm-clean root package.
+members = ["ffi", "markdown"]
 resolver = "2"
 
 [package]
