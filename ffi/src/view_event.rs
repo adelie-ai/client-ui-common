@@ -562,6 +562,7 @@ mod tests {
             content: "hello".into(),
             kind: api::client::MessageKind::Spoken,
             idempotency_key: None,
+            created_at_ms: None,
         });
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains(r#""kind":"spoken""#), "{json}");
@@ -640,6 +641,7 @@ mod tests {
             content: "hi".into(),
             kind: api::client::MessageKind::Normal,
             idempotency_key: None,
+            created_at_ms: None,
         });
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains(r#""kind":"normal""#), "{json}");
