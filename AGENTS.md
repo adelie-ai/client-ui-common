@@ -1,15 +1,22 @@
 # Agent Instructions - client-ui-common
 
-`client-ui-common` is the shared client core for Adele's UIs, a Cargo workspace with two
-members that must not blur together:
+`client-ui-common` is the shared client core for Adele's UIs, a Cargo workspace of three
+packages that must not blur together:
 
 - The root package (`client-ui-common`) is a **pure, transport-free reducer** that stays
   **wasm-clean**: it consumes only wasm-compatible types (desktop-assistant's `api-model`,
   voice's `adele-voice-client-common` with the native chunker off) and expresses RPCs as
   `Effect`s the host runs, so it builds with `--target wasm32`. Never pull a transport crate
   or tokio into this package.
-- The `ffi` member is the **native-only C-ABI** wrapper (cbindgen-generated header) that adds
-  the transport plus tokio, and is what native clients such as `adele-kde` link against.
+- The `ffi` member (`client-ui-ffi`) is the **native-only C-ABI** wrapper (cbindgen-generated
+  header) that adds the transport plus tokio, and is what native clients such as `adele-kde`
+  and `adele-mac` link against.
+- The `markdown` member (`adele-markdown`) is the **security boundary for untrusted assistant
+  text**: markdown to sanitized HTML, the CSP-pinned page templates the webview clients render
+  replies inside, and the JavaScript-literal encoding for anything a host evaluates as script.
+  It is a separate member because it pulls an HTML parser (`ammonia` / `html5ever`) that has no
+  place in the wasm-clean reducer; consumers depend on it directly rather than through the root
+  package.
 
 Dependency sourcing is via path deps for now and is still being settled (so `api-model` is not
 duplicated in a client's build graph); some work here is blocked by desktop-assistant#387 and
@@ -73,13 +80,24 @@ Apply these consistently. The pre-commit checklist at the bottom is the floor.
 - Don't narrate PR / issue history in code comments. Reference issues only when the comment captures a non-obvious WHY tied to that issue.
 
 ### Pre-commit checklist
+
+`just check` runs all four in order. Run it, or run them by hand:
+
 1. `cargo fmt --check`
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test`
+2. `cargo clippy --workspace --all-targets -- -D warnings`
+3. `cargo test --workspace`
 4. The reducer still builds wasm-clean: `cargo build -p client-ui-common --target wasm32-unknown-unknown`.
+
+`--workspace` on steps 2 and 3 is load-bearing, not decoration. This workspace has a **root
+package** as well as members, and a cargo command with no package selection defaults to the
+root package alone - so without it, clippy and the test run cover the reducer and skip both
+`ffi` and `markdown`, which is to say they skip the C ABI and the sanitizer. Add
+`--workspace` to any other cargo verb you reach for here, for the same reason.
 
 Warnings are enforced mechanically via the `[lints]` table (see the top of this file), so a
 plain `cargo build` / `test` also hard-fails on any warning - there is no soft period.
+
+Run `cargo audit` too whenever `Cargo.lock` changed (`just audit`).
 
 ## Cross-project engineering standards
 
