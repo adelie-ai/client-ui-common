@@ -130,10 +130,19 @@ fn set_content_script_is_exported_as_a_complete_already_escaped_statement() {
         "{script}"
     );
     assert!(script.ends_with(");"), "{script}");
-    assert!(
-        !script.contains("\");alert("),
-        "the reply broke out of the literal: {script}"
-    );
+
+    // The argument is one JSON/JS string literal, so the reply is data: a
+    // trailing `);alert(…)` would leave characters the parser rejects.
+    let inner = script
+        .strip_prefix(&format!(
+            "{}(",
+            adele_markdown::bubble::SET_CONTENT_FUNCTION
+        ))
+        .and_then(|rest| rest.strip_suffix(");"))
+        .unwrap_or_else(|| panic!("not a single call: {script}"));
+    let decoded: String = serde_json::from_str(inner)
+        .unwrap_or_else(|e| panic!("argument {inner:?} is not one string literal: {e}"));
+    assert_eq!(decoded, adele_markdown::markdown_to_html(reply));
     assert!(!script.contains('\n'), "no raw newline: {script}");
 }
 

@@ -6,8 +6,8 @@
 //! macOS) is one careless `innerHTML` away from arbitrary script execution in a
 //! window that also talks to the daemon.
 //!
-//! This crate owns the two independent layers that close that hole, so there is
-//! exactly one security-reviewed copy rather than one per client:
+//! This crate owns the three independent layers that close that hole, so there
+//! is exactly one security-reviewed copy rather than one per client:
 //!
 //! 1. [`markdown_to_html`] renders Markdown and then **sanitizes the rendered
 //!    HTML** with [`ammonia`], stripping `<script>`, event handlers, and unsafe
@@ -16,6 +16,13 @@
 //!    serve their inline script under a **SHA-256-pinned CSP `script-src`**, so
 //!    the engine refuses to execute anything else — including markup that
 //!    somehow survived layer 1.
+//! 3. [`js`] encodes anything a **host** evaluates as script. Host evaluation
+//!    is exempt from the page CSP by design, so layer 2 does not cover it: a
+//!    client that streams a reply in with `evaluateJavaScript` is running
+//!    source it built, and the reply must be a string literal in it rather than
+//!    part of the program. Callers get a whole pre-built statement
+//!    ([`bubble::set_content_script`]) or the encoder, never a bare function
+//!    name and the job of quoting.
 //!
 //! Why the crate is separate from the `client-ui-common` reducer: the reducer
 //! must stay `wasm32`-clean, and the HTML parser this pulls in is native-only
@@ -26,6 +33,7 @@ use pulldown_cmark::{Event, Options, Parser, html};
 pub mod bubble;
 pub mod chat_page;
 mod csp;
+pub mod js;
 
 /// Convert markdown text to HTML and sanitize the result.
 ///

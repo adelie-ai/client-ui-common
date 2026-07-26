@@ -32,7 +32,8 @@ mod view_event;
 // re-exporting keeps it reachable by path for the rlib consumers (the spec).
 pub use markdown::{
     adele_core_markdown_height_handler_name, adele_core_markdown_set_content_function,
-    adele_core_render_markdown, adele_core_render_markdown_document, adele_core_string_free,
+    adele_core_markdown_set_content_script, adele_core_render_markdown,
+    adele_core_render_markdown_document, adele_core_string_free,
 };
 
 use std::ffi::{CStr, c_char, c_void};

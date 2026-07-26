@@ -9,15 +9,17 @@
 //! # Contract with the host
 //!
 //! - Load [`document`] once per message with a `nil` base URL.
-//! - On every subsequent content change, call
-//!   `adeleSetContent(<sanitized html>)` through the host's JS bridge. The
-//!   document's inline script body is byte-identical regardless of content, so
-//!   the pinned CSP hash never changes and the page never has to reload.
+//! - On every subsequent content change, evaluate the string
+//!   [`set_content_script`] returns, **verbatim**. It is a complete statement
+//!   with the reply already rendered, sanitized and encoded as a JavaScript
+//!   string literal. The document's inline script body is byte-identical
+//!   regardless of content, so the pinned CSP hash never changes and the page
+//!   never has to reload.
 //! - Subscribe to the [`HEIGHT_MESSAGE_HANDLER`] script-message handler and use
 //!   the posted number as the view's height — an embedded engine does not
 //!   self-size inside a native stack view.
 //!
-//! # Why the host's `adeleSetContent` call is not a CSP hole
+//! # Why the host evaluates a whole statement instead of building the call
 //!
 //! `script-src` pins one hash and forbids `'unsafe-inline'` / `'unsafe-eval'`,
 //! so nothing *in the page* can introduce script — verified empirically: a
@@ -25,6 +27,14 @@
 //! page script raises `EvalError`. Host-side script evaluation
 //! (`WKWebView.evaluateJavaScript`) is not page script and is exempt, which is
 //! what lets the host stream content in without weakening the policy.
+//!
+//! That exemption cuts both ways. A host that formats
+//! `adeleSetContent("<html>")` itself is *writing a program* around untrusted
+//! text, and an ordinary reply is enough to escape it — a rendered fragment
+//! carries raw double quotes and raw newlines. The result would run outside the
+//! pinned `script-src` with the message handlers in reach, defeating both other
+//! layers. So the escaping lives here, on the shared side of the boundary, and
+//! the host is never handed a fragment plus a function name. See [`crate::js`].
 
 use std::sync::OnceLock;
 
@@ -38,8 +48,14 @@ use crate::markdown_to_html;
 /// bubble stuck at its initial height rather than a JS exception.
 pub const HEIGHT_MESSAGE_HANDLER: &str = "adeleBubble";
 
-/// Name of the global function the host calls to swap the rendered body in
-/// place (via host-side script evaluation) without reloading the document.
+/// Name of the global function that swaps the rendered body in place without
+/// reloading the document.
+///
+/// Exposed for hosts that bind the page themselves — installing their own
+/// wrapper, or asserting the bridge is present. It is **not** the way to push
+/// content: use [`set_content_script`], which returns the whole call with the
+/// reply already escaped. Formatting the call from this name and a rendered
+/// fragment is the injection this module's docs describe.
 pub const SET_CONTENT_FUNCTION: &str = "adeleSetContent";
 
 /// Inline JavaScript body for the bubble document.
@@ -214,9 +230,9 @@ hr { border: none; border-top: 1px solid var(--rule); margin: 0.9em 0; }
 
 del { color: var(--fg-dim); }
 
-/* pulldown-cmark emits task-list checkboxes as <input>, which the sanitizer
-   drops (an input is a form control, not text). The residual list markers stay
-   aligned with plain list items. */
+/* A *loose* list — items separated by blank lines — has each item's content
+   wrapped in a <p>, which would otherwise inherit the full paragraph margin and
+   space the items apart like paragraphs. */
 ul li p { margin: 0.15em 0; }
 </style>
 </head>
@@ -269,4 +285,32 @@ pub fn document(markdown: &str) -> String {
     out.push_str(&body);
     out.push_str(tail);
     out
+}
+
+/// Build the complete JavaScript statement that replaces a loaded bubble's body
+/// with a new render of `markdown` — what a host evaluates on every streaming
+/// update after the initial [`document`] load.
+///
+/// Takes the same untrusted markdown [`document`] does, and returns something
+/// that is already script: the reply is rendered, sanitized, and encoded as a
+/// JavaScript string literal ([`crate::js::string_literal`]). A host evaluates
+/// the returned string verbatim and never sees, or has to quote, the fragment
+/// in between — which is the point. There is no supported path where a host
+/// assembles this call itself.
+///
+/// ```
+/// use adele_markdown::bubble;
+///
+/// // A reply that tries to close the call stays inside the literal: one
+/// // statement, one argument, and no raw newline to end the line early.
+/// let script = bubble::set_content_script(r#"He said "run me");alert(1);//"#);
+/// assert!(script.starts_with("adeleSetContent(\""));
+/// assert!(script.ends_with("\");"));
+/// assert!(!script.contains('\n'));
+/// ```
+pub fn set_content_script(markdown: &str) -> String {
+    format!(
+        "{SET_CONTENT_FUNCTION}({});",
+        crate::js::string_literal(&markdown_to_html(markdown))
+    )
 }

@@ -31,6 +31,27 @@ fn sole_string_argument(statement: &str) -> String {
         .unwrap_or_else(|e| panic!("argument {inner:?} is not one string literal: {e}"))
 }
 
+/// Count the `"` characters that actually delimit a literal — those preceded by
+/// an even number of backslashes. An escaped `\"` is data; an unescaped one
+/// ends the literal, which is the difference the escaping exists to make.
+fn unescaped_quotes(encoded: &str) -> usize {
+    let mut count = 0;
+    let mut backslashes = 0;
+    for c in encoded.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                if backslashes % 2 == 0 {
+                    count += 1;
+                }
+                backslashes = 0;
+            }
+            _ => backslashes = 0,
+        }
+    }
+    count
+}
+
 /// Inputs that classically break out of a JS string literal, plus every C0
 /// control character. Lifted from adele-gtk's `js_safe_string` corpus so the
 /// clients that used to each own an escaper now share one spec.
@@ -88,7 +109,7 @@ fn string_literal_emits_no_character_that_can_end_the_literal_or_the_line() {
         let encoded = js::string_literal(&input);
         // The only unescaped quotes are the literal's own delimiters.
         assert_eq!(
-            encoded.matches('"').count(),
+            unescaped_quotes(&encoded),
             2,
             "stray quote for {input:?}: {encoded:?}"
         );
@@ -163,9 +184,10 @@ fn a_reply_that_closes_the_js_string_literal_cannot_start_a_new_statement() {
     );
 
     let script = bubble::set_content_script(hostile);
-    assert!(
-        !script.contains("\");alert("),
-        "breakout reached the statement: {script}"
+    assert_eq!(
+        unescaped_quotes(&script),
+        2,
+        "the reply closed the literal: {script}"
     );
     assert_eq!(
         sole_string_argument(&script),
@@ -188,7 +210,7 @@ fn set_content_script_emits_no_raw_newline_quote_or_control_character() {
     assert!(!script.contains('\n'), "{script}");
     assert!(!script.contains('\r'), "{script}");
     assert_eq!(
-        script.matches('"').count(),
+        unescaped_quotes(&script),
         2,
         "only the literal's own delimiters: {script}"
     );

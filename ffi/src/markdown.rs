@@ -16,11 +16,11 @@
 //!
 //! # Ownership
 //!
-//! `adele_core_render_markdown` / `adele_core_render_markdown_document` return a
-//! NUL-terminated string allocated by this library. Release it with
-//! [`adele_core_string_free`] — never the caller's `free`, since the allocators
-//! need not match. The bridge-name accessors return `'static` pointers that must
-//! **not** be freed.
+//! `adele_core_render_markdown`, `adele_core_render_markdown_document` and
+//! `adele_core_markdown_set_content_script` return a NUL-terminated string
+//! allocated by this library. Release it with [`adele_core_string_free`] —
+//! never the caller's `free`, since the allocators need not match. The
+//! bridge-name accessors return `'static` pointers that must **not** be freed.
 
 use std::ffi::{CString, c_char};
 use std::sync::OnceLock;
@@ -35,17 +35,19 @@ use crate::cstr_to_string;
 /// NUL. A caller checking only for null would otherwise be handed a truncated
 /// document; an empty bubble is the safer failure.
 fn into_c_string(value: String) -> *mut c_char {
-    CString::new(value)
-        .unwrap_or_default()
-        .into_raw()
-        .cast::<c_char>()
+    CString::new(value).unwrap_or_default().into_raw()
 }
 
-/// Render untrusted markdown into a **sanitized HTML fragment**.
+/// Render untrusted markdown into a **sanitized HTML fragment**, for a host
+/// that splices markup into a page it builds itself.
 ///
-/// This is what a host streams into an already-loaded page (via the page's
-/// update function — see [`adele_core_markdown_set_content_function`]) so a
-/// growing reply never reloads the document.
+/// The fragment is inert markup, not script. Do **not** format it into
+/// JavaScript source — a rendered fragment carries raw double quotes and raw
+/// newlines, so interpolating one into a call ends the string literal and
+/// executes whatever the reply put after it, outside the page's pinned
+/// `script-src`. To push content into a bubble page, call
+/// [`adele_core_markdown_set_content_script`], which returns the whole
+/// statement with the escaping already done.
 ///
 /// Returns a caller-owned string to release with [`adele_core_string_free`];
 /// null input renders as the empty string. Never returns null.
@@ -64,10 +66,9 @@ pub unsafe extern "C" fn adele_core_render_markdown(text: *const c_char) -> *mut
 /// message bubble: transparent background, system-appearance aware, no network,
 /// self-reporting height, and an in-place update hook.
 ///
-/// This is what a host loads once per message (with a null base URL); subsequent
-/// updates go through [`adele_core_render_markdown`] plus the page's update
-/// function, which keeps the pinned script hash — and therefore the page —
-/// unchanged.
+/// This is what a host loads once per message (with a null base URL);
+/// subsequent updates go through [`adele_core_markdown_set_content_script`],
+/// which keeps the pinned script hash — and therefore the page — unchanged.
 ///
 /// Returns a caller-owned string to release with [`adele_core_string_free`];
 /// null input renders an empty bubble. Never returns null.
@@ -94,8 +95,41 @@ pub extern "C" fn adele_core_markdown_height_handler_name() -> *const c_char {
         .as_ptr()
 }
 
-/// Name of the global function the host calls (through host-side script
-/// evaluation) to swap a new render into an already-loaded bubble page.
+/// Render untrusted markdown into the **complete JavaScript statement** that
+/// swaps it into an already-loaded bubble page — the streaming update that
+/// follows [`adele_core_render_markdown_document`].
+///
+/// Evaluate the returned string verbatim (`WKWebView.evaluateJavaScript`). It
+/// is one call to the page's update function with the reply rendered,
+/// sanitized, and encoded as a JavaScript string literal, so the reply cannot
+/// leave the literal and become code. Building that call from
+/// [`adele_core_render_markdown`] and
+/// [`adele_core_markdown_set_content_function`] instead is an injection: host
+/// evaluation is exempt from the page's CSP, so nothing downstream would catch
+/// it.
+///
+/// Returns a caller-owned string to release with [`adele_core_string_free`];
+/// null input yields the statement that clears the bubble. Never returns null.
+///
+/// # Safety
+/// `text` must be null or point to a valid NUL-terminated C string that stays
+/// valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_markdown_set_content_script(
+    text: *const c_char,
+) -> *mut c_char {
+    // SAFETY: contract above.
+    let input = unsafe { cstr_to_string(text) };
+    into_c_string(bubble::set_content_script(&input))
+}
+
+/// Name of the global function that swaps a new render into an already-loaded
+/// bubble page.
+///
+/// For hosts that bind the page themselves — installing their own wrapper, or
+/// asserting the bridge is present. It is **not** how to push content: use
+/// [`adele_core_markdown_set_content_script`], which returns the whole call
+/// already escaped.
 ///
 /// Returns a `'static` pointer — do not free it.
 #[unsafe(no_mangle)]
@@ -105,12 +139,13 @@ pub extern "C" fn adele_core_markdown_set_content_function() -> *const c_char {
         .as_ptr()
 }
 
-/// Free a string returned by [`adele_core_render_markdown`] or
-/// [`adele_core_render_markdown_document`]. Null is a no-op.
+/// Free a string returned by [`adele_core_render_markdown`],
+/// [`adele_core_render_markdown_document`] or
+/// [`adele_core_markdown_set_content_script`]. Null is a no-op.
 ///
 /// # Safety
-/// `text` must be null, or a pointer returned by one of those two functions and
-/// not yet freed. Do not pass the `'static` pointers from the bridge-name
+/// `text` must be null, or a pointer returned by one of those three functions
+/// and not yet freed. Do not pass the `'static` pointers from the bridge-name
 /// accessors.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_string_free(text: *mut c_char) {
