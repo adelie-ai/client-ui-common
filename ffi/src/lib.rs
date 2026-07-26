@@ -25,7 +25,16 @@
 
 mod builtins;
 mod engine;
+mod markdown;
 mod view_event;
+
+// The markdown surface is `no_mangle`, so the cdylib exports it either way;
+// re-exporting keeps it reachable by path for the rlib consumers (the spec).
+pub use markdown::{
+    adele_core_markdown_height_handler_name, adele_core_markdown_set_content_function,
+    adele_core_markdown_set_content_script, adele_core_render_markdown,
+    adele_core_render_markdown_document, adele_core_string_free,
+};
 
 use std::ffi::{CStr, c_char, c_void};
 
@@ -40,7 +49,7 @@ use crate::view_event::adele_output_from_str;
 /// # Safety
 /// `ptr` must be null or point to a valid NUL-terminated C string that stays
 /// valid for the duration of the call.
-unsafe fn cstr_to_string(ptr: *const c_char) -> String {
+pub(crate) unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }

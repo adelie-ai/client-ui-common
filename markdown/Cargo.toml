@@ -1,0 +1,40 @@
+[package]
+name = "adele-markdown"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Shared markdown -> sanitized HTML pipeline + CSP-pinned page templates for Adelie's webview-based chat transcripts."
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]
+# CommonMark + the GFM extensions assistant replies actually use (tables,
+# strikethrough, task lists). `default-features = false` keeps the CLI/`getopts`
+# tail out of the graph; `html` is the renderer we need.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# The security boundary: parses the RENDERED html and strips anything
+# executable. See `markdown_to_html` for why sanitization happens after
+# rendering rather than before.
+ammonia = "4"
+# CSP `script-src 'sha256-...'` pinning for the inline page scripts.
+sha2 = "0.10"
+base64 = "0.22"
+# The JS string-literal grammar, for the third layer (`js::string_literal`):
+# a JSON string literal IS a JavaScript string literal, and this is an audited
+# implementation of that grammar. Hand-rolling an escaper on a boundary that
+# decides whether a hostile reply executes is not worth the saved dependency.
+serde_json = "1"
+
+[dev-dependencies]
+# The spec re-derives the CSP hash independently of the implementation, so a
+# template edit that forgets to re-pin the script is caught.
+sha2 = "0.10"
+base64 = "0.22"
+# The JS-bridge spec decodes the emitted literal back to its value with its own
+# parser, so the round-trip property holds independently of which encoder the
+# implementation happens to use.
+serde_json = "1"

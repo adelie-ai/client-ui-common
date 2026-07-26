@@ -1,3 +1,7 @@
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
+# Pre-commit step 4 builds the reducer for wasm32. Without the target pinned
+# here a fresh clone fails it with E0463 until someone runs `rustup target add`,
+# which makes the wasm-clean guarantee something the gate silently skips.
+targets = ["wasm32-unknown-unknown"]

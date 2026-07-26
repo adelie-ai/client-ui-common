@@ -58,6 +58,11 @@ mcp-skills = ["dep:skills-mcp"]
 # map, the voice-mode client-tool registrations).
 client-ui-common = { path = ".." }
 
+# The shared markdown -> sanitized-HTML -> CSP-locked-page pipeline (gtk#25's
+# security boundary). Exposed over the C ABI so adele-mac, which has no Rust of
+# its own, renders assistant replies through the SAME sanitizer as adele-gtk.
+adele-markdown = { path = "../markdown" }
+
 # Protocol TYPES (api::client conversation views, SignalEvent, Command /
 # CommandResult, the model/task/scratchpad views).
 desktop-assistant-api-model = { path = "../../desktop-assistant/crates/api-model" }
@@ -100,6 +105,10 @@ uuid = { version = "1", features = ["v4"] }
 cbindgen = "0.29"
 
 [dev-dependencies]
+# Integration tests only see the crate under test + dev-deps, so the markdown
+# spec needs its own handle on the shared crate to assert the C ABI's exported
+# bridge names match it.
+adele-markdown = { path = "../markdown" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }
 # The client-MCP-host wiring tests spin up a `/bin/sh` fake MCP server from a
 # temp dir (mirroring the `mcp_host` unit tests).

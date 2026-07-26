@@ -278,6 +278,102 @@ void adele_core_set_mcp_builtin_disabled(Core *core, const char *name, bool disa
  */
 void adele_core_send_command(Core *core, const char *request_id, const char *command_json);
 
+/*
+ Render untrusted markdown into a **sanitized HTML fragment**, for a host
+ that splices markup into a page it builds itself.
+
+ The fragment is inert markup, not script. Do **not** format it into
+ JavaScript source — a rendered fragment carries raw double quotes and raw
+ newlines, so interpolating one into a call ends the string literal and
+ executes whatever the reply put after it, outside the page's pinned
+ `script-src`. To push content into a bubble page, call
+ [`adele_core_markdown_set_content_script`], which returns the whole
+ statement with the escaping already done.
+
+ Returns a caller-owned string to release with [`adele_core_string_free`];
+ null input renders as the empty string. Never returns null.
+
+ # Safety
+ `text` must be null or point to a valid NUL-terminated C string that stays
+ valid for the duration of the call.
+ */
+char *adele_core_render_markdown(const char *text);
+
+/*
+ Render untrusted markdown into a **complete, CSP-locked page** for a single
+ message bubble: transparent background, system-appearance aware, no network,
+ self-reporting height, and an in-place update hook.
+
+ This is what a host loads once per message (with a null base URL);
+ subsequent updates go through [`adele_core_markdown_set_content_script`],
+ which keeps the pinned script hash — and therefore the page — unchanged.
+
+ Returns a caller-owned string to release with [`adele_core_string_free`];
+ null input renders an empty bubble. Never returns null.
+
+ # Safety
+ `text` must be null or point to a valid NUL-terminated C string that stays
+ valid for the duration of the call.
+ */
+char *adele_core_render_markdown_document(const char *text);
+
+/*
+ Name of the script-message handler the bubble page posts its pixel height
+ to. The host must register a handler under exactly this name; an embedded
+ engine does not self-size inside a native stack view.
+
+ Returns a `'static` pointer — do not free it.
+ */
+const char *adele_core_markdown_height_handler_name(void);
+
+/*
+ Render untrusted markdown into the **complete JavaScript statement** that
+ swaps it into an already-loaded bubble page — the streaming update that
+ follows [`adele_core_render_markdown_document`].
+
+ Evaluate the returned string verbatim (`WKWebView.evaluateJavaScript`). It
+ is one call to the page's update function with the reply rendered,
+ sanitized, and encoded as a JavaScript string literal, so the reply cannot
+ leave the literal and become code. Building that call from
+ [`adele_core_render_markdown`] and
+ [`adele_core_markdown_set_content_function`] instead is an injection: host
+ evaluation is exempt from the page's CSP, so nothing downstream would catch
+ it.
+
+ Returns a caller-owned string to release with [`adele_core_string_free`];
+ null input yields the statement that clears the bubble. Never returns null.
+
+ # Safety
+ `text` must be null or point to a valid NUL-terminated C string that stays
+ valid for the duration of the call.
+ */
+char *adele_core_markdown_set_content_script(const char *text);
+
+/*
+ Name of the global function that swaps a new render into an already-loaded
+ bubble page.
+
+ For hosts that bind the page themselves — installing their own wrapper, or
+ asserting the bridge is present. It is **not** how to push content: use
+ [`adele_core_markdown_set_content_script`], which returns the whole call
+ already escaped.
+
+ Returns a `'static` pointer — do not free it.
+ */
+const char *adele_core_markdown_set_content_function(void);
+
+/*
+ Free a string returned by [`adele_core_render_markdown`],
+ [`adele_core_render_markdown_document`] or
+ [`adele_core_markdown_set_content_script`]. Null is a no-op.
+
+ # Safety
+ `text` must be null, or a pointer returned by one of those three functions
+ and not yet freed. Do not pass the `'static` pointers from the bridge-name
+ accessors.
+ */
+void adele_core_string_free(char *text);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
