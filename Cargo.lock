@@ -9,6 +9,7 @@ dependencies = [
  "ammonia",
  "base64",
  "pulldown-cmark",
+ "serde_json",
  "sha2",
 ]
 

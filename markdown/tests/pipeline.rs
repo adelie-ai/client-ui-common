@@ -315,6 +315,33 @@ fn bubble_document_reports_its_height_to_the_host() {
 }
 
 #[test]
+fn bubble_tightens_list_paragraphs_because_a_loose_list_wraps_each_item_in_a_p() {
+    // Pins why the `ul li p` rule is in the stylesheet at all. A *loose* list
+    // (blank-line separated items) has its item content wrapped in `<p>`, which
+    // would otherwise inherit the full paragraph margin and space the items out
+    // like paragraphs. Task-list markers have nothing to do with it: they reach
+    // the page as text, never as an element.
+    let loose = markdown_to_html("- a\n\n- b");
+    assert!(
+        loose.contains("<p>a</p>"),
+        "loose items are wrapped: {loose}"
+    );
+    let tight = markdown_to_html("- a\n- b");
+    assert!(!tight.contains("<p>"), "tight items are not: {tight}");
+
+    let marked = markdown_to_html("- [ ] todo");
+    assert!(
+        !marked.to_ascii_lowercase().contains("<input"),
+        "no form control ever reaches the sanitizer: {marked}"
+    );
+
+    assert!(
+        bubble::document("hi").contains("ul li p"),
+        "rule is shipped"
+    );
+}
+
+#[test]
 fn bubble_document_follows_the_system_appearance() {
     let doc = bubble::document("hi");
     assert!(doc.contains("prefers-color-scheme: dark"), "{doc}");

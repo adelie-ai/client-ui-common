@@ -10,7 +10,8 @@ use std::ffi::{CStr, CString};
 
 use adele_client_core::{
     adele_core_markdown_height_handler_name, adele_core_markdown_set_content_function,
-    adele_core_render_markdown, adele_core_render_markdown_document, adele_core_string_free,
+    adele_core_markdown_set_content_script, adele_core_render_markdown,
+    adele_core_render_markdown_document, adele_core_string_free,
 };
 
 /// Call a `*const c_char -> *mut c_char` entry point and take ownership of the
@@ -106,6 +107,63 @@ fn render_markdown_treats_null_as_empty() {
 fn string_free_tolerates_null() {
     // SAFETY: freeing null is a documented no-op.
     unsafe { adele_core_string_free(std::ptr::null_mut()) };
+}
+
+#[test]
+fn set_content_script_is_exported_as_a_complete_already_escaped_statement() {
+    // The host that most needs this has no Rust of its own, so the C ABI must
+    // hand it something it can evaluate verbatim — not a function name plus the
+    // job of escaping an untrusted fragment into a JS string literal.
+    let reply = r#"He said "x");alert(document.cookie);//"#;
+    let script = render(adele_core_markdown_set_content_script, reply);
+
+    assert_eq!(
+        script,
+        adele_markdown::bubble::set_content_script(reply),
+        "the C ABI must emit exactly what the shared crate does"
+    );
+    assert!(
+        script.starts_with(&format!(
+            "{}(",
+            adele_markdown::bubble::SET_CONTENT_FUNCTION
+        )),
+        "{script}"
+    );
+    assert!(script.ends_with(");"), "{script}");
+    assert!(
+        !script.contains("\");alert("),
+        "the reply broke out of the literal: {script}"
+    );
+    assert!(!script.contains('\n'), "no raw newline: {script}");
+}
+
+#[test]
+fn set_content_script_neutralizes_hostile_markup_before_escaping_it() {
+    let script = render(
+        adele_core_markdown_set_content_script,
+        "<script>alert(1)</script>ok <img src=x onerror=alert(2)>",
+    );
+    let lower = script.to_ascii_lowercase();
+    for bad in ["<script", "onerror", "alert(1)", "alert(2)"] {
+        assert!(!lower.contains(bad), "{bad} survived: {script}");
+    }
+    assert!(script.contains("ok"), "{script}");
+}
+
+#[test]
+fn set_content_script_treats_null_as_an_empty_reply() {
+    // SAFETY: null is an explicitly supported argument.
+    unsafe {
+        let out = adele_core_markdown_set_content_script(std::ptr::null());
+        assert!(!out.is_null(), "null input must still yield a statement");
+        let script = CStr::from_ptr(out).to_string_lossy().into_owned();
+        adele_core_string_free(out);
+        assert_eq!(
+            script,
+            format!("{}(\"\");", adele_markdown::bubble::SET_CONTENT_FUNCTION),
+            "an empty reply clears the bubble rather than leaving stale content"
+        );
+    }
 }
 
 #[test]
