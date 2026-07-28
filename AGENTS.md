@@ -21,8 +21,8 @@ packages that must not blur together:
   package.
 
 Dependency sourcing is via path deps for now and is still being settled (so `api-model` is not
-duplicated in a client's build graph); some work here is blocked by desktop-assistant#387 and
-voice#116 - track those rather than working around them. Warnings are denied mechanically via
+duplicated in a client's build graph). Where that sourcing blocks work here, track it rather
+than working around it inside this crate. Warnings are denied mechanically via
 the workspace `[lints]` (`rust.warnings` / `clippy.all` = "deny").
 
 ## Rust Conventions
@@ -140,3 +140,24 @@ This group runs it with its own tooling:
 GitHub Issues on `github.com/adelie-ai/client-ui-common`, together with the shared `adelie-ai` project
 board. Manage entries with the `gh` CLI (`gh issue create`, `gh issue list`, `gh issue edit`,
 `gh pr create`). The board states in use are In Progress, In Review, and Done.
+
+### Platform, not a single product (addition)
+
+Adele is a platform, not one product. Solve for the general case at every seam that is
+plural by domain: storage backends, LLM providers, transports, clients, MCP servers, speech
+engines. When a requirement names two of something, ask whether the real requirement is N
+of them, and build that one instead.
+
+Put the abstraction at the port. Keep the conditional compilation and the selection in one
+factory, so a new implementation costs a crate, a feature, and one arm - not an edit to
+every implementation that already exists. A hand-rolled `AnyX` enum with a variant per
+implementation is the shape that fails this test: it re-dispatches every trait method by
+hand and grows with the set.
+
+Base rule 7.3 still holds inside a component. Do not invent indirection that a single call
+site does not need. It does not licence the narrow build at a platform seam, because there
+the plurality is the product, and the seam is already past the three-call-site test.
+
+Fail loudly and by name when a configured selection is not compiled in, or is unavailable.
+Name what was asked for and what is actually present. Silent degradation to a lesser
+backend hides the problem from the one person who could fix it.
