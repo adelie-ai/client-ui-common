@@ -329,6 +329,140 @@ mod tests {
         }
     }
 
+    // ----- SEP-973 declared server metadata (issue #46) -----
+
+    /// A daemon view that declared all three optional `serverInfo` fields.
+    fn described(name: &str) -> McpServerView {
+        McpServerView {
+            title: Some("Weather Service".into()),
+            description: Some("Live weather and forecasts.".into()),
+            website_url: Some("https://example.com/weather".into()),
+            ..dv(name, "stdio", "running", 3)
+        }
+    }
+
+    #[test]
+    fn server_rows_carry_server_metadata() {
+        let rows = server_rows(&[described("weather")], &[]);
+        assert_eq!(rows[0].title.as_deref(), Some("Weather Service"));
+        assert_eq!(rows[0].description.as_deref(), Some("Live weather and forecasts."));
+        assert_eq!(
+            rows[0].website_url.as_deref(),
+            Some("https://example.com/weather")
+        );
+    }
+
+    /// The case for every server today: it declares nothing and must render
+    /// exactly as it did before this existed.
+    #[test]
+    fn server_rows_leave_metadata_absent_when_unset() {
+        let rows = server_rows(&[dv("weather", "stdio", "running", 3)], &[]);
+        assert_eq!(rows[0].title, None);
+        assert_eq!(rows[0].description, None);
+        assert_eq!(rows[0].website_url, None);
+    }
+
+    /// Only a daemon row has an `initialize` handshake behind it, so only a
+    /// daemon row can carry anything a server declared.
+    #[test]
+    fn client_and_builtin_rows_have_no_declared_metadata() {
+        let rows = server_rows_with_builtins(
+            &[],
+            &[cv("local", "stdio", "running", 1)],
+            &[BuiltinServerDto {
+                name: "fileio".into(),
+                tool_count: 5,
+                overridden_by: None,
+            }],
+        );
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.title, None, "{} must not declare a title", row.name);
+            assert_eq!(row.description, None);
+            assert_eq!(row.website_url, None);
+        }
+    }
+
+    #[test]
+    fn display_name_prefers_title_over_name() {
+        let row = &server_rows(&[described("weather")], &[])[0];
+        assert_eq!(display_name(row), "Weather Service");
+    }
+
+    #[test]
+    fn display_name_falls_back_to_name_when_title_absent() {
+        let row = &server_rows(&[dv("weather", "stdio", "running", 3)], &[])[0];
+        assert_eq!(display_name(row), "weather");
+    }
+
+    /// A server sending a blank title must not produce an empty row label.
+    #[test]
+    fn display_name_falls_back_to_name_when_title_is_blank() {
+        let view = McpServerView {
+            title: Some("   ".into()),
+            ..dv("weather", "stdio", "running", 3)
+        };
+        let row = &server_rows(&[view], &[])[0];
+        assert_eq!(display_name(row), "weather");
+    }
+
+    /// Untrusted input: a long or newline-laden description must not break the
+    /// row layout.
+    #[test]
+    fn description_is_clamped_and_stripped_of_control_characters() {
+        let hostile = format!("line one\nline\ttwo\r\n{}", "x".repeat(1000));
+        let view = McpServerView {
+            description: Some(hostile),
+            ..dv("weather", "stdio", "running", 3)
+        };
+        let row = &server_rows(&[view], &[])[0];
+        let rendered = row.description.as_deref().expect("description present");
+        assert!(
+            !rendered.contains('\n') && !rendered.contains('\r') && !rendered.contains('\t'),
+            "control characters must be stripped: {rendered:?}"
+        );
+        assert!(
+            rendered.chars().count() <= MAX_DESCRIPTION_CHARS,
+            "description must be clamped, got {} chars",
+            rendered.chars().count()
+        );
+    }
+
+    /// Untrusted input: only `http(s)` may be offered as a clickable link. A
+    /// `file://` or `javascript:` URL from a hostile server is the abuse case.
+    #[test]
+    fn website_url_rejects_non_http_schemes() {
+        for hostile in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>",
+            "/relative/path",
+            "example.com",
+        ] {
+            let view = McpServerView {
+                website_url: Some(hostile.to_string()),
+                ..dv("weather", "stdio", "running", 3)
+            };
+            let row = &server_rows(&[view], &[])[0];
+            assert_eq!(
+                row.website_url, None,
+                "{hostile:?} must not survive as a link"
+            );
+        }
+    }
+
+    #[test]
+    fn website_url_accepts_http_and_https() {
+        for ok in ["http://example.com", "https://example.com/weather"] {
+            let view = McpServerView {
+                website_url: Some(ok.to_string()),
+                ..dv("weather", "stdio", "running", 3)
+            };
+            let row = &server_rows(&[view], &[])[0];
+            assert_eq!(row.website_url.as_deref(), Some(ok));
+        }
+    }
+
     /// A [`BuiltinServerDto`] for a compiled-in server. `overridden_by` is the
     /// external server name shadowing it, or `None` when the built-in is active.
     /// Not disabled-by-config; use [`bv_disabled`] for that case.
