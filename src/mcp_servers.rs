@@ -156,6 +156,75 @@ pub struct ServerRow {
     /// disabled (e.g. a built-in shadowed by an external server of the same
     /// name), with `reason` the user-facing explanation.
     pub disabled_reason: Option<String>,
+    /// Display name the server declared for itself (SEP-973), already sanitized.
+    /// Render via [`display_name`] rather than reading this directly, so the
+    /// fallback to [`name`](Self::name) is applied consistently.
+    pub title: Option<String>,
+    /// What the server says it offers, sanitized and clamped to
+    /// [`MAX_DESCRIPTION_CHARS`]. Suitable as a one-line subtitle.
+    pub description: Option<String>,
+    /// The server's home page, present only when it is a valid `http(s)` URL.
+    /// Safe to offer as a clickable link; still must not be auto-opened.
+    pub website_url: Option<String>,
+}
+
+/// Cap on a rendered description, in characters.
+///
+/// A server's declared description is untrusted: it comes from whatever process
+/// the config points at. Long enough to be a useful subtitle, short enough that
+/// no server can push the rest of a row off screen.
+pub const MAX_DESCRIPTION_CHARS: usize = 200;
+
+/// Sanitize a server-declared string for display: collapse every run of
+/// whitespace (including newlines and tabs) to a single space, drop other
+/// control characters, trim, and return `None` if nothing is left.
+///
+/// Why: these strings are rendered in the user's UI but authored by the server,
+/// so a newline-laden or control-character-laden value would otherwise break the
+/// row layout. The MCP spec makes the same point about tool annotations —
+/// clients must treat server-supplied metadata as untrusted.
+fn sanitize_declared(value: &str, max_chars: usize) -> Option<String> {
+    let mut out = String::new();
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        if out.chars().count() >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Accept a server-declared website only when it is an `http(s)` URL.
+///
+/// A hostile server offering `javascript:`, `file://` or `data:` must not become
+/// a clickable link in the user's client, and a scheme-less value is refused
+/// rather than guessed at.
+fn sanitized_website(value: &str) -> Option<String> {
+    let url = sanitize_declared(value, MAX_DESCRIPTION_CHARS)?;
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")).then_some(url)
+}
+
+/// The label to show for a row: the server's declared title when it gave a
+/// usable one, else its configured [`name`](ServerRow::name).
+///
+/// The real `name` stays the identity used in config, namespacing and error
+/// messages, so a client showing a title must keep the name visible somewhere —
+/// a server must not be able to make its own identity unfindable.
+pub fn display_name(row: &ServerRow) -> &str {
+    row.title.as_deref().unwrap_or(&row.name)
 }
 
 /// Human label for a row's runner.
@@ -239,7 +308,20 @@ pub fn server_rows_with_builtins(
         detail: d.detail.clone(),
         kind: ServerKind::from_transport(&d.transport),
         disabled_reason: None,
+        // Sanitized at the boundary, so every renderer downstream gets a value
+        // that is already safe to place in a row.
+        title: d
+            .title
+            .as_deref()
+            .and_then(|t| sanitize_declared(t, MAX_DESCRIPTION_CHARS)),
+        description: d
+            .description
+            .as_deref()
+            .and_then(|t| sanitize_declared(t, MAX_DESCRIPTION_CHARS)),
+        website_url: d.website_url.as_deref().and_then(sanitized_website),
     });
+    // Client-run and built-in servers have no `initialize` handshake behind
+    // them, so there is nothing they could have declared.
     let client_rows = client.iter().map(|c| ServerRow {
         name: c.name.clone(),
         runner: Runner::Client,
@@ -249,6 +331,9 @@ pub fn server_rows_with_builtins(
         detail: None,
         kind: ServerKind::from_transport(&c.transport),
         disabled_reason: None,
+        title: None,
+        description: None,
+        website_url: None,
     });
     let builtin_rows = builtins.iter().map(|b| {
         // A built-in renders disabled when it was turned off in config OR shadowed
@@ -276,6 +361,9 @@ pub fn server_rows_with_builtins(
             detail: None,
             kind: ServerKind::BuiltIn,
             disabled_reason,
+            title: None,
+            description: None,
+            website_url: None,
         }
     });
 
@@ -345,7 +433,10 @@ mod tests {
     fn server_rows_carry_server_metadata() {
         let rows = server_rows(&[described("weather")], &[]);
         assert_eq!(rows[0].title.as_deref(), Some("Weather Service"));
-        assert_eq!(rows[0].description.as_deref(), Some("Live weather and forecasts."));
+        assert_eq!(
+            rows[0].description.as_deref(),
+            Some("Live weather and forecasts.")
+        );
         assert_eq!(
             rows[0].website_url.as_deref(),
             Some("https://example.com/weather")
@@ -371,8 +462,10 @@ mod tests {
             &[cv("local", "stdio", "running", 1)],
             &[BuiltinServerDto {
                 name: "fileio".into(),
+                namespace: "fileio".into(),
                 tool_count: 5,
                 overridden_by: None,
+                disabled_by_config: false,
             }],
         );
         assert_eq!(rows.len(), 2);
@@ -499,6 +592,9 @@ mod tests {
             detail: None,
             kind: ServerKind::Stdio,
             disabled_reason: None,
+            title: None,
+            description: None,
+            website_url: None,
         };
         assert_eq!(row.runner, Runner::Daemon);
         assert_ne!(Runner::Daemon, Runner::Client);
