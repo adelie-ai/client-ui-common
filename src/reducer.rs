@@ -2130,6 +2130,7 @@ fn filter_messages(detail: &ConversationDetail, debug: bool) -> ConversationDeta
             .collect(),
         model_selection: detail.model_selection.clone(),
         conversation_personality: detail.conversation_personality,
+        tool_gate_disabled: detail.tool_gate_disabled,
     }
 }
 
@@ -2251,6 +2252,7 @@ mod tests {
             messages,
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         }
     }
 
