@@ -65,6 +65,13 @@ struct StreamState {
     /// [`external`](Self::external) turn adopted from elsewhere (this client
     /// never received that turn's ack, so it holds no handle to cancel it).
     task_id: String,
+    /// The client-minted idempotency key of the send that started this turn
+    /// (#570), carried through to [`Effect::TurnFinished`] so a host can name
+    /// the submit a completion closes out (#51). Taken from the conversation
+    /// model's [`pending_send_key`](ConversationModel::pending_send_key) when
+    /// the ack opens the stream. `None` for a keyless send and for an
+    /// [`external`](Self::external) turn this client never sent.
+    idempotency_key: Option<String>,
 }
 
 /// Separator used to fold several queued messages into one combined prompt on
@@ -153,6 +160,15 @@ struct ConversationModel {
     /// own partial here while the open one renders live, and switching back
     /// re-seeds the buffered prefix. See [`StreamState`].
     stream: Option<StreamState>,
+    /// The idempotency key of a send that has left the reducer but is not yet
+    /// acked, held so the ack can put it on the stream it opens (#51). Set by
+    /// [`commit_send`](WindowState::commit_send), taken by
+    /// [`UiMessage::PromptSent`], and dropped by [`UiMessage::SendFailed`] —
+    /// the same window `pending_flush` covers, and cleared the same way, so a
+    /// send that never reached the daemon leaves no key behind for the next
+    /// turn to be reported under. `None` outside that window and for a keyless
+    /// send.
+    pending_send_key: Option<String>,
 }
 
 /// Shared mutable state for the window.
@@ -573,6 +589,12 @@ impl WindowState {
         // the outbox — the composer may hold an unrelated fresh draft that must
         // survive (a switch-back flush would otherwise wipe it; see the flush
         // paths). The one caller that consumes the composer clears it itself.
+        // Park the send's key until the ack opens this turn's stream (#51), so
+        // the completion can name the submit it closes. Held on the model, not
+        // the stream, because the stream does not exist until the ack arrives.
+        if let Some(model) = self.open.get_mut(&conversation_id) {
+            model.pending_send_key = idempotency_key.clone();
+        }
         let system_refinement = refinement_for_send(self).map(str::to_string);
         vec![Effect::SendPrompt {
             conversation_id,
@@ -1456,6 +1478,12 @@ impl WindowState {
                 // the front of the outbox (they were queued before anything typed
                 // since). A direct send leaves `pending_flush` empty, so this is a
                 // no-op there — no phantom queue entries.
+                // The send never reached the daemon, so no turn will ever start
+                // under its key: drop it rather than let the next turn in this
+                // conversation be reported under it (#51).
+                if let Some(model) = self.open.get_mut(&conversation_id) {
+                    model.pending_send_key = None;
+                }
                 let requeued = match self.open.get_mut(&conversation_id) {
                     Some(model) if !model.pending_flush.is_empty() => {
                         let restored = std::mem::take(&mut model.pending_flush);
@@ -1494,19 +1522,21 @@ impl WindowState {
                 // background-task handle Cancel acts on, so it lets a view offer
                 // Cancel for this turn until the stream terminates (empty for a
                 // legacy id-less ack — no Cancel then).
-                let stream = StreamState {
-                    request_id: None,
-                    buffer: String::new(),
-                    say_this_spoken_this_turn: false,
-                    external: false,
-                    task_id,
-                };
                 let model = self.open.entry(conversation_id).or_default();
                 // The daemon accepted the send (#25): the flush is now its
                 // responsibility, so drop the client-side copy held for
                 // restore-on-failure. No-op for a direct send (empty).
                 model.pending_flush.clear();
-                model.stream = Some(stream);
+                model.stream = Some(StreamState {
+                    request_id: None,
+                    buffer: String::new(),
+                    say_this_spoken_this_turn: false,
+                    external: false,
+                    task_id,
+                    // Move the parked send key onto the turn it started (#51),
+                    // so the completion names the submit it closes.
+                    idempotency_key: model.pending_send_key.take(),
+                });
                 vec![]
             }
             UiMessage::UserMessageAdded {
@@ -1610,6 +1640,9 @@ impl WindowState {
                         // turn's ack, so it holds no task id and cannot cancel it
                         // (#138).
                         task_id: String::new(),
+                        // Nor did it send the turn, so there is no key of ours to
+                        // report when it finishes (#51).
+                        idempotency_key: None,
                     };
                     self.open.entry(conversation_id).or_default().stream = Some(stream);
                     if let Some(conv) = self.current_conversation_mut() {
@@ -1728,6 +1761,16 @@ impl WindowState {
                 // narrated by its originator — gtk must not also speak it.
                 let was_external = stream.external;
                 let is_active = self.is_active_conversation(&origin);
+                // The turn is over: report it so a host can close a per-turn
+                // span (#51). Built here, while the stream is still in hand, and
+                // emitted on BOTH paths below — the backgrounded one included,
+                // which is the path a host could not observe at all.
+                let finished = Effect::TurnFinished {
+                    conversation_id: origin.clone(),
+                    request_id,
+                    idempotency_key: stream.idempotency_key,
+                    outcome: TurnOutcome::Completed,
+                };
 
                 if !is_active {
                     // The originating conversation isn't the one in view, so we
@@ -1735,8 +1778,10 @@ impl WindowState {
                     // the open conversation). Touch NOTHING in the open chat: no
                     // CompleteStreaming, no chat status, no audio. The reply is
                     // persisted daemon-side and appears when the user switches
-                    // back and the conversation reloads.
-                    return vec![];
+                    // back and the conversation reloads. The turn report is the
+                    // one exception: it renders nothing, and without it a
+                    // backgrounded turn would never reach the host (#51).
+                    return vec![finished];
                 }
 
                 // Reply narration (issue #80): narrate the finalized reply via
@@ -1781,6 +1826,10 @@ impl WindowState {
                 if let Some(id) = self.current_conversation_id.clone() {
                     effects.push(Effect::FetchScratchpad(id));
                 }
+                // Report the finished turn BEFORE the flush below, which starts
+                // the NEXT turn: a host must see this turn close before the next
+                // one opens, or it nests them (#51).
+                effects.push(finished);
                 // The reply finished: flush any messages the user queued while it
                 // streamed as ONE combined follow-up turn. (Only reached for the
                 // in-view conversation — a backgrounded completion returned
@@ -1796,20 +1845,24 @@ impl WindowState {
                 let Some(origin) = self.route_stream(&request_id) else {
                     return vec![];
                 };
-                if self
-                    .open
-                    .get_mut(&origin)
-                    .and_then(|m| m.stream.take())
-                    .is_none()
-                {
+                let Some(stream) = self.open.get_mut(&origin).and_then(|m| m.stream.take()) else {
                     return vec![];
-                }
+                };
                 let is_active = self.is_active_conversation(&origin);
                 // Only clear the chat status line if the failed stream's
                 // conversation is the one in view (GTK-2); a background turn's
                 // failure must not blank another conversation's chat. The
                 // status-text line is the global one, so always surface the error.
                 let mut effects = vec![Effect::SetStatusText(format!("Error: {error}"))];
+                // The turn is over: report it on BOTH paths so a host can close
+                // its per-turn span even for a backgrounded failure (#51).
+                let finished = Effect::TurnFinished {
+                    conversation_id: origin.clone(),
+                    request_id,
+                    idempotency_key: stream.idempotency_key,
+                    outcome: TurnOutcome::Failed(error),
+                };
+                effects.push(finished);
                 if is_active {
                     effects.insert(0, Effect::ClearChatStatus);
                     // The turn failed, but the user's queued follow-ups are still
@@ -3589,7 +3642,8 @@ mod tests {
 
     /// Completing the BACKGROUNDED stream touches nothing in the open chat (no
     /// CompleteStreaming for the conversation not in view) and leaves the open
-    /// conversation's stream intact.
+    /// conversation's stream intact. It reports the finished turn (#51), which
+    /// renders nothing.
     #[test]
     fn completing_background_stream_does_not_touch_open_conversation() {
         let mut state = two_streams_state();
@@ -3598,7 +3652,10 @@ mod tests {
             full_response: "c1 done".to_string(),
         });
         assert!(
-            effects.is_empty(),
+            matches!(
+                effects.as_slice(),
+                [Effect::TurnFinished { conversation_id, .. }] if conversation_id == "c1"
+            ),
             "a backgrounded completion must not render into the open chat: {effects:?}"
         );
         assert!(state.stream_of("c1").is_none(), "c1's stream is cleared");
@@ -4757,6 +4814,10 @@ mod tests {
                     Effect::ClearChatStatus,
                     Effect::CompleteStreaming(c),
                     Effect::FetchScratchpad(conv),
+                    Effect::TurnFinished {
+                        outcome: TurnOutcome::Completed,
+                        ..
+                    },
                 ] if c == "the answer" && conv == "c1"
             ),
             "unexpected effects: {effects:?}"
@@ -4784,7 +4845,17 @@ mod tests {
         assert!(!state.is_streaming());
         assert!(state.streaming_buffer().is_empty());
         assert!(
-            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::SetStatusText(t)] if t == "Error: boom"),
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ClearChatStatus,
+                    Effect::SetStatusText(t),
+                    Effect::TurnFinished {
+                        outcome: TurnOutcome::Failed(e),
+                        ..
+                    },
+                ] if t == "Error: boom" && e == "boom"
+            ),
             "unexpected effects: {effects:?}"
         );
     }
@@ -6789,7 +6860,10 @@ mod tests {
             content: "asked by voice".to_string(),
             idempotency_key: None,
         });
-        assert!(state.stream_external(), "precondition: the turn was adopted");
+        assert!(
+            state.stream_external(),
+            "precondition: the turn was adopted"
+        );
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-ext".to_string(),
             full_response: "the answer".to_string(),

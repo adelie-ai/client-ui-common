@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use client_ui_common::{
-    AdeleOutput, Effect, UiMessage, WindowState, interactive_default_from_purposes,
+    AdeleOutput, Effect, TurnOutcome, UiMessage, WindowState, interactive_default_from_purposes,
     signal_to_ui_message, voice_mode_client_tools,
 };
 use desktop_assistant_api_model as api;
@@ -772,6 +772,24 @@ impl Engine {
                 tool_call_id,
                 result,
             } => self.spawn_submit_tool_result(task_id, tool_call_id, result),
+            // A turn ended. The reducer reports it so a host can close a
+            // per-turn span; this engine keeps no spans, so it only records the
+            // correlation on the log line. Ids and an outcome only — no prompt
+            // and no reply text.
+            Effect::TurnFinished {
+                conversation_id,
+                request_id,
+                idempotency_key,
+                outcome,
+            } => {
+                tracing::debug!(
+                    conversation_id,
+                    request_id,
+                    idempotency_key,
+                    failed = matches!(outcome, TurnOutcome::Failed(_)),
+                    "turn finished"
+                );
+            }
             // `try_from_view_effect` returns `Err` only for the RPC set above;
             // a brand-new effect variant would land here — assert in debug so a
             // future wiring gap is loud, and log (not panic) in release.
