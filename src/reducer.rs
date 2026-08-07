@@ -969,13 +969,19 @@ pub enum Effect {
     /// whole point: a backgrounded turn used to end with zero effects, so a
     /// host executor that watches effects could not observe it at all.
     ///
-    /// Four paths produce it: [`UiMessage::StreamComplete`],
-    /// [`UiMessage::StreamError`], [`UiMessage::Disconnected`], and
-    /// [`WindowState::reset_streaming_state`]. Together they cover every way a
-    /// turn leaves the reducer, so the reducer offers a close for every span it
-    /// let a host open. A host still has to run the effects it gets back from
-    /// all four, `reset_streaming_state` included, or it keeps the span open
-    /// on whichever path it drops.
+    /// The invariant, rather than a list of paths, because the list has grown
+    /// twice already and a number in prose goes stale every time: **wherever
+    /// the reducer drops, clears or replaces a stream, it emits exactly one of
+    /// these for that turn first.** Completion and error are the obvious two.
+    /// A disconnect, a streaming-state reset, a delete of the conversation, and
+    /// an ack that replaces a turn still in flight are the rest. So the reducer
+    /// offers a close for every span it let a host open.
+    ///
+    /// Two obligations on a host follow from that. Run the effects from EVERY
+    /// entry point that returns them, including
+    /// [`WindowState::reset_streaming_state`], or the span stays open on
+    /// whichever path is dropped. And if you add a path here that ends a
+    /// stream, report it, or you silently reintroduce the leak.
     ///
     /// Why: a host that opens a per-turn span when the person presses send has
     /// to close it when the reply ends, and the daemon's `request_id` alone does
@@ -1258,7 +1264,20 @@ impl WindowState {
                 // per-conversation state (voice settings, draft, any cached
                 // transcript) goes with it, so a later id reuse can't inherit a
                 // stale `You:`/`Adele:` setting or composer draft.
-                self.open.remove(&id);
+                //
+                // The stream goes with it too, which ends any turn streaming
+                // into this conversation. Report it (#51): a person can delete
+                // a conversation while a reply is still arriving in it, and
+                // nothing else will ever close a span opened for that turn.
+                let ended = self.open.remove(&id).and_then(|model| {
+                    let stream = model.stream?;
+                    Some(Effect::TurnFinished {
+                        conversation_id: id.clone(),
+                        request_id: stream.request_id.unwrap_or_default(),
+                        idempotency_key: stream.idempotency_key,
+                        outcome: TurnOutcome::Failed("Conversation deleted".to_string()),
+                    })
+                });
                 let is_active = self.current_conversation_id.as_deref() == Some(&id);
                 if is_active {
                     self.current_conversation_id = None;
@@ -1271,6 +1290,9 @@ impl WindowState {
                     effects.push(Effect::RefreshSidePaneTasks);
                     effects.push(Effect::EnsureActiveConversation);
                 }
+                // After the view effects, matching every other path: the screen
+                // settles first, then the turn is called over.
+                effects.extend(ended);
                 effects
             }
             UiMessage::ConversationRenamed { id, title } => {
@@ -7047,9 +7069,29 @@ mod tests {
     /// A completion for a stream the reducer does not own reports nothing. The
     /// reducer's own view is what a host acts on, so a stray daemon id must not
     /// close a span.
+    ///
+    /// A LIVE stream has to be in flight for this to mean anything. With no
+    /// stream to take, the arm returns early whether or not it routes, so the
+    /// test would pass without the routing guard doing any work. Here the guard
+    /// is the only thing standing between a stray daemon id and a turn that is
+    /// still streaming: without it the completion takes that turn and closes
+    /// its span under an id that belongs to something else.
     #[test]
     fn an_unrouted_completion_reports_no_finished_turn() {
         let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "still going".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-a".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::StreamChunk {
+            request_id: "req-a".to_string(),
+            chunk: "half".to_string(),
+        });
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-nobody-owns".to_string(),
             full_response: "the answer".to_string(),
@@ -7058,6 +7100,64 @@ mod tests {
             turn_finished(&effects),
             None,
             "an unrouted completion must report no finished turn: {effects:?}"
+        );
+        assert!(
+            state.stream_of("c1").is_some(),
+            "and it must not take the live turn's stream"
+        );
+    }
+
+    // --- Turns a delete ends (#51) ----------------------------------------
+
+    /// Deleting a conversation drops its model, stream included. That ends any
+    /// turn streaming into it, so it reports. A person can delete a
+    /// conversation while a reply is still arriving in it, and nothing else
+    /// will ever close a span opened for that turn.
+    #[test]
+    fn deleting_a_conversation_reports_the_turn_it_ends() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "never mind".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-a".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::StreamChunk {
+            request_id: "req-a".to_string(),
+            chunk: "half an answer".to_string(),
+        });
+        // Switch away so the delete lands on a BACKGROUNDED turn, the case a
+        // host could never observe.
+        state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
+        let effects = state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some((
+                "c1",
+                "req-a",
+                Some("key-a"),
+                &TurnOutcome::Failed("Conversation deleted".to_string())
+            )),
+            "deleting a conversation must report the turn it ended: {effects:?}"
+        );
+    }
+
+    /// Deleting an idle conversation reports nothing.
+    #[test]
+    fn deleting_an_idle_conversation_reports_no_turn() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        let effects = state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            None,
+            "no turn was in flight, so none ended: {effects:?}"
         );
     }
 
