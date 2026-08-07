@@ -995,7 +995,10 @@ pub enum Effect {
     /// Four paths produce it: [`UiMessage::StreamComplete`],
     /// [`UiMessage::StreamError`], [`UiMessage::Disconnected`], and
     /// [`WindowState::reset_streaming_state`]. Together they cover every way a
-    /// turn leaves the reducer, so a span opened at submit always has a close.
+    /// turn leaves the reducer, so the reducer offers a close for every span it
+    /// let a host open. A host still has to run the effects it gets back from
+    /// all four, `reset_streaming_state` included, or it keeps the span open
+    /// on whichever path it drops.
     ///
     /// Why: a host that opens a per-turn span when the person presses send has
     /// to close it when the reply ends, and the daemon's `request_id` alone does
