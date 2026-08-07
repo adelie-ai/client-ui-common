@@ -703,6 +703,16 @@ fn say_this_text(arguments: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// How a turn's reply stream ended, carried on [`Effect::TurnFinished`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// The reply finished normally.
+    Completed,
+    /// The turn failed. Carries the daemon's error text — the same text
+    /// [`Effect::SetStatusText`] surfaces on the status line.
+    Failed(String),
+}
+
 /// A single observable side-effect produced by [`WindowState::apply`].
 ///
 /// `apply` is a pure decision function: it mutates `WindowState` and returns
@@ -891,6 +901,45 @@ pub enum Effect {
         tool_call_id: String,
         result: Result<String, String>,
     },
+
+    // --- Turn-completion correlation (#51) --------------------------------
+    /// A turn's reply stream reached a terminal state — it completed, or it
+    /// failed. Emitted for EVERY stream the reducer routes, including one whose
+    /// conversation is not the one in view, which is the whole point: a
+    /// backgrounded turn used to end with zero effects, so a host executor that
+    /// watches effects could not observe it at all.
+    ///
+    /// Why: a host that opens a per-turn span when the person presses send has
+    /// to close it when the reply ends, and the daemon's `request_id` alone does
+    /// not say which send that was. This carries the correlation the host
+    /// already held at submit time — it saw the same `conversation_id` and
+    /// `idempotency_key` on [`Effect::SendPrompt`].
+    ///
+    /// This reports the REDUCER's view of which stream ended, not the daemon's.
+    /// A stray or unrouted `request_id` produces no `TurnFinished`, so a host
+    /// never closes a span for a turn the reducer was not tracking.
+    ///
+    /// Purely informational: a host that runs no telemetry ignores it, and the
+    /// reducer's own state is already settled by the time it is emitted.
+    TurnFinished {
+        /// The conversation whose stream ended, as the reducer routed it —
+        /// which is the conversation the turn was sent into, not whichever one
+        /// is open now.
+        conversation_id: String,
+        /// The daemon's turn id for the stream that ended.
+        request_id: String,
+        /// The client-minted idempotency key of the send behind this turn, so a
+        /// host can name the exact [`UiMessage::SubmitPrompt`] it closes.
+        /// `None` for a keyless send and for an adopted external turn (a voice
+        /// turn, or another client) that this client never sent — a key-minting
+        /// host reads `None` as "I hold no span for this".
+        ///
+        /// A queue flush sends several submits as ONE turn and adopts the first
+        /// queued message's key, so that is the key reported here.
+        idempotency_key: Option<String>,
+        /// Whether the turn completed or failed.
+        outcome: TurnOutcome,
+    },
 }
 
 // Manual `Debug` (retained from when `Effect::SetClient` carried the
@@ -985,6 +1034,18 @@ impl std::fmt::Debug for Effect {
                 .field("task_id", task_id)
                 .field("tool_call_id", tool_call_id)
                 .field("result", result)
+                .finish(),
+            Effect::TurnFinished {
+                conversation_id,
+                request_id,
+                idempotency_key,
+                outcome,
+            } => f
+                .debug_struct("TurnFinished")
+                .field("conversation_id", conversation_id)
+                .field("request_id", request_id)
+                .field("idempotency_key", idempotency_key)
+                .field("outcome", outcome)
                 .finish(),
         }
     }
@@ -6562,6 +6623,308 @@ mod tests {
             state.adele_output_for_current(),
             AdeleOutput::Disabled,
             "Adele set on c1 must not leak into c2"
+        );
+    }
+
+    // --- Turn-completion correlation (#51) --------------------------------
+    //
+    // A host that opens a per-turn span at submit must be able to close it at
+    // the reply's end. It therefore needs two things the reducer did not give
+    // it: a terminal event for EVERY routed stream (a backgrounded completion
+    // used to return zero effects, so a host watching effects could not see it
+    // at all), and enough on that event to name the submit it closes.
+
+    /// Read the single `TurnFinished` out of a returned effect list, or `None`
+    /// when there is none. Panics if a turn reports finished twice.
+    fn turn_finished(effects: &[Effect]) -> Option<(&str, &str, Option<&str>, &TurnOutcome)> {
+        let mut it = effects.iter().filter_map(|e| match e {
+            Effect::TurnFinished {
+                conversation_id,
+                request_id,
+                idempotency_key,
+                outcome,
+            } => Some((
+                conversation_id.as_str(),
+                request_id.as_str(),
+                idempotency_key.as_deref(),
+                outcome,
+            )),
+            _ => None,
+        });
+        let first = it.next();
+        assert!(
+            it.next().is_none(),
+            "a single terminal event must report exactly one finished turn"
+        );
+        first
+    }
+
+    /// Send into `c1`, ack it, claim the daemon id, then switch the view to
+    /// `c2` — so `c1`'s turn is still streaming, in the background, with the
+    /// client-minted key `k` behind it.
+    fn backgrounded_turn(key: Option<&str>) -> WindowState {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "how long did that take".to_string(),
+            idempotency_key: key.map(str::to_string),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        state.apply(UiMessage::StreamChunk {
+            request_id: "req-c1".to_string(),
+            chunk: "thinking".to_string(),
+        });
+        state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
+        assert!(
+            state.stream_of("c1").is_some(),
+            "precondition: c1 still streams after the switch"
+        );
+        assert!(
+            !state.is_active_conversation("c1"),
+            "precondition: c1 is backgrounded"
+        );
+        state
+    }
+
+    /// The case nobody could observe: the person sends in one conversation,
+    /// switches away, and the reply finishes while they are somewhere else. The
+    /// completion must still reach the host, naming the conversation and the
+    /// submit it closes.
+    #[test]
+    fn a_backgrounded_completion_reports_its_conversation_and_key() {
+        let mut state = backgrounded_turn(Some("submit-key"));
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-c1".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some(("c1", "req-c1", Some("submit-key"), &TurnOutcome::Completed)),
+            "a backgrounded completion must report the finished turn: {effects:?}"
+        );
+    }
+
+    /// The same for the failure path — a span closes on a failed turn too, or
+    /// it never closes at all.
+    #[test]
+    fn a_backgrounded_error_reports_its_conversation_and_key() {
+        let mut state = backgrounded_turn(Some("submit-key"));
+        let effects = state.apply(UiMessage::StreamError {
+            request_id: "req-c1".to_string(),
+            error: "the provider timed out".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some((
+                "c1",
+                "req-c1",
+                Some("submit-key"),
+                &TurnOutcome::Failed("the provider timed out".to_string())
+            )),
+            "a backgrounded error must report the finished turn: {effects:?}"
+        );
+    }
+
+    /// The in-view path reports the same thing, so a host has one rule rather
+    /// than two.
+    #[test]
+    fn an_in_view_completion_reports_the_finished_turn() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("submit-key".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-c1".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some(("c1", "req-c1", Some("submit-key"), &TurnOutcome::Completed)),
+            "an in-view completion must report the finished turn: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn an_in_view_error_reports_the_finished_turn_as_failed() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("submit-key".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamError {
+            request_id: "req-c1".to_string(),
+            error: "boom".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some((
+                "c1",
+                "req-c1",
+                Some("submit-key"),
+                &TurnOutcome::Failed("boom".to_string())
+            )),
+            "an in-view error must report the finished turn: {effects:?}"
+        );
+    }
+
+    /// A turn this client never sent (a voice turn, or another client) carries
+    /// no key, so a host is told plainly that it holds no span for it.
+    #[test]
+    fn an_adopted_external_turn_reports_no_key() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "req-ext".to_string(),
+            content: "asked by voice".to_string(),
+            idempotency_key: None,
+        });
+        assert!(state.stream_external(), "precondition: the turn was adopted");
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-ext".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some(("c1", "req-ext", None, &TurnOutcome::Completed)),
+            "an adopted external turn reports its conversation but no key: {effects:?}"
+        );
+    }
+
+    /// A keyless send (a host that mints no key) still reports its
+    /// conversation, so correlation degrades rather than disappearing.
+    #[test]
+    fn a_keyless_send_still_reports_its_conversation() {
+        let mut state = backgrounded_turn(None);
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-c1".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some(("c1", "req-c1", None, &TurnOutcome::Completed)),
+            "a keyless turn still names its conversation: {effects:?}"
+        );
+    }
+
+    /// The completion of one turn must reach the host before the queue flush
+    /// starts the next one, or a host nests the new turn inside the old span.
+    #[test]
+    fn a_finished_turn_is_reported_before_the_queue_flushs_next_send() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "and another thing".to_string(),
+            idempotency_key: Some("queued-key".to_string()),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        let finished = effects
+            .iter()
+            .position(|e| matches!(e, Effect::TurnFinished { .. }))
+            .expect("the completed turn must be reported");
+        let next_send = effects
+            .iter()
+            .position(|e| matches!(e, Effect::SendPrompt { .. }))
+            .expect("the queued follow-up must flush");
+        assert!(
+            finished < next_send,
+            "the finished turn must be reported before the next send starts: {effects:?}"
+        );
+    }
+
+    /// Several sends queued mid-stream flush as ONE turn that adopts the first
+    /// queued key. The finished turn reports that same key, so the host closes
+    /// the span the fold actually kept.
+    #[test]
+    fn a_flushed_turn_reports_the_key_the_flush_adopted() {
+        let mut state = mid_stream_state("c1", "c1");
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "a".to_string(),
+            idempotency_key: Some("ka".to_string()),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "b".to_string(),
+            idempotency_key: Some("kb".to_string()),
+        });
+        // Finish the first turn: the queue flushes as one combined send.
+        state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "first answer".to_string(),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-2".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-flush".to_string(),
+            full_response: "second answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some(("c1", "req-flush", Some("ka"), &TurnOutcome::Completed)),
+            "the flushed turn reports the key it adopted: {effects:?}"
+        );
+    }
+
+    /// A completion for a stream the reducer does not own reports nothing. The
+    /// reducer's own view is what a host acts on, so a stray daemon id must not
+    /// close a span.
+    #[test]
+    fn an_unrouted_completion_reports_no_finished_turn() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-nobody-owns".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            None,
+            "an unrouted completion must report no finished turn: {effects:?}"
+        );
+    }
+
+    /// A send that never reached the daemon leaves no key behind, so the next
+    /// turn in the same conversation is not reported under the failed send's
+    /// key.
+    #[test]
+    fn a_failed_send_does_not_leak_its_key_onto_the_next_turn() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "lost".to_string(),
+            idempotency_key: Some("dead-key".to_string()),
+        });
+        state.apply(UiMessage::SendFailed {
+            conversation_id: "c1".to_string(),
+            prompt: "lost".to_string(),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "retry".to_string(),
+            idempotency_key: Some("live-key".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-2".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-c1".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some(("c1", "req-c1", Some("live-key"), &TurnOutcome::Completed)),
+            "the finished turn must report the send that reached the daemon: {effects:?}"
         );
     }
 }
