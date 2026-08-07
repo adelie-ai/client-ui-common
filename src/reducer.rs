@@ -168,7 +168,7 @@ struct ConversationModel {
     /// Why no clear on failure: `commit_send` is the ONLY writer and it always
     /// overwrites, and it is the only path that reaches a `PromptSent` at all.
     /// So a send that fails cannot leave a key for a later turn to be reported
-    /// under — the next send replaces it before any ack can read it.
+    /// under. The next send replaces it before any ack can read it.
     pending_send_key: Option<String>,
 }
 
@@ -731,7 +731,7 @@ fn say_this_text(arguments: &serde_json::Value) -> Option<String> {
 pub enum TurnOutcome {
     /// The reply finished normally.
     Completed,
-    /// The turn failed. Carries the daemon's error text — the same text
+    /// The turn failed. Carries the daemon's error text, the same text
     /// [`Effect::SetStatusText`] surfaces on the status line.
     Failed(String),
 }
@@ -926,7 +926,7 @@ pub enum Effect {
     },
 
     // --- Turn-completion correlation (#51) --------------------------------
-    /// A turn's reply stream reached a terminal state — it completed, or it
+    /// A turn's reply stream reached a terminal state. It completed, or it
     /// failed. Emitted for EVERY stream the reducer routes, including one whose
     /// conversation is not the one in view, which is the whole point: a
     /// backgrounded turn used to end with zero effects, so a host executor that
@@ -935,7 +935,7 @@ pub enum Effect {
     /// Why: a host that opens a per-turn span when the person presses send has
     /// to close it when the reply ends, and the daemon's `request_id` alone does
     /// not say which send that was. This carries the correlation the host
-    /// already held at submit time — it saw the same `conversation_id` and
+    /// already held at submit time. It saw the same `conversation_id` and
     /// `idempotency_key` on [`Effect::SendPrompt`].
     ///
     /// This reports the REDUCER's view of which stream ended, not the daemon's.
@@ -945,16 +945,16 @@ pub enum Effect {
     /// Purely informational: a host that runs no telemetry ignores it, and the
     /// reducer's own state is already settled by the time it is emitted.
     TurnFinished {
-        /// The conversation whose stream ended, as the reducer routed it —
-        /// which is the conversation the turn was sent into, not whichever one
-        /// is open now.
+        /// The conversation whose stream ended, as the reducer routed it. That
+        /// is the conversation the turn was sent into, not whichever one is
+        /// open now.
         conversation_id: String,
         /// The daemon's turn id for the stream that ended.
         request_id: String,
         /// The client-minted idempotency key of the send behind this turn, so a
         /// host can name the exact [`UiMessage::SubmitPrompt`] it closes.
         /// `None` for a keyless send and for an adopted external turn (a voice
-        /// turn, or another client) that this client never sent — a key-minting
+        /// turn, or another client) that this client never sent. A key-minting
         /// host reads `None` as "I hold no span for this".
         ///
         /// A queue flush sends several submits as ONE turn and adopts the first
@@ -1758,7 +1758,7 @@ impl WindowState {
                 let is_active = self.is_active_conversation(&origin);
                 // The turn is over: report it so a host can close a per-turn
                 // span (#51). Built here, while the stream is still in hand, and
-                // emitted on BOTH paths below — the backgrounded one included,
+                // emitted on BOTH paths below, the backgrounded one included,
                 // which is the path a host could not observe at all.
                 let finished = Effect::TurnFinished {
                     conversation_id: origin.clone(),
@@ -6726,7 +6726,7 @@ mod tests {
     }
 
     /// Send into `c1`, ack it, claim the daemon id, then switch the view to
-    /// `c2` — so `c1`'s turn is still streaming, in the background, with the
+    /// `c2`, so `c1`'s turn is still streaming, in the background, with the
     /// client-minted key `k` behind it.
     fn backgrounded_turn(key: Option<&str>) -> WindowState {
         let mut state = WindowState::default().with_open(detail("c1", vec![]));
@@ -6772,7 +6772,7 @@ mod tests {
         );
     }
 
-    /// The same for the failure path — a span closes on a failed turn too, or
+    /// The same for the failure path. A span closes on a failed turn too, or
     /// it never closes at all.
     #[test]
     fn a_backgrounded_error_reports_its_conversation_and_key() {

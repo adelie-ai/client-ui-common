@@ -774,7 +774,7 @@ impl Engine {
             } => self.spawn_submit_tool_result(task_id, tool_call_id, result),
             // A turn ended. The reducer reports it so a host can close a
             // per-turn span; this engine keeps no spans, so it only records the
-            // correlation on the log line. Ids and an outcome only — no prompt
+            // correlation on the log line. Ids and an outcome only, no prompt
             // and no reply text.
             Effect::TurnFinished {
                 conversation_id,
