@@ -169,6 +169,13 @@ struct ConversationModel {
     /// overwrites, and it is the only path that reaches a `PromptSent` at all.
     /// So a send that fails cannot leave a key for a later turn to be reported
     /// under. The next send replaces it before any ack can read it.
+    ///
+    /// One send at a time is the limit, and it is the reducer's limit rather
+    /// than this field's: a conversation models ONE stream, so a second send
+    /// that leaves before the first is acked already loses the first turn's
+    /// stream when the second ack replaces it. In that state the key reported
+    /// for the surviving turn is the later send's. Do not read this field as a
+    /// per-send record; it holds the most recent send that has not been acked.
     pending_send_key: Option<String>,
 }
 
@@ -405,10 +412,55 @@ impl WindowState {
     /// Part of the shared public API for view clients that own their connection
     /// lifecycle outside the reducer (the TUI drives reconnect from its run loop,
     /// not from a `Disconnected` message).
-    pub fn reset_streaming_state(&mut self) {
-        for model in self.open.values_mut() {
-            model.stream = None;
-        }
+    ///
+    /// Returns one [`Effect::TurnFinished`] per turn it ended (#51). A turn
+    /// dropped here never completes, so a host that opened a per-turn span for
+    /// it has nothing else to close the span with. A caller that runs no
+    /// telemetry can ignore the result; the state change is the same either way.
+    pub fn reset_streaming_state(&mut self) -> Vec<Effect> {
+        self.end_every_turn("Streaming state reset")
+    }
+
+    /// Drop every conversation's in-flight stream and report each one as a
+    /// failed turn, for a teardown that ends turns without a reply (#51).
+    ///
+    /// Why: `StreamComplete` and `StreamError` are not the only ways a turn
+    /// ends. The connection can drop mid-turn, and a turn dropped in silence
+    /// leaves a host's per-turn span open for the life of the process. `reason`
+    /// becomes the outcome text, so it must name the teardown rather than any
+    /// content of the turn.
+    ///
+    /// Reports are ordered by conversation id so the effect list is
+    /// deterministic, rather than following the `open` map's hash order.
+    fn end_every_turn(&mut self, reason: &str) -> Vec<Effect> {
+        let mut ended: Vec<Effect> = self
+            .open
+            .iter_mut()
+            .filter_map(|(conversation_id, model)| {
+                let stream = model.stream.take()?;
+                Some(Effect::TurnFinished {
+                    conversation_id: conversation_id.clone(),
+                    // A turn torn down inside the `__pending__` window never
+                    // received a daemon id. Empty says "unknown", the same way
+                    // an id-less ack leaves `task_id` empty.
+                    request_id: stream.request_id.unwrap_or_default(),
+                    idempotency_key: stream.idempotency_key,
+                    outcome: TurnOutcome::Failed(reason.to_string()),
+                })
+            })
+            .collect();
+        ended.sort_by(|a, b| match (a, b) {
+            (
+                Effect::TurnFinished {
+                    conversation_id: x, ..
+                },
+                Effect::TurnFinished {
+                    conversation_id: y, ..
+                },
+            ) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        ended
     }
 
     /// The currently-open conversation's loaded detail, or `None` when nothing
@@ -731,8 +783,16 @@ fn say_this_text(arguments: &serde_json::Value) -> Option<String> {
 pub enum TurnOutcome {
     /// The reply finished normally.
     Completed,
-    /// The turn failed. Carries the daemon's error text, the same text
-    /// [`Effect::SetStatusText`] surfaces on the status line.
+    /// The turn failed, or a teardown ended it before a reply arrived. Carries
+    /// the failure text: the daemon's own error, the same text
+    /// [`Effect::SetStatusText`] surfaces, or the reason a disconnect gave.
+    ///
+    /// Treat this string as UNTRUSTED FOR TELEMETRY. It comes from the daemon
+    /// or from a provider, and neither promises to keep conversation content
+    /// out of it - a content-moderation refusal can quote the text it refused.
+    /// So it may go to a user-facing message and to a DEBUG log, and it must
+    /// not go on a span field or an INFO line, which carry ids and durations
+    /// only. Match on the variant when all you need is "did this turn fail".
     Failed(String),
 }
 
@@ -926,11 +986,16 @@ pub enum Effect {
     },
 
     // --- Turn-completion correlation (#51) --------------------------------
-    /// A turn's reply stream reached a terminal state. It completed, or it
-    /// failed. Emitted for EVERY stream the reducer routes, including one whose
-    /// conversation is not the one in view, which is the whole point: a
-    /// backgrounded turn used to end with zero effects, so a host executor that
-    /// watches effects could not observe it at all.
+    /// A turn ended. It completed, it failed, or a teardown ended it before a
+    /// reply arrived. Emitted for EVERY turn the reducer was tracking,
+    /// including one whose conversation is not the one in view, which is the
+    /// whole point: a backgrounded turn used to end with zero effects, so a
+    /// host executor that watches effects could not observe it at all.
+    ///
+    /// Four paths produce it: [`UiMessage::StreamComplete`],
+    /// [`UiMessage::StreamError`], [`UiMessage::Disconnected`], and
+    /// [`WindowState::reset_streaming_state`]. Together they cover every way a
+    /// turn leaves the reducer, so a span opened at submit always has a close.
     ///
     /// Why: a host that opens a per-turn span when the person presses send has
     /// to close it when the reply ends, and the daemon's `request_id` alone does
@@ -949,7 +1014,9 @@ pub enum Effect {
         /// is the conversation the turn was sent into, not whichever one is
         /// open now.
         conversation_id: String,
-        /// The daemon's turn id for the stream that ended.
+        /// The daemon's turn id for the stream that ended. Empty when a
+        /// teardown ended the turn before that id arrived, the same way an
+        /// id-less ack leaves a task id empty.
         request_id: String,
         /// The client-minted idempotency key of the send behind this turn, so a
         /// host can name the exact [`UiMessage::SubmitPrompt`] it closes.
@@ -2178,19 +2245,19 @@ impl WindowState {
                 // "[Connection lost]" stub only to the *open* conversation's
                 // stream — a backgrounded stream's partial was never persisted
                 // daemon-side, so it is simply discarded.
-                let active_stream = self
+                let active_partial = self
                     .current_conversation_id
                     .clone()
-                    .and_then(|id| self.open.get_mut(&id))
-                    .and_then(|m| m.stream.take());
-                // Clear every remaining (backgrounded) stream without finalizing.
-                for model in self.open.values_mut() {
-                    model.stream = None;
-                }
-                if let Some(stream) = active_stream
-                    && !stream.buffer.is_empty()
-                {
-                    let full = format!("{}\n\n[Connection lost]", stream.buffer);
+                    .and_then(|id| self.open.get(&id))
+                    .and_then(|m| m.stream.as_ref())
+                    .map(|s| s.buffer.clone())
+                    .filter(|buffer| !buffer.is_empty());
+                // Drop every stream, and report each turn it ended so a host can
+                // close its per-turn span (#51). Every turn in flight is over:
+                // the link that would have finished them is gone.
+                let ended = self.end_every_turn(&format!("Disconnected: {reason}"));
+                if let Some(buffer) = active_partial {
+                    let full = format!("{buffer}\n\n[Connection lost]");
                     if let Some(conv) = self.current_conversation_mut() {
                         conv.messages.push(ChatMessage {
                             // Local connection-lost stub: no server id
@@ -2207,6 +2274,9 @@ impl WindowState {
                     }
                     effects.push(Effect::CompleteStreaming(full));
                 }
+                // After the render, so the partial is on screen before the turn
+                // is called over.
+                effects.extend(ended);
                 effects
             }
         }
@@ -4880,7 +4950,8 @@ mod tests {
             .last()
             .unwrap();
         assert_eq!(last.content, "half a thought\n\n[Connection lost]");
-        // Effects: clear client, desensitize send, status text, then finalize.
+        // Effects: clear client, desensitize send, status text, finalize, then
+        // report the turn the disconnect ended.
         assert!(
             matches!(
                 effects.as_slice(),
@@ -4889,7 +4960,10 @@ mod tests {
                     Effect::SetSendSensitive(false),
                     Effect::SetStatusText(t),
                     Effect::CompleteStreaming(c),
-                ] if t == "Disconnected: socket closed" && c == "half a thought\n\n[Connection lost]"
+                    Effect::TurnFinished { conversation_id, .. },
+                ] if t == "Disconnected: socket closed"
+                    && c == "half a thought\n\n[Connection lost]"
+                    && conversation_id == "c1"
             ),
             "unexpected effects: {effects:?}"
         );
@@ -6994,6 +7068,108 @@ mod tests {
             turn_finished(&effects),
             Some(("c1", "req-c1", Some("live-key"), &TurnOutcome::Completed)),
             "the finished turn must report the send that reached the daemon: {effects:?}"
+        );
+    }
+
+    // --- Turns that end without a reply (#51) -----------------------------
+    //
+    // A completion and an error are not the only ways a turn ends. Teardown
+    // drops every in-flight stream, and a turn dropped without a report leaves
+    // a host span open for the life of the process.
+
+    /// Every `TurnFinished` in an effect list, sorted by conversation, as
+    /// (conversation, request id, key, outcome).
+    fn turns_finished(effects: &[Effect]) -> Vec<(&str, &str, Option<&str>, &TurnOutcome)> {
+        let mut found: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::TurnFinished {
+                    conversation_id,
+                    request_id,
+                    idempotency_key,
+                    outcome,
+                } => Some((
+                    conversation_id.as_str(),
+                    request_id.as_str(),
+                    idempotency_key.as_deref(),
+                    outcome,
+                )),
+                _ => None,
+            })
+            .collect();
+        found.sort_by_key(|(id, ..)| *id);
+        found
+    }
+
+    /// A disconnect ends every turn in flight, in view and backgrounded alike.
+    #[test]
+    fn a_disconnect_reports_every_turn_it_ends() {
+        let mut state = two_streams_state();
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        let lost = TurnOutcome::Failed("Disconnected: socket closed".to_string());
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("c1", "req-c1", None, &lost), ("c2", "req-c2", None, &lost),],
+            "a disconnect must report both the backgrounded turn and the one in view: {effects:?}"
+        );
+    }
+
+    /// A turn torn down inside the `__pending__` window has no daemon id yet.
+    /// It still reports, keyed by the send, so the host closes the right span.
+    #[test]
+    fn a_disconnect_reports_a_turn_whose_daemon_id_never_arrived() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "hello".to_string(),
+            idempotency_key: Some("submit-key".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        assert!(
+            state.stream_unclaimed(),
+            "precondition: the daemon id has not arrived yet"
+        );
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        let lost = TurnOutcome::Failed("Disconnected: socket closed".to_string());
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("c1", "", Some("submit-key"), &lost)],
+            "an unclaimed turn reports an empty request id and its send key: {effects:?}"
+        );
+    }
+
+    /// The TUI drives its own reconnect and resets the reducer's streaming
+    /// state directly. That ends turns too, so it hands back the reports.
+    #[test]
+    fn resetting_streaming_state_reports_every_turn_it_ends() {
+        let mut state = two_streams_state();
+        let effects = state.reset_streaming_state();
+        let lost = TurnOutcome::Failed("Streaming state reset".to_string());
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("c1", "req-c1", None, &lost), ("c2", "req-c2", None, &lost),],
+            "a reset must report every turn it drops: {effects:?}"
+        );
+        assert!(!state.is_streaming(), "and it still drops them");
+    }
+
+    /// Teardown with nothing in flight reports nothing.
+    #[test]
+    fn a_disconnect_with_no_turn_in_flight_reports_none() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        assert_eq!(
+            turns_finished(&effects),
+            vec![],
+            "no turn was in flight, so none finished: {effects:?}"
         );
     }
 }

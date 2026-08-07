@@ -773,16 +773,19 @@ impl Engine {
                 result,
             } => self.spawn_submit_tool_result(task_id, tool_call_id, result),
             // A turn ended. The reducer reports it so a host can close a
-            // per-turn span; this engine keeps no spans, so it only records the
-            // correlation on the log line. Ids and an outcome only, no prompt
-            // and no reply text.
+            // per-turn span; this engine keeps no spans, so it records the
+            // correlation on one log line instead. That line is what an
+            // operator greps to find a turn, so it is INFO, and it carries ids
+            // and a flag only. The failure TEXT stays off it deliberately:
+            // INFO never carries content, and that string is not guaranteed to
+            // be free of it.
             Effect::TurnFinished {
                 conversation_id,
                 request_id,
                 idempotency_key,
                 outcome,
             } => {
-                tracing::debug!(
+                tracing::info!(
                     conversation_id,
                     request_id,
                     idempotency_key,
