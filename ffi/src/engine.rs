@@ -1020,6 +1020,9 @@ impl Engine {
         };
         let override_selection = self.staged_override.clone();
         let tx = self.self_tx.clone();
+        // Kept for the ack: the send call consumes the key, and the reducer
+        // needs it back to tie the turn to this send (#51).
+        let echoed_key = idempotency_key.clone();
         tokio::spawn(async move {
             let refinement = system_refinement.as_deref().unwrap_or("");
             // Forward the client-minted idempotency key on the `SendMessage` wire
@@ -1064,6 +1067,10 @@ impl Engine {
                     let _ = tx.send(ui(UiMessage::PromptSent {
                         task_id,
                         conversation_id,
+                        // Echo the key this send carried, so the reducer ties
+                        // the turn to the send that started it rather than
+                        // guessing which of several in flight it answers (#51).
+                        idempotency_key: echoed_key,
                     }));
                 }
                 Err(e) => {

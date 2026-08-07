@@ -67,9 +67,9 @@ struct StreamState {
     task_id: String,
     /// The client-minted idempotency key of the send that started this turn
     /// (#570), carried through to [`Effect::TurnFinished`] so a host can name
-    /// the submit a completion closes out (#51). Taken from the conversation
-    /// model's [`pending_send_key`](ConversationModel::pending_send_key) when
-    /// the ack opens the stream. `None` for a keyless send and for an
+    /// the submit a completion closes out (#51). Echoed onto this stream by the
+    /// [`UiMessage::PromptSent`] ack that opened it, which is the only place
+    /// that knows which send it answers. `None` for a keyless send and for an
     /// [`external`](Self::external) turn this client never sent.
     idempotency_key: Option<String>,
 }
@@ -160,23 +160,6 @@ struct ConversationModel {
     /// own partial here while the open one renders live, and switching back
     /// re-seeds the buffered prefix. See [`StreamState`].
     stream: Option<StreamState>,
-    /// The idempotency key of a send that has left the reducer but is not yet
-    /// acked, held so the ack can put it on the stream it opens (#51). Set by
-    /// [`commit_send`](WindowState::commit_send) and taken by
-    /// [`UiMessage::PromptSent`]. `None` for a keyless send.
-    ///
-    /// Why no clear on failure: `commit_send` is the ONLY writer and it always
-    /// overwrites, and it is the only path that reaches a `PromptSent` at all.
-    /// So a send that fails cannot leave a key for a later turn to be reported
-    /// under. The next send replaces it before any ack can read it.
-    ///
-    /// One send at a time is the limit, and it is the reducer's limit rather
-    /// than this field's: a conversation models ONE stream, so a second send
-    /// that leaves before the first is acked already loses the first turn's
-    /// stream when the second ack replaces it. In that state the key reported
-    /// for the surviving turn is the later send's. Do not read this field as a
-    /// per-send record; it holds the most recent send that has not been acked.
-    pending_send_key: Option<String>,
 }
 
 /// Shared mutable state for the window.
@@ -642,12 +625,6 @@ impl WindowState {
         // the outbox — the composer may hold an unrelated fresh draft that must
         // survive (a switch-back flush would otherwise wipe it; see the flush
         // paths). The one caller that consumes the composer clears it itself.
-        // Park the send's key until the ack opens this turn's stream (#51), so
-        // the completion can name the submit it closes. Held on the model, not
-        // the stream, because the stream does not exist until the ack arrives.
-        if let Some(model) = self.open.get_mut(&conversation_id) {
-            model.pending_send_key = idempotency_key.clone();
-        }
         let system_refinement = refinement_for_send(self).map(str::to_string);
         vec![Effect::SendPrompt {
             conversation_id,
@@ -1568,6 +1545,7 @@ impl WindowState {
             UiMessage::PromptSent {
                 task_id,
                 conversation_id,
+                idempotency_key,
             } => {
                 // The wire ack carries either a `task_id` (post-#114
                 // `SendMessageAck`) or an empty string (legacy `Ack`). Neither
@@ -1587,22 +1565,38 @@ impl WindowState {
                 // background-task handle Cancel acts on, so it lets a view offer
                 // Cancel for this turn until the stream terminates (empty for a
                 // legacy id-less ack — no Cancel then).
-                let model = self.open.entry(conversation_id).or_default();
+                let model = self.open.entry(conversation_id.clone()).or_default();
                 // The daemon accepted the send (#25): the flush is now its
                 // responsibility, so drop the client-side copy held for
                 // restore-on-failure. No-op for a direct send (empty).
                 model.pending_flush.clear();
-                model.stream = Some(StreamState {
+                let replaced = model.stream.replace(StreamState {
                     request_id: None,
                     buffer: String::new(),
                     say_this_spoken_this_turn: false,
                     external: false,
                     task_id,
-                    // Move the parked send key onto the turn it started (#51),
-                    // so the completion names the submit it closes.
-                    idempotency_key: model.pending_send_key.take(),
+                    // The ack names its own send, so this turn is keyed by the
+                    // send that started it and by no other (#51).
+                    idempotency_key,
                 });
-                vec![]
+                // A stream was already here, so a second send left before this
+                // ack and the conversation cannot model both. The turn just
+                // replaced is lost - that is #53, and it predates the report -
+                // but its END is not: a host holds a span for it, opened at its
+                // own submit. Report it under ITS key, so the host closes that
+                // span rather than leaving it open or, worse, closing it later
+                // under the surviving turn's key and recording a duration that
+                // reads plausible and belongs to a different turn.
+                match replaced {
+                    Some(stream) => vec![Effect::TurnFinished {
+                        conversation_id,
+                        request_id: stream.request_id.unwrap_or_default(),
+                        idempotency_key: stream.idempotency_key,
+                        outcome: TurnOutcome::Failed("Replaced by a later send".to_string()),
+                    }],
+                    None => vec![],
+                }
             }
             UiMessage::UserMessageAdded {
                 conversation_id,
@@ -2710,6 +2704,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "ack-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         assert!(
             state.stream_unclaimed(),
@@ -2801,8 +2796,14 @@ mod tests {
         let effects = state.apply(UiMessage::PromptSent {
             task_id: "ack-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
-        assert!(effects.is_empty(), "PromptSent performs no widget effects");
+        assert!(
+            !effects
+                .iter()
+                .any(|e| !matches!(e, Effect::TurnFinished { .. })),
+            "PromptSent performs no widget effects: {effects:?}"
+        );
         assert!(
             state.stream_unclaimed(),
             "the request id is the __pending__ sentinel until the first frame claims it"
@@ -2824,6 +2825,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "ack-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(state.stream_conversation_id(), Some("c1"));
     }
@@ -2842,6 +2844,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-42".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(state.active_task_id_for_view().as_deref(), Some("task-42"));
     }
@@ -2865,6 +2868,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-42".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         // The unique pending stream claims this completion.
         state.apply(UiMessage::StreamComplete {
@@ -2890,6 +2894,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-42".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::StreamError {
             request_id: "r1".to_string(),
@@ -2913,6 +2918,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: String::new(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         assert!(
             state.streaming_is_active_for_view(),
@@ -2964,6 +2970,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-bg".to_string(),
             conversation_id: "c2".to_string(),
+            idempotency_key: None,
         });
         assert_eq!(
             state.active_task_id_for_view(),
@@ -2988,6 +2995,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "t-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::StreamError {
             request_id: "r1".to_string(),
@@ -3035,6 +3043,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "t-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         // A second send while streaming is QUEUED, not sent.
         state.apply(UiMessage::SubmitPrompt {
@@ -3065,6 +3074,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "t-2".to_string(),
             conversation_id: "c2".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::StreamError {
             request_id: "r2".to_string(),
@@ -3087,6 +3097,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "t-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         state.apply(UiMessage::StreamComplete {
             request_id: "r1".to_string(),
@@ -3951,6 +3962,7 @@ mod tests {
         let ack = state.apply(UiMessage::PromptSent {
             task_id: String::new(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         assert!(
             !ack.iter().any(|e| matches!(e, Effect::AddUserMessage(_))),
@@ -4088,6 +4100,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "t1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         // A late/duplicate failure must not re-queue an already-sent message.
         state.apply(UiMessage::SendFailed {
@@ -6031,6 +6044,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: String::new(),
             conversation_id: "c1".to_string(),
+            idempotency_key: None,
         });
         let effects = state.apply(UiMessage::UserMessageAdded {
             conversation_id: "c1".to_string(),
@@ -6814,6 +6828,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: key.map(str::to_string),
         });
         state.apply(UiMessage::StreamChunk {
             request_id: "req-c1".to_string(),
@@ -6882,6 +6897,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: Some("submit-key".to_string()),
         });
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-c1".to_string(),
@@ -6904,6 +6920,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: Some("submit-key".to_string()),
         });
         let effects = state.apply(UiMessage::StreamError {
             request_id: "req-c1".to_string(),
@@ -7012,6 +7029,9 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-2".to_string(),
             conversation_id: "c1".to_string(),
+            // The executor echoes the key it was handed on the flush's
+            // `SendPrompt`, which is the first queued message's.
+            idempotency_key: Some("ka".to_string()),
         });
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-flush".to_string(),
@@ -7062,6 +7082,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-2".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: Some("live-key".to_string()),
         });
         let effects = state.apply(UiMessage::StreamComplete {
             request_id: "req-c1".to_string(),
@@ -7131,6 +7152,7 @@ mod tests {
         state.apply(UiMessage::PromptSent {
             task_id: "task-1".to_string(),
             conversation_id: "c1".to_string(),
+            idempotency_key: Some("submit-key".to_string()),
         });
         assert!(
             state.stream_unclaimed(),
@@ -7160,6 +7182,117 @@ mod tests {
             "a reset must report every turn it drops: {effects:?}"
         );
         assert!(!state.is_streaming(), "and it still drops them");
+    }
+
+    // --- Turns an ack replaces (#51) --------------------------------------
+    //
+    // A send leaves before the previous one is acked, so two acks arrive for
+    // one conversation. The second replaces the first turn's stream. The turn
+    // itself is lost, which is #53 and pre-existing, but its report must not
+    // be: a host holds a span for it, and a span that never closes is a leak
+    // while a span closed under another turn's key is a wrong number.
+
+    /// The ack that replaces a turn reports the turn it replaced.
+    #[test]
+    fn an_ack_that_replaces_a_turn_reports_the_one_it_replaced() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-a".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::StreamChunk {
+            request_id: "req-a".to_string(),
+            chunk: "partial".to_string(),
+        });
+        let effects = state.apply(UiMessage::PromptSent {
+            task_id: "task-b".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: Some("key-b".to_string()),
+        });
+        assert_eq!(
+            turn_finished(&effects),
+            Some((
+                "c1",
+                "req-a",
+                Some("key-a"),
+                &TurnOutcome::Failed("Replaced by a later send".to_string())
+            )),
+            "the replaced turn must be reported, under its OWN key: {effects:?}"
+        );
+    }
+
+    /// Two sends that overlap close two spans, each under the key of the send
+    /// that opened it. Neither host span is left open, and neither closes under
+    /// the other's key.
+    #[test]
+    fn two_overlapping_sends_report_their_own_keys() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        // Both sends leave before either is acked: the reducer's send gate keys
+        // off the stream, and no stream exists until an ack arrives.
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "first".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "second".to_string(),
+            idempotency_key: Some("key-b".to_string()),
+        });
+        let first_ack = state.apply(UiMessage::PromptSent {
+            task_id: "task-a".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        assert_eq!(
+            turn_finished(&first_ack),
+            None,
+            "the first ack replaces nothing: {first_ack:?}"
+        );
+        let second_ack = state.apply(UiMessage::PromptSent {
+            task_id: "task-b".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: Some("key-b".to_string()),
+        });
+        assert_eq!(
+            turn_finished(&second_ack).map(|(_, _, key, _)| key),
+            Some(Some("key-a")),
+            "the replaced turn closes under key-a, not key-b: {second_ack:?}"
+        );
+        let done = state.apply(UiMessage::StreamComplete {
+            request_id: "req-b".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&done),
+            Some(("c1", "req-b", Some("key-b"), &TurnOutcome::Completed)),
+            "the surviving turn closes under key-b: {done:?}"
+        );
+    }
+
+    /// The ack carries the key, so the reducer never guesses which send it
+    /// belongs to. An ack whose send this client did not key reports no key
+    /// rather than borrowing one from another send in flight.
+    #[test]
+    fn an_ack_without_a_key_does_not_borrow_one() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.apply(UiMessage::SubmitPrompt {
+            prompt: "keyed".to_string(),
+            idempotency_key: Some("key-a".to_string()),
+        });
+        state.apply(UiMessage::PromptSent {
+            task_id: "task-x".to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: None,
+        });
+        let done = state.apply(UiMessage::StreamComplete {
+            request_id: "req-x".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert_eq!(
+            turn_finished(&done),
+            Some(("c1", "req-x", None, &TurnOutcome::Completed)),
+            "a keyless ack must not pick up another send's key: {done:?}"
+        );
     }
 
     /// Teardown with nothing in flight reports nothing.
