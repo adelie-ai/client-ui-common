@@ -162,12 +162,13 @@ struct ConversationModel {
     stream: Option<StreamState>,
     /// The idempotency key of a send that has left the reducer but is not yet
     /// acked, held so the ack can put it on the stream it opens (#51). Set by
-    /// [`commit_send`](WindowState::commit_send), taken by
-    /// [`UiMessage::PromptSent`], and dropped by [`UiMessage::SendFailed`] —
-    /// the same window `pending_flush` covers, and cleared the same way, so a
-    /// send that never reached the daemon leaves no key behind for the next
-    /// turn to be reported under. `None` outside that window and for a keyless
-    /// send.
+    /// [`commit_send`](WindowState::commit_send) and taken by
+    /// [`UiMessage::PromptSent`]. `None` for a keyless send.
+    ///
+    /// Why no clear on failure: `commit_send` is the ONLY writer and it always
+    /// overwrites, and it is the only path that reaches a `PromptSent` at all.
+    /// So a send that fails cannot leave a key for a later turn to be reported
+    /// under — the next send replaces it before any ack can read it.
     pending_send_key: Option<String>,
 }
 
@@ -1478,12 +1479,6 @@ impl WindowState {
                 // the front of the outbox (they were queued before anything typed
                 // since). A direct send leaves `pending_flush` empty, so this is a
                 // no-op there — no phantom queue entries.
-                // The send never reached the daemon, so no turn will ever start
-                // under its key: drop it rather than let the next turn in this
-                // conversation be reported under it (#51).
-                if let Some(model) = self.open.get_mut(&conversation_id) {
-                    model.pending_send_key = None;
-                }
                 let requeued = match self.open.get_mut(&conversation_id) {
                     Some(model) if !model.pending_flush.is_empty() => {
                         let restored = std::mem::take(&mut model.pending_flush);
