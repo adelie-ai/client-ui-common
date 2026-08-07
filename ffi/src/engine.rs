@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use client_ui_common::{
-    AdeleOutput, Effect, UiMessage, WindowState, interactive_default_from_purposes,
+    AdeleOutput, Effect, TurnOutcome, UiMessage, WindowState, interactive_default_from_purposes,
     signal_to_ui_message, voice_mode_client_tools,
 };
 use desktop_assistant_api_model as api;
@@ -772,6 +772,27 @@ impl Engine {
                 tool_call_id,
                 result,
             } => self.spawn_submit_tool_result(task_id, tool_call_id, result),
+            // A turn ended. The reducer reports it so a host can close a
+            // per-turn span; this engine keeps no spans, so it records the
+            // correlation on one log line instead. That line is what an
+            // operator greps to find a turn, so it is INFO, and it carries ids
+            // and a flag only. The failure TEXT stays off it deliberately:
+            // INFO never carries content, and that string is not guaranteed to
+            // be free of it.
+            Effect::TurnFinished {
+                conversation_id,
+                request_id,
+                idempotency_key,
+                outcome,
+            } => {
+                tracing::info!(
+                    conversation_id,
+                    request_id,
+                    idempotency_key,
+                    failed = matches!(outcome, TurnOutcome::Failed(_)),
+                    "turn finished"
+                );
+            }
             // `try_from_view_effect` returns `Err` only for the RPC set above;
             // a brand-new effect variant would land here — assert in debug so a
             // future wiring gap is loud, and log (not panic) in release.
@@ -999,6 +1020,9 @@ impl Engine {
         };
         let override_selection = self.staged_override.clone();
         let tx = self.self_tx.clone();
+        // Kept for the ack: the send call consumes the key, and the reducer
+        // needs it back to tie the turn to this send (#51).
+        let echoed_key = idempotency_key.clone();
         tokio::spawn(async move {
             let refinement = system_refinement.as_deref().unwrap_or("");
             // Forward the client-minted idempotency key on the `SendMessage` wire
@@ -1043,6 +1067,10 @@ impl Engine {
                     let _ = tx.send(ui(UiMessage::PromptSent {
                         task_id,
                         conversation_id,
+                        // Echo the key this send carried, so the reducer ties
+                        // the turn to the send that started it rather than
+                        // guessing which of several in flight it answers (#51).
+                        idempotency_key: echoed_key,
                     }));
                 }
                 Err(e) => {

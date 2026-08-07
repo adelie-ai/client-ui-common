@@ -36,5 +36,5 @@ pub use mcp_servers::{
     server_rows_with_builtins, transport_chip,
 };
 pub use message::{UiMessage, interactive_default_from_purposes, signal_to_ui_message};
-pub use reducer::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
+pub use reducer::{Effect, TurnOutcome, WindowState, refinement_for_send, voice_mode_client_tools};
 pub use selected_models::SelectedModel;

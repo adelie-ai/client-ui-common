@@ -121,6 +121,18 @@ pub enum UiMessage {
         /// to the originating conversation even if the user switches away
         /// mid-stream.
         conversation_id: String,
+        /// The `idempotency_key` the executor was handed on
+        /// [`Effect::SendPrompt`](crate::Effect::SendPrompt) for the send this
+        /// ack answers, echoed back unchanged. `None` for a keyless send.
+        ///
+        /// Why the ack carries it rather than the reducer remembering it: a
+        /// send and its ack are one round trip, and only the executor knows
+        /// which is which. Sends can overlap - a second one leaves before the
+        /// first is acked - and a host runs each on its own task, so acks need
+        /// not come back in send order. Anything the reducer parked would have
+        /// to guess the pairing, and a wrong guess attributes a turn to the
+        /// wrong send. Echoing the key makes the pairing exact (#51).
+        idempotency_key: Option<String>,
     },
     /// The user asked to send `prompt` into the currently-open conversation
     /// (Enter / dictation). The reducer is the single decision point:
@@ -384,10 +396,12 @@ impl std::fmt::Debug for UiMessage {
             UiMessage::PromptSent {
                 task_id,
                 conversation_id,
+                idempotency_key,
             } => f
                 .debug_struct("PromptSent")
                 .field("task_id", task_id)
                 .field("conversation_id", conversation_id)
+                .field("idempotency_key", idempotency_key)
                 .finish(),
             UiMessage::SubmitPrompt {
                 prompt,
