@@ -434,6 +434,13 @@ struct Engine {
     /// The `client-mcp.toml` surface this core resolves under; see
     /// [`DEFAULT_MCP_SURFACE`].
     mcp_surface: String,
+    /// The cancel handle last reported to the view, so
+    /// [`report_turn_state`](Self::report_turn_state) can emit only on a change.
+    ///
+    /// It mirrors the reducer rather than owning anything: the reducer is the
+    /// single source of truth, and this is one value of memory so an unchanged
+    /// answer is not re-sent on every streaming chunk.
+    active_task_id: Option<String>,
 }
 
 /// Build the `SubmitPrompt` message for a user send, minting a fresh per-send
@@ -533,6 +540,31 @@ impl Engine {
         }
         for effect in self.state.apply(msg) {
             self.run_effect(effect);
+        }
+        self.report_turn_state();
+    }
+
+    /// Carry the reducer's turn state across the C ABI.
+    ///
+    /// Two values a view needs and cannot compute: the handle that cancels the
+    /// open turn, and the prompt of a turn that just failed. adele-gtk reads
+    /// both off `WindowState` directly; a client on the far side of the ABI
+    /// holds no `WindowState`, so the engine reports them as events.
+    ///
+    /// Called after the reducer applies a message, because both answers are
+    /// derived from what that message did.
+    fn report_turn_state(&mut self) {
+        let active = self.state.active_task_id_for_view();
+        // Only on a change. A view redrawing per event would otherwise be told
+        // the same thing by every streamed chunk of a long reply.
+        if active != self.active_task_id {
+            self.active_task_id = active.clone();
+            self.sink.emit(&ViewEvent::ActiveTurn { task_id: active });
+        }
+        // One-shot by construction: taking the offer clears it, so a stale
+        // prompt cannot resurface at a later, unrelated moment.
+        if let Some(text) = self.state.take_pending_retry_prompt() {
+            self.sink.emit(&ViewEvent::RetryPrompt { text });
         }
     }
 
@@ -1270,6 +1302,7 @@ impl Core {
             // checkbox opts out via `SetShareClientContext(false)` (#549).
             share_client_context: true,
             mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
+            active_task_id: None,
         };
         runtime.spawn(engine.run(rx));
         Self {
@@ -1430,6 +1463,7 @@ mod share_context_tests {
             ws_jwt: None,
             share_client_context: true,
             mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
+            active_task_id: None,
         }
     }
 
@@ -2148,5 +2182,252 @@ enabled = ["good", "broken"]
         assert_eq!(broken.tool_count, 0);
 
         host.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod turn_state_tests {
+    //! Cover the turn-state view events: the cancel handle for the open turn,
+    //! and the one-shot retry offer for a turn that failed (#58).
+    //!
+    //! The reducer computes both. adele-gtk reads them directly because it holds
+    //! the `WindowState`; a client on the far side of the C ABI holds none and
+    //! sees only `ViewEvent` JSON. So the engine drains both after every applied
+    //! message.
+    //!
+    //! The assertions are over the emitted JSON, because the JSON is the
+    //! contract a client codes against.
+    use super::*;
+    use std::ffi::CStr;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Events the recording sink captured, oldest first.
+    ///
+    /// A `static` rather than a `user_data` pointer: the sink is an
+    /// `extern "C" fn` that captures nothing, and `emitted` holds a lock for the
+    /// whole of each case, so a shared buffer costs nothing in coverage and
+    /// avoids threading a raw pointer through the ABI for no reason.
+    fn recorded() -> &'static Mutex<Vec<String>> {
+        static EVENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Serializes the cases, which share `recorded()`.
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    extern "C" fn recording_sink(_user_data: *mut std::ffi::c_void, json: *const std::ffi::c_char) {
+        // SAFETY: the sink is only ever called by `ViewSink::emit`, which passes
+        // a NUL-terminated C string that outlives the call.
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        recorded().lock().expect("event buffer poisoned").push(text);
+    }
+
+    /// Drive an engine through `messages` and return every event it emitted.
+    fn emitted(messages: Vec<UiMessage>) -> Vec<serde_json::Value> {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        recorded().lock().expect("event buffer poisoned").clear();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut engine = Engine {
+            state: WindowState::default(),
+            connector: None,
+            mcp_host: None,
+            self_tx: tx,
+            sink: ViewSink::new(recording_sink, 0),
+            staged_override: None,
+            ws_jwt: None,
+            share_client_context: true,
+            mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
+            active_task_id: None,
+        };
+        for message in messages {
+            engine.dispatch(message);
+        }
+        recorded()
+            .lock()
+            .expect("event buffer poisoned")
+            .iter()
+            .map(|json| serde_json::from_str(json).expect("every event must be valid JSON"))
+            .collect()
+    }
+
+    /// Every `active_turn` event in order, read as its `task_id`.
+    fn handles(events: &[serde_json::Value]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter(|e| e["type"] == "active_turn")
+            .map(|e| e["task_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Every `retry_prompt` event in order, read as its `text`.
+    fn offers(events: &[serde_json::Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|e| e["type"] == "retry_prompt")
+            .map(|e| e["text"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn open(id: &str) -> UiMessage {
+        UiMessage::ConversationLoaded(api::client::ConversationDetail {
+            id: id.to_string(),
+            title: "t".to_string(),
+            messages: Vec::new(),
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled: false,
+        })
+    }
+
+    fn user_said(text: &str) -> UiMessage {
+        UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "r1".to_string(),
+            content: text.to_string(),
+            idempotency_key: None,
+        }
+    }
+
+    fn prompt_sent(task_id: &str) -> UiMessage {
+        UiMessage::PromptSent {
+            task_id: task_id.to_string(),
+            conversation_id: "c1".to_string(),
+            idempotency_key: None,
+        }
+    }
+
+    fn stream_error() -> UiMessage {
+        UiMessage::StreamError {
+            request_id: "r1".to_string(),
+            error: "timeout".to_string(),
+        }
+    }
+
+    fn stream_complete() -> UiMessage {
+        UiMessage::StreamComplete {
+            request_id: "r1".to_string(),
+            full_response: "done".to_string(),
+        }
+    }
+
+    // --- the cancel handle ---
+
+    /// A turn starting in the open conversation reports the id Cancel acts on,
+    /// so a client can offer the control without holding reducer state.
+    #[test]
+    fn a_started_turn_reports_its_cancel_handle() {
+        let events = emitted(vec![open("c1"), prompt_sent("task-42")]);
+        assert_eq!(handles(&events), vec![Some("task-42".to_string())]);
+    }
+
+    /// A finished turn is not cancelable, so the handle is withdrawn.
+    #[test]
+    fn a_completed_turn_withdraws_its_cancel_handle() {
+        let events = emitted(vec![open("c1"), prompt_sent("task-42"), stream_complete()]);
+        assert_eq!(
+            handles(&events),
+            vec![Some("task-42".to_string()), None],
+            "a completed turn must withdraw the handle"
+        );
+    }
+
+    /// Nor is an abandoned one.
+    #[test]
+    fn an_errored_turn_withdraws_its_cancel_handle() {
+        let events = emitted(vec![open("c1"), prompt_sent("task-42"), stream_error()]);
+        assert_eq!(
+            handles(&events),
+            vec![Some("task-42".to_string()), None],
+            "an errored turn must withdraw the handle"
+        );
+    }
+
+    /// A legacy daemon acks with no task id. A stream is in flight, but nothing
+    /// can cancel it, so no event says otherwise.
+    #[test]
+    fn a_turn_without_a_handle_reports_nothing() {
+        let events = emitted(vec![open("c1"), prompt_sent("")]);
+        assert!(
+            handles(&events).is_empty(),
+            "an id-less ack must report no handle, got {:?}",
+            handles(&events)
+        );
+    }
+
+    /// The event fires only on a change, so a client that redraws per event is
+    /// not told the same thing by every streaming chunk.
+    #[test]
+    fn an_unchanged_handle_is_not_repeated() {
+        let events = emitted(vec![
+            open("c1"),
+            prompt_sent("task-42"),
+            UiMessage::StreamChunk {
+                request_id: "r1".to_string(),
+                chunk: "hello".to_string(),
+            },
+            UiMessage::StreamChunk {
+                request_id: "r1".to_string(),
+                chunk: " world".to_string(),
+            },
+        ]);
+        assert_eq!(
+            handles(&events),
+            vec![Some("task-42".to_string())],
+            "streaming chunks must not re-report an unchanged handle"
+        );
+    }
+
+    // --- the retry offer ---
+
+    /// A turn that fails offers its prompt back, so a client can put it in the
+    /// composer for a one-click resend.
+    #[test]
+    fn a_failed_turn_offers_its_prompt_back() {
+        let events = emitted(vec![
+            open("c1"),
+            user_said("what is the time"),
+            prompt_sent("task-42"),
+            stream_error(),
+        ]);
+        assert_eq!(offers(&events), vec!["what is the time".to_string()]);
+    }
+
+    /// The offer is one-shot: taking it clears it, so no later message can
+    /// resurface a stale prompt into a composer.
+    #[test]
+    fn the_retry_offer_is_made_once() {
+        let events = emitted(vec![
+            open("c1"),
+            user_said("what is the time"),
+            prompt_sent("task-42"),
+            stream_error(),
+            UiMessage::StatusUpdate("something else".to_string()),
+            UiMessage::StatusUpdate("and again".to_string()),
+        ]);
+        assert_eq!(
+            offers(&events).len(),
+            1,
+            "the offer must be made once, not on every later message"
+        );
+    }
+
+    /// A turn that completes normally offers nothing back.
+    #[test]
+    fn a_completed_turn_offers_nothing_back() {
+        let events = emitted(vec![
+            open("c1"),
+            user_said("what is the time"),
+            prompt_sent("task-42"),
+            stream_complete(),
+        ]);
+        assert!(
+            offers(&events).is_empty(),
+            "a completed turn must not offer a retry"
+        );
     }
 }
