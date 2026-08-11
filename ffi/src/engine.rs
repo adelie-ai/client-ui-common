@@ -1872,6 +1872,46 @@ enabled = ["notes"]
         );
     }
 
+    /// A built-in opt-out gives the surface a section of its own. On a surface
+    /// that was inheriting `[surfaces.default]`, that section must still host the
+    /// inherited external servers: turning a built-in off says nothing about
+    /// them.
+    #[tokio::test]
+    async fn a_builtin_opt_out_keeps_the_inherited_external_servers() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[[servers]]
+name = "fs"
+command = "fileio-mcp"
+
+[[servers]]
+name = "git"
+command = "git-mcp"
+
+[surfaces.default]
+enabled = ["fs", "git"]
+"#,
+        ));
+
+        write_builtin_disabled(&path, "mac", "tasks", true)
+            .await
+            .expect("write succeeds");
+
+        let cfg = reload(&path);
+        let mut hosted: Vec<String> = cfg
+            .resolved_servers("mac")
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        hosted.sort();
+        assert_eq!(hosted, ["fs", "git"]);
+        assert_eq!(
+            cfg.surface_enabled_names("default"),
+            ["fs".to_string(), "git".to_string()],
+            "the inheritance fallback must not be edited as a side effect"
+        );
+    }
+
     /// The built-in opt-out and the client-run writes edit one file, so they
     /// must share one serialization. Driven concurrently: a lost update shows up
     /// as a missing opt-out or a missing definition.

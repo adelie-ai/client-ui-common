@@ -259,6 +259,33 @@ mod tests {
         cfg.list_defined_servers().iter().find(|s| s.name == name)
     }
 
+    /// What `surface` actually hosts, after the `[surfaces.default]` fallback and
+    /// the definition-level filter. Sorted, because the answer is a set.
+    fn names_hosted_by(cfg: &ClientMcpConfig, surface: &str) -> Vec<String> {
+        let mut names: Vec<String> = cfg
+            .resolved_servers(surface)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Two servers, both hosted by every surface through `[surfaces.default]`.
+    /// The `mac` surface has no section of its own, so it inherits them.
+    const INHERITING: &str = r#"
+[[servers]]
+name = "fs"
+command = "fileio-mcp"
+
+[[servers]]
+name = "git"
+command = "git-mcp"
+
+[surfaces.default]
+enabled = ["fs", "git"]
+"#;
+
     // --- upsert ---------------------------------------------------------------
 
     #[tokio::test]
@@ -576,6 +603,104 @@ enabled = ["notes"]
             .expect_err("a config that cannot be parsed is refused");
 
         assert_eq!(fx.raw(), broken, "the file every client reads is untouched");
+    }
+
+    // --- inheritance from [surfaces.default] ----------------------------------
+
+    /// Adding a server on a surface that inherits `[surfaces.default]` must not
+    /// un-host what it was inheriting. The write gives the surface a section of
+    /// its own, so that section has to carry the inherited names as well as the
+    /// new one.
+    #[tokio::test]
+    async fn adding_a_server_keeps_what_this_surface_inherited() {
+        let fx = Fixture::new("inherit-upsert");
+        fx.write(INHERITING);
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("upsert succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["fs", "git", "notes"]);
+    }
+
+    /// The same for the enable path: switching one server on for an inheriting
+    /// surface adds to what it hosts rather than replacing it.
+    #[tokio::test]
+    async fn enabling_a_server_keeps_what_this_surface_inherited() {
+        let fx = Fixture::new("inherit-enable");
+        fx.write(&format!(
+            r#"{INHERITING}
+[[servers]]
+name = "notes"
+command = "notes-mcp"
+"#
+        ));
+
+        ClientServerWrite::SetEnabled {
+            name: "notes".to_string(),
+            enabled: true,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("enable succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["fs", "git", "notes"]);
+    }
+
+    /// Switching one inherited server off must remove that one only. The other
+    /// inherited servers were never touched by the person doing the edit.
+    #[tokio::test]
+    async fn disabling_one_inherited_server_keeps_the_others() {
+        let fx = Fixture::new("inherit-disable");
+        fx.write(INHERITING);
+
+        ClientServerWrite::SetEnabled {
+            name: "fs".to_string(),
+            enabled: false,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("disable succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["git"]);
+    }
+
+    /// `[surfaces.default]` is the fallback every other surface reads, so an edit
+    /// made for one surface must never change it.
+    #[tokio::test]
+    async fn a_write_never_edits_the_default_surface() {
+        let fx = Fixture::new("inherit-default-untouched");
+        fx.write(INHERITING);
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("upsert succeeds");
+
+        let cfg = fx.read();
+        assert_eq!(names_enabled_for(&cfg, "default"), ["fs", "git"]);
+        assert!(cfg.surface_disabled_builtins("default").is_empty());
+    }
+
+    /// A surface that already has a section of its own inherits nothing, so the
+    /// write must not import the default list into it.
+    #[tokio::test]
+    async fn a_surface_with_its_own_section_is_not_seeded_from_default() {
+        let fx = Fixture::new("inherit-own-section");
+        fx.write(&format!(
+            r#"{INHERITING}
+[surfaces.mac]
+enabled = []
+"#
+        ));
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("upsert succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["notes"]);
     }
 
     // --- serialization --------------------------------------------------------
