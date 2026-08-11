@@ -414,6 +414,11 @@ fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &st
 /// file, so ordering one against the other is what keeps either from losing an
 /// update. The lock is held across the load, the change and the save.
 ///
+/// This write materializes a section for `surface`, so it first seeds one from
+/// `[surfaces.default]` via [`crate::client_mcp::seed_surface_from_default`] —
+/// which carries the reasoning. An opt-out from a built-in says nothing about
+/// the external servers the surface hosts, so it must not drop them.
+///
 /// An empty `name` is refused: a blank entry is inert noise every other client
 /// sharing the file would then carry.
 async fn write_builtin_disabled(
@@ -427,6 +432,7 @@ async fn write_builtin_disabled(
     }
     let _guard = crate::client_mcp::lock_writes().await;
     let mut cfg = crate::client_mcp::load_strict(path)?;
+    crate::client_mcp::seed_surface_from_default(&mut cfg, surface);
     cfg.set_builtin_disabled(surface, name, disabled);
     cfg.save(path)
 }

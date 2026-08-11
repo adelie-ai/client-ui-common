@@ -18,7 +18,9 @@
 
 use std::path::Path;
 
-use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, DEFAULT_SURFACE, McpServerConfig, SurfaceConfig,
+};
 
 /// One edit to this surface's external client-run MCP servers.
 ///
@@ -151,6 +153,7 @@ fn apply_upsert(cfg: &mut ClientMcpConfig, surface: &str, server_json: &str) -> 
         description: existing.and_then(|s| s.description.clone()),
     };
     cfg.upsert_server(server);
+    seed_surface_from_default(cfg, surface);
     cfg.set_surface_enabled(surface, &name, form.enabled);
     Ok(())
 }
@@ -178,8 +181,42 @@ fn apply_enabled(
     } else if !cfg.list_defined_servers().iter().any(|s| s.name == name) {
         return Err(format!("no such server: {name}"));
     }
+    seed_surface_from_default(cfg, surface);
     cfg.set_surface_enabled(surface, name, enabled);
     Ok(())
+}
+
+/// Give `surface` a section of its own, seeded with the servers it was
+/// inheriting from `[surfaces.default]`.
+///
+/// Every write path materializes a surface section, and an empty one does not
+/// mean the same thing as no section at all:
+/// [`ClientMcpConfig::resolved_servers`] falls back to `[surfaces.default]` only
+/// while the surface has no section, and reads an explicit empty list as "hosts
+/// nothing". So materializing an empty section un-hosts every server the surface
+/// was inheriting, none of which the person edited. Seeding first makes the new
+/// section say what the surface already hosted; the edit then adds or removes
+/// one name from it.
+///
+/// A surface that already has a section inherits nothing, so it is left alone.
+/// `[surfaces.default]` is never seeded and never changed - it is the fallback
+/// every other surface reads. Only the `enabled` list is inherited:
+/// `disabled_builtins` has no fallback to begin with.
+pub(crate) fn seed_surface_from_default(cfg: &mut ClientMcpConfig, surface: &str) {
+    if surface == DEFAULT_SURFACE || cfg.surfaces.contains_key(surface) {
+        return;
+    }
+    let inherited = cfg.surface_enabled_names(DEFAULT_SURFACE).to_vec();
+    if inherited.is_empty() {
+        return;
+    }
+    cfg.surfaces.insert(
+        surface.to_string(),
+        SurfaceConfig {
+            enabled: inherited,
+            ..Default::default()
+        },
+    );
 }
 
 /// Parse the config at `path` strictly, for an edit.
