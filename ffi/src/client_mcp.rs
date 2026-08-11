@@ -323,6 +323,16 @@ command = "git-mcp"
 enabled = ["fs", "git"]
 "#;
 
+    /// One definition that reaches its server over HTTP, which the client MCP
+    /// host cannot run: it spawns `command`, and this definition has none.
+    const HTTP_DEFINITION: &str = r#"
+[[servers]]
+name = "search"
+enabled = true
+[servers.http]
+url = "https://mcp.example.com/sse"
+"#;
+
     // --- upsert ---------------------------------------------------------------
 
     #[tokio::test]
@@ -577,7 +587,68 @@ enabled = ["notes"]
         assert!(fx.raw().is_empty(), "nothing was written");
     }
 
+    /// A definition with an HTTP endpoint carries no command, and the client MCP
+    /// host spawns a command. Enabling one can only produce a server that fails
+    /// to start, so the write is refused and says why.
+    #[tokio::test]
+    async fn enabling_an_http_definition_is_refused() {
+        let fx = Fixture::new("enable-http");
+        fx.write(HTTP_DEFINITION);
+        let before = fx.raw();
+
+        let err = ClientServerWrite::SetEnabled {
+            name: "search".to_string(),
+            enabled: true,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect_err("an http definition cannot be hosted here");
+
+        assert!(err.contains("http"), "{err}");
+        assert_eq!(fx.raw(), before, "the refusal writes nothing");
+    }
+
+    /// Disabling must keep working: a definition already in a surface's list
+    /// needs a way out, whatever transport it names.
+    #[tokio::test]
+    async fn disabling_an_http_definition_still_works() {
+        let fx = Fixture::new("disable-http");
+        fx.write(&format!(
+            r#"{HTTP_DEFINITION}
+[surfaces.mac]
+enabled = ["search"]
+"#
+        ));
+
+        ClientServerWrite::SetEnabled {
+            name: "search".to_string(),
+            enabled: false,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("disable succeeds");
+
+        assert!(names_enabled_for(&fx.read(), SURFACE).is_empty());
+    }
+
     // --- remove ---------------------------------------------------------------
+
+    /// Deleting a definition needs no ability to run it, so an HTTP one is
+    /// removable.
+    #[tokio::test]
+    async fn removing_an_http_definition_still_works() {
+        let fx = Fixture::new("remove-http");
+        fx.write(HTTP_DEFINITION);
+
+        ClientServerWrite::Remove {
+            name: "search".to_string(),
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("remove succeeds");
+
+        assert!(definition(&fx.read(), "search").is_none());
+    }
 
     #[tokio::test]
     async fn removing_drops_the_definition_and_every_surface_membership() {
