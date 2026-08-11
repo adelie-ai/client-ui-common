@@ -167,6 +167,13 @@ pub struct ConversationDetailDto {
     pub title: String,
     pub messages: Vec<ChatMessageDto>,
     pub model_selection: Option<api::ConversationModelSelectionView>,
+    /// Whether the tool-provenance gate is turned off for this conversation
+    /// (desktop-assistant#1007).
+    ///
+    /// Always serialized, including when false, so a client reads "the gate is
+    /// enforced" from the value rather than from a missing key - which would be
+    /// indistinguishable from a core too old to report it.
+    pub tool_gate_disabled: bool,
 }
 
 impl From<ConversationDetail> for ConversationDetailDto {
@@ -176,6 +183,7 @@ impl From<ConversationDetail> for ConversationDetailDto {
             title: d.title,
             messages: d.messages.into_iter().map(ChatMessageDto::from).collect(),
             model_selection: d.model_selection,
+            tool_gate_disabled: d.tool_gate_disabled,
         }
     }
 }
@@ -482,6 +490,36 @@ impl ViewEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation detail with only the fields a case sets.
+    fn detail(id: &str, tool_gate_disabled: bool) -> ConversationDetail {
+        ConversationDetail {
+            id: id.to_string(),
+            title: "t".to_string(),
+            messages: Vec::new(),
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled,
+        }
+    }
+
+    /// A conversation whose gate was turned off says so, so a client can show
+    /// the state it wrote rather than guessing at it after a reload.
+    #[test]
+    fn a_disabled_tool_gate_reaches_the_view() {
+        let dto = ConversationDetailDto::from(detail("c1", true));
+        let json = serde_json::to_value(&dto).expect("the dto must serialize");
+        assert_eq!(json["tool_gate_disabled"], serde_json::json!(true));
+    }
+
+    /// A conversation with the gate enforced reports false rather than omitting
+    /// the field, so "enforced" and "not reported" cannot be confused.
+    #[test]
+    fn an_enforced_tool_gate_reaches_the_view() {
+        let dto = ConversationDetailDto::from(detail("c1", false));
+        let json = serde_json::to_value(&dto).expect("the dto must serialize");
+        assert_eq!(json["tool_gate_disabled"], serde_json::json!(false));
+    }
 
     #[test]
     fn view_event_tag_is_snake_case_with_fields() {
