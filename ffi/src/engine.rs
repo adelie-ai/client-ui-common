@@ -434,6 +434,13 @@ struct Engine {
     /// The `client-mcp.toml` surface this core resolves under; see
     /// [`DEFAULT_MCP_SURFACE`].
     mcp_surface: String,
+    /// The cancel handle last reported to the view, so
+    /// [`report_turn_state`](Self::report_turn_state) can emit only on a change.
+    ///
+    /// It mirrors the reducer rather than owning anything: the reducer is the
+    /// single source of truth, and this is one value of memory so an unchanged
+    /// answer is not re-sent on every streaming chunk.
+    active_task_id: Option<String>,
 }
 
 /// Build the `SubmitPrompt` message for a user send, minting a fresh per-send
@@ -533,6 +540,31 @@ impl Engine {
         }
         for effect in self.state.apply(msg) {
             self.run_effect(effect);
+        }
+        self.report_turn_state();
+    }
+
+    /// Carry the reducer's turn state across the C ABI.
+    ///
+    /// Two values a view needs and cannot compute: the handle that cancels the
+    /// open turn, and the prompt of a turn that just failed. adele-gtk reads
+    /// both off `WindowState` directly; a client on the far side of the ABI
+    /// holds no `WindowState`, so the engine reports them as events.
+    ///
+    /// Called after the reducer applies a message, because both answers are
+    /// derived from what that message did.
+    fn report_turn_state(&mut self) {
+        let active = self.state.active_task_id_for_view();
+        // Only on a change. A view redrawing per event would otherwise be told
+        // the same thing by every streamed chunk of a long reply.
+        if active != self.active_task_id {
+            self.active_task_id = active.clone();
+            self.sink.emit(&ViewEvent::ActiveTurn { task_id: active });
+        }
+        // One-shot by construction: taking the offer clears it, so a stale
+        // prompt cannot resurface at a later, unrelated moment.
+        if let Some(text) = self.state.take_pending_retry_prompt() {
+            self.sink.emit(&ViewEvent::RetryPrompt { text });
         }
     }
 
@@ -1270,6 +1302,7 @@ impl Core {
             // checkbox opts out via `SetShareClientContext(false)` (#549).
             share_client_context: true,
             mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
+            active_task_id: None,
         };
         runtime.spawn(engine.run(rx));
         Self {
@@ -1430,6 +1463,7 @@ mod share_context_tests {
             ws_jwt: None,
             share_client_context: true,
             mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
+            active_task_id: None,
         }
     }
 
@@ -2187,7 +2221,9 @@ mod turn_state_tests {
     extern "C" fn recording_sink(_user_data: *mut std::ffi::c_void, json: *const std::ffi::c_char) {
         // SAFETY: the sink is only ever called by `ViewSink::emit`, which passes
         // a NUL-terminated C string that outlives the call.
-        let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
         recorded().lock().expect("event buffer poisoned").push(text);
     }
 

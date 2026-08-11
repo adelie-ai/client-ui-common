@@ -287,6 +287,28 @@ pub enum ViewEvent {
     ContextUsage { usage: Option<ContextUsageDto> },
     /// Append a user bubble (own optimistic send, or an adopted external turn).
     AddUserMessage { content: String },
+    /// The cancel handle for the turn streaming into the open conversation, or
+    /// `null` when there is nothing to cancel.
+    ///
+    /// A view shows its **Cancel** control exactly while this is non-null, and
+    /// acts on it with `adele_core_cancel_task`, which sends
+    /// `CancelBackgroundTask { id }`. `null` covers every reason a turn cannot
+    /// be cancelled: no turn is in flight, the turn finished or was abandoned,
+    /// the turn was adopted from another client, or the daemon acked without an
+    /// id (a legacy daemon).
+    ///
+    /// Emitted only when the answer changes, so a view that redraws per event
+    /// is not told the same thing by every streamed chunk.
+    /// The field is always present, and `null` rather than absent, so a client
+    /// reads "nothing to cancel" from the value instead of from a missing key.
+    ActiveTurn { task_id: Option<String> },
+    /// The prompt of a turn that just failed, offered back for a resend.
+    ///
+    /// One-shot: the offer is cleared as it is made, so it can never resurface
+    /// at a later, unrelated moment. A view should apply it only when its
+    /// composer is empty, so it never overwrites text the user typed while
+    /// waiting.
+    RetryPrompt { text: String },
     /// Append a streaming chunk to the in-progress assistant bubble.
     Chunk { text: String },
     /// Finalize the in-progress assistant bubble.
