@@ -331,6 +331,14 @@ void adele_core_remove_mcp_client_server(Core *core, const char *name);
 
  A name that is not defined is refused (and toasted) in either direction,
  rather than materializing a surface entry for a server that does not exist.
+
+ Turning **on** a definition that carries an HTTP endpoint is refused too, for
+ the reason [`adele_core_upsert_mcp_client_server`] refuses to write one: the
+ client MCP host spawns a command, and an HTTP definition has none, so the row
+ could only ever report a server that failed to start. Turning one off stays
+ allowed, so a definition already in this surface's list has a way out, and so
+ does removing it.
+
  The event and timing contract is [`adele_core_upsert_mcp_client_server`]'s.
 
  # Safety

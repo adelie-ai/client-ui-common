@@ -169,6 +169,12 @@ fn apply_upsert(cfg: &mut ClientMcpConfig, surface: &str, server_json: &str) -> 
 ///
 /// Fails when no definition of that name exists, in either direction, rather
 /// than materializing a surface entry for a server that does not exist.
+///
+/// Turning **on** a definition that reaches its server over HTTP is refused, as
+/// the upsert path refuses to write one: the client MCP host spawns `command`,
+/// which an HTTP definition leaves empty, so the result could only ever fail to
+/// start. Turning one **off** stays allowed - a definition already in a
+/// surface's list needs a way out.
 fn apply_enabled(
     cfg: &mut ClientMcpConfig,
     surface: &str,
@@ -176,9 +182,21 @@ fn apply_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     let name = name.trim();
+    // `None` when nothing of that name is defined; `Some(true)` when the
+    // definition that is reaches its server over HTTP.
+    let over_http = cfg
+        .list_defined_servers()
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.http.is_some());
     if enabled {
+        if over_http == Some(true) {
+            return Err(format!(
+                "server '{name}' is configured for http; this client runs stdio servers only"
+            ));
+        }
         cfg.set_server_enabled(name, true)?;
-    } else if !cfg.list_defined_servers().iter().any(|s| s.name == name) {
+    } else if over_http.is_none() {
         return Err(format!("no such server: {name}"));
     }
     seed_surface_from_default(cfg, surface);
