@@ -483,6 +483,36 @@ impl ViewEvent {
 mod tests {
     use super::*;
 
+    /// A conversation detail with only the fields a case sets.
+    fn detail(id: &str, tool_gate_disabled: bool) -> ConversationDetail {
+        ConversationDetail {
+            id: id.to_string(),
+            title: "t".to_string(),
+            messages: Vec::new(),
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled,
+        }
+    }
+
+    /// A conversation whose gate was turned off says so, so a client can show
+    /// the state it wrote rather than guessing at it after a reload.
+    #[test]
+    fn a_disabled_tool_gate_reaches_the_view() {
+        let dto = ConversationDetailDto::from(detail("c1", true));
+        let json = serde_json::to_value(&dto).expect("the dto must serialize");
+        assert_eq!(json["tool_gate_disabled"], serde_json::json!(true));
+    }
+
+    /// A conversation with the gate enforced reports false rather than omitting
+    /// the field, so "enforced" and "not reported" cannot be confused.
+    #[test]
+    fn an_enforced_tool_gate_reaches_the_view() {
+        let dto = ConversationDetailDto::from(detail("c1", false));
+        let json = serde_json::to_value(&dto).expect("the dto must serialize");
+        assert_eq!(json["tool_gate_disabled"], serde_json::json!(false));
+    }
+
     #[test]
     fn view_event_tag_is_snake_case_with_fields() {
         let ev = ViewEvent::Chunk {
