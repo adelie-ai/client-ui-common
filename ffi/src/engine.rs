@@ -39,6 +39,7 @@ use desktop_assistant_client_common::{
 };
 use tokio::sync::mpsc;
 
+use crate::client_mcp::ClientServerWrite;
 use crate::view_event::{ClientServerDto, ViewEvent, view_event_for_signal};
 
 /// The `client-mcp.toml` surface a core resolves MCP servers (and
@@ -196,6 +197,16 @@ pub enum Intent {
     /// start); the refreshed [`ViewEvent::McpBuiltins`] that follows shows the
     /// pending state so the panel is honest in the meantime.
     SetMcpBuiltinDisabled { name: String, disabled: bool },
+    /// Add, edit, enable or remove one **external client-run** MCP server in the
+    /// shared `client-mcp.toml`, for this client's surface.
+    ///
+    /// The sibling of [`SetMcpBuiltinDisabled`], and for the same reason: that
+    /// file is machine-wide, so the Rust side owns every write to it rather than
+    /// each client parsing and rewriting it. Takes effect on the next connect
+    /// (the running host is fixed at start); the refreshed
+    /// [`ViewEvent::McpClientServers`] that follows shows the pending state, so
+    /// the panel is honest in the meantime.
+    WriteMcpClientServer(ClientServerWrite),
     /// Send an arbitrary management `api::Command` (serialized as JSON) over the
     /// connector; the `CommandResult` comes back as a `command_result` view event
     /// keyed by `request_id`. The generic channel for settings/management
@@ -381,15 +392,12 @@ fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &st
 /// Add or remove `name` in one surface's `disabled_builtins` list in the client
 /// MCP config at `path`.
 ///
-/// **Fail-closed on a malformed file.** [`ClientMcpConfig::load`] is deliberately
-/// tolerant — an unparseable config degrades to an empty one so a bad file never
-/// stops a client connecting — but saving that empty config back would erase
-/// every server definition on the machine, for every surface. The edit path
-/// therefore parses strictly and refuses rather than replacing what it could not
-/// read. A file that is merely *absent* is fine: that is a first write.
+/// Fail-closed on a malformed file, via [`crate::client_mcp::load_strict`] —
+/// which carries the reasoning, and which every edit to this shared file goes
+/// through.
 ///
-/// An empty `name` is refused for the same reason: a blank entry is inert noise
-/// every other client sharing the file would then carry.
+/// An empty `name` is refused: a blank entry is inert noise every other client
+/// sharing the file would then carry.
 fn write_builtin_disabled(
     path: &Path,
     surface: &str,
@@ -399,11 +407,7 @@ fn write_builtin_disabled(
     if name.is_empty() {
         return Err("built-in server name must not be empty".to_string());
     }
-    let mut cfg = match std::fs::read_to_string(path) {
-        Ok(contents) => ClientMcpConfig::from_toml(&contents)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ClientMcpConfig::default(),
-        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
-    };
+    let mut cfg = crate::client_mcp::load_strict(path)?;
     cfg.set_builtin_disabled(surface, name, disabled);
     cfg.save(path)
 }
@@ -610,6 +614,7 @@ impl Engine {
             Intent::SetMcpBuiltinDisabled { name, disabled } => {
                 self.spawn_set_mcp_builtin_disabled(name, disabled)
             }
+            Intent::WriteMcpClientServer(write) => self.spawn_write_mcp_client_server(write),
             Intent::SendCommand {
                 request_id,
                 command_json,
@@ -672,6 +677,33 @@ impl Engine {
                 });
             }
             sink.emit(&mcp_builtins_event_at(&path, host.as_deref(), &surface));
+        });
+    }
+
+    /// Answer [`Intent::WriteMcpClientServer`]: apply one edit to the external
+    /// client-run population, then re-emit the inventory so the panel resyncs.
+    ///
+    /// The refreshed inventory is emitted on failure too, for the same reason the
+    /// built-in opt-out does it: the panel must fall back to the truth on disk
+    /// rather than keep an optimistic row that never landed. A refused edit
+    /// writes nothing, so the re-read is the state the file already had.
+    fn spawn_write_mcp_client_server(&self, write: ClientServerWrite) {
+        let sink = self.sink;
+        let surface = self.mcp_surface.clone();
+        let host = self.mcp_host.clone();
+        tokio::spawn(async move {
+            let path = default_client_mcp_path();
+            if let Err(err) = write.apply(&path, &surface) {
+                tracing::warn!("client MCP write failed for surface '{surface}': {err}");
+                sink.emit(&ViewEvent::Toast {
+                    text: format!("Could not update client MCP server: {err}"),
+                });
+            }
+            sink.emit(&mcp_client_servers_event_at(
+                &path,
+                host.as_deref(),
+                &surface,
+            ));
         });
     }
 
