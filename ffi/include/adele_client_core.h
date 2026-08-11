@@ -266,6 +266,75 @@ void adele_core_request_mcp_client_servers(Core *core);
 void adele_core_set_mcp_builtin_disabled(Core *core, const char *name, bool disabled);
 
 /*
+ Add one **external client-run** MCP server to the shared `client-mcp.toml`,
+ or edit the one of the same name, for the surface declared via
+ [`adele_core_set_mcp_surface`].
+
+ `server_json` is a JSON object: `name` (required), `command` (required),
+ `args` (array of strings), `namespace` (string or null), `enabled` (bool,
+ default `true`). A field this core does not know is refused rather than
+ ignored, so a client cannot believe it configured something it did not — an
+ HTTP endpoint, for instance, which a client-run server cannot have (there is
+ no client-side secret store to authenticate one with).
+
+ `enabled` sets both grains at once: the definition's own flag and this
+ surface's membership. Editing a server preserves what the form does not carry
+ (`env`, `env_secrets`, `inherit_env`, `description`).
+
+ The write goes through the core because `client-mcp.toml` is machine-wide:
+ every Adele client on the box reads the same one, and a second independent
+ writer would be a correctness hazard for all of them. A malformed file is
+ refused rather than overwritten.
+
+ Takes effect on the next [`adele_core_connect`] — a running MCP host is fixed
+ at start. An `mcp_client_servers` view event follows either way (including on
+ failure, which also emits a `toast`), carrying the state on disk so the panel
+ never keeps an edit that did not land.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`]; `server_json` must be
+ NULL or a valid NUL-terminated UTF-8 string, borrowed for the call.
+ */
+void adele_core_upsert_mcp_client_server(Core *core, const char *server_json);
+
+/*
+ Delete one external client-run MCP server from the shared `client-mcp.toml`.
+
+ The definition is machine-wide, so this removes it for **every** surface, not
+ only this client's — to stop hosting a server here while other clients keep
+ it, use [`adele_core_set_mcp_client_server_enabled`] with `enabled = false`.
+
+ Removing a name that is not defined is refused (and toasted) rather than
+ silently accepted. The event and timing contract is
+ [`adele_core_upsert_mcp_client_server`]'s.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
+ valid NUL-terminated UTF-8 string, borrowed for the call.
+ */
+void adele_core_remove_mcp_client_server(Core *core, const char *name);
+
+/*
+ Turn one external client-run MCP server on or off **for this client's
+ surface**.
+
+ Asymmetric on purpose, so one surface's choice never disturbs another sharing
+ the file: turning it **on** joins `[surfaces.<surface>].enabled` and switches
+ the definition's own `enabled` flag on, so the server really is hosted here;
+ turning it **off** drops this surface's entry only, leaving the definition
+ enabled for every other surface that lists it.
+
+ A name that is not defined is refused (and toasted) in either direction,
+ rather than materializing a surface entry for a server that does not exist.
+ The event and timing contract is [`adele_core_upsert_mcp_client_server`]'s.
+
+ # Safety
+ `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
+ valid NUL-terminated UTF-8 string, borrowed for the call.
+ */
+void adele_core_set_mcp_client_server_enabled(Core *core, const char *name, bool enabled);
+
+/*
  Send an arbitrary management command (an `api::Command` serialized as JSON)
  over the connector. The `CommandResult` is delivered later as a
  `command_result` view event carrying the same `request_id`, so the caller can
