@@ -409,9 +409,14 @@ fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &st
 /// which carries the reasoning, and which every edit to this shared file goes
 /// through.
 ///
+/// Serialized against the external client-run writes by the one lock
+/// [`crate::client_mcp::lock_writes`] hands out: both populations live in this
+/// file, so ordering one against the other is what keeps either from losing an
+/// update. The lock is held across the load, the change and the save.
+///
 /// An empty `name` is refused: a blank entry is inert noise every other client
 /// sharing the file would then carry.
-fn write_builtin_disabled(
+async fn write_builtin_disabled(
     path: &Path,
     surface: &str,
     name: &str,
@@ -420,6 +425,7 @@ fn write_builtin_disabled(
     if name.is_empty() {
         return Err("built-in server name must not be empty".to_string());
     }
+    let _guard = crate::client_mcp::lock_writes().await;
     let mut cfg = crate::client_mcp::load_strict(path)?;
     cfg.set_builtin_disabled(surface, name, disabled);
     cfg.save(path)
@@ -683,7 +689,7 @@ impl Engine {
         let host = self.mcp_host.clone();
         tokio::spawn(async move {
             let path = default_client_mcp_path();
-            if let Err(err) = write_builtin_disabled(&path, &surface, &name, disabled) {
+            if let Err(err) = write_builtin_disabled(&path, &surface, &name, disabled).await {
                 tracing::warn!("failed to update built-in '{name}' for surface '{surface}': {err}");
                 sink.emit(&ViewEvent::Toast {
                     text: format!("Could not update built-in server: {err}"),
@@ -706,7 +712,7 @@ impl Engine {
         let host = self.mcp_host.clone();
         tokio::spawn(async move {
             let path = default_client_mcp_path();
-            if let Err(err) = write.apply(&path, &surface) {
+            if let Err(err) = write.apply(&path, &surface).await {
                 tracing::warn!("client MCP write failed for surface '{surface}': {err}");
                 sink.emit(&ViewEvent::Toast {
                     text: format!("Could not update client MCP server: {err}"),
@@ -1735,8 +1741,8 @@ mod mcp_builtin_tests {
     /// The whole point of the `mac` surface: an opt-out written from the Mac's
     /// panel must land in `[surfaces.mac]` and leave every other client's
     /// section — they share this one file — untouched.
-    #[test]
-    fn disabling_a_builtin_writes_the_named_surface_only() {
+    #[tokio::test]
+    async fn disabling_a_builtin_writes_the_named_surface_only() {
         let (_dir, path) = temp_config(Some(
             r#"
 [surfaces.kde]
@@ -1745,7 +1751,9 @@ disabled_builtins = ["terminal"]
 "#,
         ));
 
-        write_builtin_disabled(&path, "mac", "fileio", true).expect("write succeeds");
+        write_builtin_disabled(&path, "mac", "fileio", true)
+            .await
+            .expect("write succeeds");
 
         let cfg = reload(&path);
         assert_eq!(cfg.surface_disabled_builtins("mac"), ["fileio".to_string()]);
@@ -1758,8 +1766,8 @@ disabled_builtins = ["terminal"]
 
     /// Re-enabling is the same write in reverse: the name leaves the list, and
     /// the surface is left with an empty (not absent-by-accident) selection.
-    #[test]
-    fn re_enabling_a_builtin_removes_it_from_the_surface() {
+    #[tokio::test]
+    async fn re_enabling_a_builtin_removes_it_from_the_surface() {
         let (_dir, path) = temp_config(Some(
             r#"
 [surfaces.mac]
@@ -1768,7 +1776,9 @@ disabled_builtins = ["fileio", "web"]
 "#,
         ));
 
-        write_builtin_disabled(&path, "mac", "fileio", false).expect("write succeeds");
+        write_builtin_disabled(&path, "mac", "fileio", false)
+            .await
+            .expect("write succeeds");
 
         assert_eq!(
             reload(&path).surface_disabled_builtins("mac"),
@@ -1778,11 +1788,15 @@ disabled_builtins = ["fileio", "web"]
     }
 
     /// Disabling twice must not duplicate the entry.
-    #[test]
-    fn disabling_a_builtin_twice_is_idempotent() {
+    #[tokio::test]
+    async fn disabling_a_builtin_twice_is_idempotent() {
         let (_dir, path) = temp_config(None);
-        write_builtin_disabled(&path, "mac", "web", true).expect("first write");
-        write_builtin_disabled(&path, "mac", "web", true).expect("second write");
+        write_builtin_disabled(&path, "mac", "web", true)
+            .await
+            .expect("first write");
+        write_builtin_disabled(&path, "mac", "web", true)
+            .await
+            .expect("second write");
         assert_eq!(
             reload(&path).surface_disabled_builtins("mac"),
             ["web".to_string()]
@@ -1792,8 +1806,8 @@ disabled_builtins = ["fileio", "web"]
     /// `client-mcp.toml` is machine-wide and holds every surface's server
     /// definitions. A built-in toggle must rewrite it in place, never replace it
     /// — losing the `[[servers]]` block would break every other client.
-    #[test]
-    fn disabling_a_builtin_preserves_the_shared_server_definitions() {
+    #[tokio::test]
+    async fn disabling_a_builtin_preserves_the_shared_server_definitions() {
         let (_dir, path) = temp_config(Some(
             r#"
 [[servers]]
@@ -1806,7 +1820,9 @@ enabled = ["notes"]
 "#,
         ));
 
-        write_builtin_disabled(&path, "mac", "fileio", true).expect("write succeeds");
+        write_builtin_disabled(&path, "mac", "fileio", true)
+            .await
+            .expect("write succeeds");
 
         let cfg = reload(&path);
         let defined: Vec<&str> = cfg
@@ -1820,11 +1836,13 @@ enabled = ["notes"]
 
     /// A surface with no section yet gets one materialized, rather than the
     /// opt-out silently falling into `[surfaces.default]`.
-    #[test]
-    fn disabling_a_builtin_materializes_a_missing_surface_section() {
+    #[tokio::test]
+    async fn disabling_a_builtin_materializes_a_missing_surface_section() {
         let (_dir, path) = temp_config(None);
 
-        write_builtin_disabled(&path, "mac", "tasks", true).expect("write succeeds");
+        write_builtin_disabled(&path, "mac", "tasks", true)
+            .await
+            .expect("write succeeds");
 
         let cfg = reload(&path);
         assert_eq!(cfg.surface_disabled_builtins("mac"), ["tasks".to_string()]);
@@ -1838,12 +1856,13 @@ enabled = ["notes"]
     /// degrades an unparseable config to an EMPTY one; saving that back would
     /// erase every server definition on the machine, so the edit path must
     /// refuse instead — and leave the bytes exactly as they were.
-    #[test]
-    fn a_malformed_config_is_refused_rather_than_overwritten() {
+    #[tokio::test]
+    async fn a_malformed_config_is_refused_rather_than_overwritten() {
         let original = "this is not = valid toml [[[";
         let (_dir, path) = temp_config(Some(original));
 
         let err = write_builtin_disabled(&path, "mac", "fileio", true)
+            .await
             .expect_err("a malformed config must not be silently replaced");
         assert!(!err.is_empty(), "the failure must explain itself");
         assert_eq!(
@@ -1865,7 +1884,7 @@ enabled = ["notes"]
         for i in 0..PAIRS {
             let opt_out_path = path.clone();
             writers.push(tokio::spawn(async move {
-                write_builtin_disabled(&opt_out_path, "mac", &format!("b{i:02}"), true)
+                write_builtin_disabled(&opt_out_path, "mac", &format!("b{i:02}"), true).await
             }));
             let upsert_path = path.clone();
             writers.push(tokio::spawn(async move {
@@ -1873,6 +1892,7 @@ enabled = ["notes"]
                     server_json: format!(r#"{{"name":"s{i:02}","command":"s{i:02}-mcp"}}"#),
                 }
                 .apply(&upsert_path, "mac")
+                .await
             }));
         }
         for writer in writers {
@@ -2039,10 +2059,12 @@ enabled = []
     /// An empty built-in name is refused rather than written: a blank entry in
     /// `disabled_builtins` is inert noise every other client sharing the file
     /// would then carry, and it can only come from a caller bug.
-    #[test]
-    fn an_empty_builtin_name_is_not_written() {
+    #[tokio::test]
+    async fn an_empty_builtin_name_is_not_written() {
         let (_dir, path) = temp_config(None);
-        write_builtin_disabled(&path, "mac", "", true).expect_err("an empty name is rejected");
+        write_builtin_disabled(&path, "mac", "", true)
+            .await
+            .expect_err("an empty name is rejected");
         assert!(!path.exists(), "nothing should have been written");
     }
 }
