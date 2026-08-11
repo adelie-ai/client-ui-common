@@ -2357,6 +2357,131 @@ enabled = ["good", "broken"]
         host.shutdown().await;
     }
 
+    /// Start a host over a config that hosts `good` alone, then rewrite the
+    /// config to add `extra_servers` and to host `hosted_after`. Models an edit
+    /// made while a connection is live: the running host is fixed at start, the
+    /// file is not.
+    ///
+    /// Returns the temp dir (the guard), the config path, the running host, and
+    /// the server names the host was started with.
+    async fn host_started_before(
+        extra_servers: &str,
+        hosted_after: &str,
+    ) -> (tempfile::TempDir, PathBuf, McpHost, Vec<String>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = dir.path().join("fake.sh");
+        std::fs::write(&script, FAKE_SERVER).expect("write the fake server");
+        let cfg_path = dir.path().join("client-mcp.toml");
+        let good = format!(
+            r#"
+[[servers]]
+name = "good"
+command = "/bin/sh"
+args = ["{}"]
+namespace = "ns"
+"#,
+            script.display()
+        );
+        std::fs::write(
+            &cfg_path,
+            format!("{good}\n[surfaces.mac]\nenabled = [\"good\"]\n"),
+        )
+        .expect("seed the config");
+
+        let servers: Vec<_> = ClientMcpConfig::load(&cfg_path)
+            .resolved_servers("mac")
+            .into_iter()
+            .cloned()
+            .collect();
+        let started: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+        let host = McpHost::start(&servers).await;
+
+        std::fs::write(
+            &cfg_path,
+            format!("{good}{extra_servers}\n[surfaces.mac]\nenabled = {hosted_after}\n"),
+        )
+        .expect("rewrite the config");
+        (dir, cfg_path, host, started)
+    }
+
+    /// A server added while a connection is live was never offered to the
+    /// running host, so the host has no tally entry for it. Nothing failed: it
+    /// starts on the next connect, and the row must say so.
+    #[tokio::test]
+    async fn client_servers_event_reports_a_server_added_while_connected_as_enabled() {
+        let (_dir, cfg_path, host, _started) = host_started_before(
+            r#"
+[[servers]]
+name = "late"
+command = "/usr/bin/late-mcp"
+"#,
+            r#"["good", "late"]"#,
+        )
+        .await;
+
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let late = servers_of(&ev)
+            .iter()
+            .find(|s| s.name == "late")
+            .expect("the new definition is listed");
+        assert_eq!(
+            late.status, "enabled",
+            "a server the running host was never given has not failed"
+        );
+        assert_eq!(late.tool_count, 0);
+
+        host.shutdown().await;
+    }
+
+    /// The same for a definition that existed at connect but this surface did
+    /// not host until now: the running host was not given it either.
+    #[tokio::test]
+    async fn client_servers_event_reports_a_server_enabled_while_connected_as_enabled() {
+        let (_dir, cfg_path, host, _started) = host_started_before(
+            r#"
+[[servers]]
+name = "parked"
+command = "/usr/bin/parked-mcp"
+"#,
+            r#"["good", "parked"]"#,
+        )
+        .await;
+
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let parked = servers_of(&ev)
+            .iter()
+            .find(|s| s.name == "parked")
+            .expect("the newly enabled server is listed");
+        assert_eq!(parked.status, "enabled");
+
+        host.shutdown().await;
+    }
+
+    /// The one the running host really was given, and really did serve, keeps
+    /// reporting its live tool count.
+    #[tokio::test]
+    async fn client_servers_event_still_reports_a_served_server_as_running() {
+        let (_dir, cfg_path, host, _started) = host_started_before(
+            r#"
+[[servers]]
+name = "late"
+command = "/usr/bin/late-mcp"
+"#,
+            r#"["good", "late"]"#,
+        )
+        .await;
+
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let good = servers_of(&ev)
+            .iter()
+            .find(|s| s.name == "good")
+            .expect("the served server is listed");
+        assert_eq!(good.status, "running");
+        assert_eq!(good.tool_count, 1);
+
+        host.shutdown().await;
+    }
+
     /// A disabled server is absent from a running host's tally for a reason that
     /// has nothing to do with failure, so it must never be reported as `error`.
     /// The disabled case is decided before the tally is consulted.
