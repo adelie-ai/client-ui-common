@@ -232,12 +232,17 @@ void adele_core_request_mcp_builtins(Core *core);
  `tool_count`, and `namespace` (or null).
 
  The sibling of [`adele_core_request_mcp_builtins`], and like it answerable with
- **no connection**: which external servers this surface hosts is a property of
- `client-mcp.toml`, so a settings panel can call this before the first connect.
- The server list is complete offline (each row reports `enabled` with a `0`
- tool count); the live tool counts and running/error status fill in once a
- connection has started the client MCP host. A surface that enables no external
- servers answers with an empty list — the honest "none configured".
+ **no connection**: which external servers this machine defines, and which of
+ them this surface hosts, are both properties of `client-mcp.toml`, so a
+ settings panel can call this before the first connect.
+
+ The list covers every **defined** server, not only the hosted ones, so a panel
+ can show — and switch back on — a server this surface has turned off. A server
+ this surface does not host reports `disabled`; a hosted one reports `enabled`
+ with a `0` tool count until a connection starts the client MCP host, and
+ `running` (with its live tool count) or `error` after that. A machine that
+ defines no external servers answers with an empty list — the honest "none
+ configured".
 
  # Safety
  `core` must be a live handle from [`adele_core_new`].

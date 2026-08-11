@@ -332,20 +332,25 @@ fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> 
 /// MCP config at `path`.
 ///
 /// The sibling of [`mcp_builtins_event_at`], same "config + optional host"
-/// shape. The server list is the surface's *external* set —
-/// [`ClientMcpConfig::resolved_servers`], which already filters to the servers
-/// this surface enables and that are themselves enabled — so the panel lists
-/// them before the first connect. Each row's transport is read straight from the
-/// definition (`http` when an HTTP endpoint is configured, else `stdio`).
+/// shape. The server list is every server the machine *defines*, not only the
+/// ones this surface hosts, because a panel that cannot see a switched-off
+/// server can never switch it back on — and would report the machine as defining
+/// nothing. Each row's transport is read straight from the definition (`http`
+/// when an HTTP endpoint is configured, else `stdio`).
 ///
-/// The status and tool count depend on whether a host is running:
+/// The status and tool count come from the surface's selection first, then the
+/// host:
 ///
-/// - **No host** (`host` is `None`): every resolved server reports `enabled`
-///   (configured and switched on, not yet started) with a `0` tool count.
-/// - **Host running**: a server whose namespace the host tallies is `running`
-///   with its live tool count; a resolved server the host did NOT start — it
-///   failed to launch or list its tools — is absent from the tally and reports
-///   `error`.
+/// - **Not hosted here** — the definition is switched off, or this surface does
+///   not list it: `disabled`, with a `0` tool count.
+/// - **Hosted, no host running** (`host` is `None`): `enabled` — configured and
+///   switched on, not yet started.
+/// - **Hosted, host running**: a server whose namespace the host tallies is
+///   `running` with its live tool count; one the host did NOT start — it failed
+///   to launch or list its tools — is absent from the tally and reports `error`.
+///
+/// The order matters: a disabled server is absent from a running host's tally
+/// too, so deciding it first is what keeps it from reporting as a failure.
 ///
 /// The tool-count key is the server's namespace (`cfg.namespace`, or its name
 /// when unset), matching [`McpHost::tool_counts`]'s key exactly.
@@ -357,16 +362,24 @@ fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> 
 fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> ViewEvent {
     let cfg = ClientMcpConfig::load(path);
     let counts = host.map(|h| h.tool_counts());
-    let servers = cfg
+    let hosted: Vec<&str> = cfg
         .resolved_servers(surface)
         .into_iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    let servers = cfg
+        .list_defined_servers()
+        .iter()
         .map(|s| {
             let namespace_key = s.namespace.clone().unwrap_or_else(|| s.name.clone());
             let transport = if s.http.is_some() { "http" } else { "stdio" };
-            // With a running host, a resolved server the host is serving reports
+            // With a running host, a hosted server the host is serving reports
             // its live tool count; one the host never started is absent from the
-            // tally and is surfaced as an error rather than a silent zero.
+            // tally and is surfaced as an error rather than a silent zero. A
+            // server this surface does not host is absent from the tally for a
+            // reason that is not failure, so it is decided before the tally.
             let (status, tool_count) = match &counts {
+                _ if !hosted.contains(&s.name.as_str()) => ("disabled", 0),
                 None => ("enabled", 0),
                 Some(counts) => match counts.get(&namespace_key) {
                     // Saturate rather than wrap: a count that cannot fit is absurd.
@@ -2098,10 +2111,13 @@ enabled = ["browser", "remote"]
         assert_eq!(remote.namespace.as_deref(), Some("rem"));
     }
 
-    /// A server this surface does NOT enable is another surface's concern and
-    /// must not appear in this client's list.
+    /// A server this surface does not enable is still listed, as `disabled`.
+    ///
+    /// The list is the *defined* set with each row's state, not the hosted set:
+    /// a panel that could not see a switched-off server could never switch it
+    /// back on, and would report the machine as defining nothing.
     #[test]
-    fn client_servers_event_respects_the_surface_selection() {
+    fn client_servers_event_lists_a_server_this_surface_does_not_enable_as_disabled() {
         let (_dir, path) = temp_config(Some(
             r#"
 [[servers]]
@@ -2115,14 +2131,18 @@ enabled = ["browser"]
 enabled = []
 "#,
         ));
-        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let servers = servers_of(&ev);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "browser");
+        assert_eq!(servers[0].status, "disabled");
+        assert_eq!(servers[0].tool_count, 0);
     }
 
-    /// A defined-but-disabled server hosts nothing, so it is excluded exactly as
-    /// `resolved_servers` excludes it — the list is the *hosted* set, not the
-    /// defined set.
+    /// A definition switched off at the definition level hosts nothing anywhere,
+    /// so every surface sees it as `disabled` rather than as absent.
     #[test]
-    fn client_servers_event_excludes_a_disabled_definition() {
+    fn client_servers_event_reports_a_disabled_definition_as_disabled() {
         let (_dir, path) = temp_config(Some(
             r#"
 [[servers]]
@@ -2134,7 +2154,10 @@ enabled = false
 enabled = ["browser"]
 "#,
         ));
-        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let servers = servers_of(&ev);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].status, "disabled");
     }
 
     /// A missing namespace travels as `None` so the client can fall back to the
@@ -2212,6 +2235,56 @@ enabled = ["good", "broken"]
             "a resolved server the host did not start is an error, not a silent zero"
         );
         assert_eq!(broken.tool_count, 0);
+
+        host.shutdown().await;
+    }
+
+    /// A disabled server is absent from a running host's tally for a reason that
+    /// has nothing to do with failure, so it must never be reported as `error`.
+    /// The disabled case is decided before the tally is consulted.
+    #[tokio::test]
+    async fn client_servers_event_never_reports_a_disabled_server_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.sh");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+        let cfg_path = dir.path().join("client-mcp.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[[servers]]
+name = "good"
+command = "/bin/sh"
+args = ["{}"]
+namespace = "ns"
+
+[[servers]]
+name = "parked"
+command = "/usr/bin/parked-mcp"
+
+[surfaces.mac]
+enabled = ["good"]
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+
+        let servers: Vec<_> = ClientMcpConfig::load(&cfg_path)
+            .resolved_servers("mac")
+            .into_iter()
+            .cloned()
+            .collect();
+        let host = McpHost::start(&servers).await;
+
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let rows = servers_of(&ev);
+        let parked = rows
+            .iter()
+            .find(|s| s.name == "parked")
+            .expect("a disabled server is still listed while a host runs");
+        assert_eq!(parked.status, "disabled");
+        assert_eq!(parked.tool_count, 0);
 
         host.shutdown().await;
     }
