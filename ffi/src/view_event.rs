@@ -167,6 +167,13 @@ pub struct ConversationDetailDto {
     pub title: String,
     pub messages: Vec<ChatMessageDto>,
     pub model_selection: Option<api::ConversationModelSelectionView>,
+    /// Whether the tool-provenance gate is turned off for this conversation
+    /// (desktop-assistant#1007).
+    ///
+    /// Always serialized, including when false, so a client reads "the gate is
+    /// enforced" from the value rather than from a missing key - which would be
+    /// indistinguishable from a core too old to report it.
+    pub tool_gate_disabled: bool,
 }
 
 impl From<ConversationDetail> for ConversationDetailDto {
@@ -176,6 +183,7 @@ impl From<ConversationDetail> for ConversationDetailDto {
             title: d.title,
             messages: d.messages.into_iter().map(ChatMessageDto::from).collect(),
             model_selection: d.model_selection,
+            tool_gate_disabled: d.tool_gate_disabled,
         }
     }
 }
