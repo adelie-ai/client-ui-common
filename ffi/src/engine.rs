@@ -2098,10 +2098,13 @@ enabled = ["browser", "remote"]
         assert_eq!(remote.namespace.as_deref(), Some("rem"));
     }
 
-    /// A server this surface does NOT enable is another surface's concern and
-    /// must not appear in this client's list.
+    /// A server this surface does not enable is still listed, as `disabled`.
+    ///
+    /// The list is the *defined* set with each row's state, not the hosted set:
+    /// a panel that could not see a switched-off server could never switch it
+    /// back on, and would report the machine as defining nothing.
     #[test]
-    fn client_servers_event_respects_the_surface_selection() {
+    fn client_servers_event_lists_a_server_this_surface_does_not_enable_as_disabled() {
         let (_dir, path) = temp_config(Some(
             r#"
 [[servers]]
@@ -2115,14 +2118,18 @@ enabled = ["browser"]
 enabled = []
 "#,
         ));
-        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let servers = servers_of(&ev);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "browser");
+        assert_eq!(servers[0].status, "disabled");
+        assert_eq!(servers[0].tool_count, 0);
     }
 
-    /// A defined-but-disabled server hosts nothing, so it is excluded exactly as
-    /// `resolved_servers` excludes it — the list is the *hosted* set, not the
-    /// defined set.
+    /// A definition switched off at the definition level hosts nothing anywhere,
+    /// so every surface sees it as `disabled` rather than as absent.
     #[test]
-    fn client_servers_event_excludes_a_disabled_definition() {
+    fn client_servers_event_reports_a_disabled_definition_as_disabled() {
         let (_dir, path) = temp_config(Some(
             r#"
 [[servers]]
@@ -2134,7 +2141,10 @@ enabled = false
 enabled = ["browser"]
 "#,
         ));
-        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let servers = servers_of(&ev);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].status, "disabled");
     }
 
     /// A missing namespace travels as `None` so the client can fall back to the
@@ -2212,6 +2222,56 @@ enabled = ["good", "broken"]
             "a resolved server the host did not start is an error, not a silent zero"
         );
         assert_eq!(broken.tool_count, 0);
+
+        host.shutdown().await;
+    }
+
+    /// A disabled server is absent from a running host's tally for a reason that
+    /// has nothing to do with failure, so it must never be reported as `error`.
+    /// The disabled case is decided before the tally is consulted.
+    #[tokio::test]
+    async fn client_servers_event_never_reports_a_disabled_server_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.sh");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+        let cfg_path = dir.path().join("client-mcp.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[[servers]]
+name = "good"
+command = "/bin/sh"
+args = ["{}"]
+namespace = "ns"
+
+[[servers]]
+name = "parked"
+command = "/usr/bin/parked-mcp"
+
+[surfaces.mac]
+enabled = ["good"]
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+
+        let servers: Vec<_> = ClientMcpConfig::load(&cfg_path)
+            .resolved_servers("mac")
+            .into_iter()
+            .cloned()
+            .collect();
+        let host = McpHost::start(&servers).await;
+
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let rows = servers_of(&ev);
+        let parked = rows
+            .iter()
+            .find(|s| s.name == "parked")
+            .expect("a disabled server is still listed while a host runs");
+        assert_eq!(parked.status, "disabled");
+        assert_eq!(parked.tool_count, 0);
 
         host.shutdown().await;
     }
