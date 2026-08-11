@@ -529,6 +529,99 @@ enabled = ["notes"]
         assert_eq!(fx.raw(), broken, "the file every client reads is untouched");
     }
 
+    // --- serialization --------------------------------------------------------
+
+    /// How many writers the concurrency cases dispatch at once. Enough that an
+    /// unserialized read-modify-write loses at least one update on every run.
+    const WRITERS: usize = 16;
+
+    /// Writes dispatched together must all land. Each edit reads the whole file,
+    /// changes one thing and writes it back, so two writers that overlap can
+    /// silently drop the first one's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_all_land() {
+        let fx = Fixture::new("concurrent-writes");
+        fx.write("");
+
+        let mut writers = Vec::new();
+        for i in 0..WRITERS {
+            let path = fx.path();
+            writers.push(tokio::spawn(async move {
+                upsert(&format!(r#"{{"name":"s{i:02}","command":"s{i:02}-mcp"}}"#))
+                    .apply(&path, SURFACE)
+            }));
+        }
+        for writer in writers {
+            writer
+                .await
+                .expect("the writer task must not panic")
+                .expect("every write succeeds");
+        }
+
+        let cfg = fx.read();
+        let mut landed: Vec<String> = cfg
+            .list_defined_servers()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        landed.sort_unstable();
+        let expected: Vec<String> = (0..WRITERS).map(|i| format!("s{i:02}")).collect();
+        assert_eq!(landed, expected, "no write may be lost");
+    }
+
+    /// The same file's surface membership must survive the same race: every
+    /// writer joins this surface, so a lost update shows up here too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_all_join_this_surface() {
+        let fx = Fixture::new("concurrent-surface");
+        fx.write("");
+
+        let mut writers = Vec::new();
+        for i in 0..WRITERS {
+            let path = fx.path();
+            writers.push(tokio::spawn(async move {
+                upsert(&format!(r#"{{"name":"s{i:02}","command":"s{i:02}-mcp"}}"#))
+                    .apply(&path, SURFACE)
+            }));
+        }
+        for writer in writers {
+            writer
+                .await
+                .expect("the writer task must not panic")
+                .expect("every write succeeds");
+        }
+
+        let cfg = fx.read();
+        let mut listed = names_enabled_for(&cfg, SURFACE);
+        listed.sort_unstable();
+        let expected: Vec<String> = (0..WRITERS).map(|i| format!("s{i:02}")).collect();
+        assert_eq!(listed, expected);
+    }
+
+    /// A refused write must leave the next one free to run: serialization that
+    /// keeps its hold after a failure would stall every later edit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_write_does_not_block_the_next_one() {
+        let fx = Fixture::new("refused-then-next");
+        fx.write("");
+
+        upsert(r#"{"name":"notes","command":"  "}"#)
+            .apply(&fx.path(), SURFACE)
+            .expect_err("a command is required");
+
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::ready(
+                upsert(r#"{"name":"notes","command":"notes-mcp"}"#).apply(&fx.path(), SURFACE),
+            ),
+        )
+        .await
+        .expect("the next write must not wait on the refused one");
+        next.expect("the next write succeeds");
+
+        assert!(definition(&fx.read(), "notes").is_some());
+    }
+
     #[test]
     fn an_edit_leaves_another_surfaces_servers_alone() {
         let fx = Fixture::new("other-surface");

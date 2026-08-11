@@ -1853,6 +1853,56 @@ enabled = ["notes"]
         );
     }
 
+    /// The built-in opt-out and the client-run writes edit one file, so they
+    /// must share one serialization. Driven concurrently: a lost update shows up
+    /// as a missing opt-out or a missing definition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_builtin_opt_out_and_a_client_run_write_do_not_lose_each_other() {
+        const PAIRS: usize = 8;
+        let (_dir, path) = temp_config(Some(""));
+
+        let mut writers = Vec::new();
+        for i in 0..PAIRS {
+            let opt_out_path = path.clone();
+            writers.push(tokio::spawn(async move {
+                write_builtin_disabled(&opt_out_path, "mac", &format!("b{i:02}"), true)
+            }));
+            let upsert_path = path.clone();
+            writers.push(tokio::spawn(async move {
+                crate::client_mcp::ClientServerWrite::Upsert {
+                    server_json: format!(r#"{{"name":"s{i:02}","command":"s{i:02}-mcp"}}"#),
+                }
+                .apply(&upsert_path, "mac")
+            }));
+        }
+        for writer in writers {
+            writer
+                .await
+                .expect("the writer task must not panic")
+                .expect("every write succeeds");
+        }
+
+        let cfg = reload(&path);
+        let mut opt_outs = cfg.surface_disabled_builtins("mac").to_vec();
+        opt_outs.sort_unstable();
+        assert_eq!(
+            opt_outs,
+            (0..PAIRS).map(|i| format!("b{i:02}")).collect::<Vec<_>>(),
+            "no built-in opt-out may be lost to a client-run write"
+        );
+        let mut defined: Vec<String> = cfg
+            .list_defined_servers()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        defined.sort_unstable();
+        assert_eq!(
+            defined,
+            (0..PAIRS).map(|i| format!("s{i:02}")).collect::<Vec<_>>(),
+            "no client-run write may be lost to a built-in opt-out"
+        );
+    }
+
     // --- read path: the mcp_builtins event ------------------------------------
 
     /// The event names the surface it resolved under, so a client can verify it
