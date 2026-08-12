@@ -25,6 +25,7 @@
 
 mod builtins;
 mod client_mcp;
+mod conversations;
 mod engine;
 mod markdown;
 mod view_event;
