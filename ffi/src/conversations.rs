@@ -126,6 +126,17 @@ pub(crate) fn disconnected_report(change: ArchiveChange) -> UiMessage {
     ))
 }
 
+/// Whether the conversation the view already has open stays open.
+///
+/// It does whenever the inventory still holds it, archived or not. A
+/// conversation archived while someone is reading it, by this client or by
+/// another, must not be closed out from under the reader. Only the conversation
+/// this core opens *for* a reader passes over archived rows, in
+/// [`auto_open_target`].
+pub(crate) fn keeps_open(conversations: &[ConversationSummary], current: Option<&str>) -> bool {
+    current.is_some_and(|id| conversations.iter().any(|c| c.id == id))
+}
+
 /// The conversation to open when the view has none: the most recent one that is
 /// not archived.
 ///
@@ -511,15 +522,33 @@ mod tests {
     /// now the single reader, but a blanket impl cannot take the narrower call
     /// away from a call site that still has [`AssistantClient`] in scope - a
     /// reverted line would compile and pass every behavioural test in this file
-    /// while the archived rows vanished again. This reads the executor and
-    /// requires that no such line exists.
+    /// while the archived rows vanished again.
+    ///
+    /// So this reads the crate's own sources and requires that no call site
+    /// spells the narrower call. Comment lines are skipped, so writing the name
+    /// in prose stays possible; the needle is assembled rather than written out,
+    /// so this file does not match itself.
     #[test]
-    fn the_executor_never_reads_the_active_only_list() {
-        const EXECUTOR: &str = include_str!("engine.rs");
+    fn no_call_site_reads_the_active_only_list() {
+        let narrower = format!("list_conversations{}", "()");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("the crate has a src directory") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a readable source file");
+            for (n, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains(&narrower) {
+                    offenders.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
         assert!(
-            !EXECUTOR.contains("list_conversations()"),
-            "the executor must read the inventory through list_all, which asks \
-             for the archived population too"
+            offenders.is_empty(),
+            "every list read must go through list_all, which asks for the \
+             archived population too; found the narrower call at {offenders:?}"
         );
     }
 
@@ -539,6 +568,27 @@ mod tests {
             UiMessage::Error(text) => assert!(text.contains("not unarchived"), "{text}"),
             other => panic!("expected an error message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_conversation_archived_while_open_stays_open() {
+        let convs = vec![summary("open", true), summary("active", false)];
+        assert!(
+            keeps_open(&convs, Some("open")),
+            "a reader must not have an archived conversation closed out from \
+             under them"
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_left_the_list_does_not_stay_open() {
+        let convs = vec![summary("active", false)];
+        assert!(!keeps_open(&convs, Some("deleted-elsewhere")));
+    }
+
+    #[test]
+    fn nothing_stays_open_when_nothing_is_open() {
+        assert!(!keeps_open(&[summary("active", false)], None));
     }
 
     #[test]

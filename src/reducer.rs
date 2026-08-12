@@ -842,7 +842,8 @@ pub enum Effect {
     /// needs the live client + ui_tx and spawns an async RPC; the decision to run
     /// it lives in `apply`. The result repaints only the sidebar (it does NOT
     /// reload the open conversation or touch the model picker), distinguishing it
-    /// from the connect-time `list_conversations -> ConversationsLoaded` path.
+    /// from the connect-time list load, which arrives as
+    /// [`UiMessage::ConversationsLoaded`] and does both.
     RefetchConversationList,
     /// Clear the chat view.
     ClearChat,

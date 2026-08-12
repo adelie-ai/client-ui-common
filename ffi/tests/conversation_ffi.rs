@@ -5,10 +5,12 @@
 //! must queue and return without blocking and without a panic crossing the
 //! boundary - including for a null handle or a null id.
 //!
-//! One case is driven end to end here, through a live core with no connection:
-//! it is the only wiring test the crate can run without a daemon, and it covers
-//! the whole path an archive click takes - entry point, intent, executor arm,
-//! reducer, view event.
+//! Both entry points are also driven through a live core with no connection,
+//! which is as far as the crate can go without a daemon. That covers the wiring
+//! up to the point the RPC would be issued: entry point, intent, the executor
+//! arm the intent selects, the reducer, and the view event a client reads. What
+//! happens past that point - the change and the re-list - is specified in
+//! `conversations.rs` against a fake daemon.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
@@ -78,10 +80,10 @@ fn the_generated_header_declares_the_archive_entry_points() {
     }
 }
 
-/// An archive with no connection never reaches a daemon, so what it proves is
-/// the wiring: the entry point queues the intent the executor turns into an
-/// (un)archive, and the report comes back naming the change the user asked for.
-/// Swap the two executor arms and this fails.
+/// An archive with no connection never reaches a daemon, so what this proves is
+/// the wiring: the entry point queues the intent, the executor selects the arm
+/// for the change that entry point names, and the report comes back naming it.
+/// Swap the two arms in `handle_intent` and this fails.
 #[test]
 fn each_entry_point_drives_the_change_it_names() {
     let _guard = event_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -119,8 +121,8 @@ fn each_entry_point_drives_the_change_it_names() {
 fn a_null_handle_is_ignored_and_a_null_id_is_not_fatal() {
     let core = adele_core_new(Some(noop_sink), std::ptr::null_mut());
     // SAFETY: a null handle and a null id are both part of the documented
-    // contract - the handle is never dereferenced, and a null id decodes to an
-    // empty string, which the daemon refuses like any unknown id.
+    // contract - neither is dereferenced. A null handle is ignored outright; a
+    // null id decodes to an empty string and travels as an ordinary id.
     unsafe {
         adele_core_archive_conversation(std::ptr::null_mut(), std::ptr::null());
         adele_core_unarchive_conversation(std::ptr::null_mut(), std::ptr::null());

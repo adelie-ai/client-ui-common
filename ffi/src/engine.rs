@@ -43,7 +43,8 @@ use tokio::sync::mpsc;
 
 use crate::client_mcp::ClientServerWrite;
 use crate::conversations::{
-    ArchiveChange, ConversationInventory, archive_and_relist, auto_open_target, disconnected_report,
+    ArchiveChange, ConversationInventory, archive_and_relist, auto_open_target,
+    disconnected_report, keeps_open,
 };
 use crate::view_event::{ClientServerDto, ViewEvent, view_event_for_signal};
 
@@ -525,6 +526,13 @@ struct Engine {
 /// to the live turn and the echoed `UserMessageAdded` dedupes by exact match.
 /// (KDE's default D-Bus transport drops the key — idempotency is inert there
 /// until a UDS/WS transport carries it; that is harmless.)
+fn submit_prompt_message(text: String) -> UiMessage {
+    UiMessage::SubmitPrompt {
+        prompt: text,
+        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+    }
+}
+
 /// Read the JSON a client handed the generic command bridge as a daemon
 /// command.
 ///
@@ -533,13 +541,6 @@ struct Engine {
 /// intents depends on this parse accepting the command it names.
 fn parse_bridge_command(json: &str) -> Result<api::Command, String> {
     serde_json::from_str(json).map_err(|e| format!("invalid command json: {e}"))
-}
-
-fn submit_prompt_message(text: String) -> UiMessage {
-    UiMessage::SubmitPrompt {
-        prompt: text,
-        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-    }
 }
 
 impl Engine {
@@ -965,9 +966,10 @@ impl Engine {
     /// client or another - stays open and readable rather than being closed out
     /// from under the reader.
     fn ensure_active_conversation(&mut self) {
-        if let Some(active) = self.state.current_conversation_id.as_deref()
-            && self.state.conversations.iter().any(|c| c.id == active)
-        {
+        if keeps_open(
+            &self.state.conversations,
+            self.state.current_conversation_id.as_deref(),
+        ) {
             return;
         }
         match auto_open_target(&self.state.conversations) {
@@ -984,7 +986,8 @@ impl Engine {
     // Each clones the connector Arc + the self-channel and runs off the actor
     // loop, feeding results back as `ui(..)`. A missing connector means
     // we're disconnected — the action is silently dropped (the reducer/UI gate
-    // upstream), except `send`, which rolls its optimistic bubble back.
+    // upstream), except `send`, which rolls its optimistic bubble back, and
+    // `set_archived`, which reports the change that did not happen.
 
     fn spawn_connect(&self, mode: TransportMode, address: String) {
         let tx = self.self_tx.clone();
