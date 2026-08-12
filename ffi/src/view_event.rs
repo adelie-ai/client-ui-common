@@ -557,6 +557,34 @@ mod tests {
         assert!(json.contains(r#""type":"conversations""#));
         assert!(json.contains(r#""id":"c1""#));
         assert!(json.contains(r#""message_count":3"#));
+        assert!(json.contains(r#""archived":false"#));
+    }
+
+    /// The inventory carries archived conversations, and `archived` is the only
+    /// thing a client has to tell one from an active conversation. It must reach
+    /// the JSON, under that name, for the row that is archived.
+    #[test]
+    fn an_archived_conversation_reaches_the_view_flagged() {
+        let convs = vec![
+            ConversationSummary {
+                id: "active".into(),
+                title: "Active".into(),
+                message_count: 1,
+                archived: false,
+            },
+            ConversationSummary {
+                id: "filed".into(),
+                title: "Filed away".into(),
+                message_count: 2,
+                archived: true,
+            },
+        ];
+        let ev = ViewEvent::try_from_view_effect(Effect::SetConversations(convs))
+            .expect("SetConversations is a view effect");
+        let json = ev.to_json().unwrap();
+        assert!(json.contains(r#""id":"filed""#), "{json}");
+        assert!(json.contains(r#""archived":true"#), "{json}");
+        assert!(json.contains(r#""archived":false"#), "{json}");
     }
 
     #[test]

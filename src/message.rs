@@ -15,7 +15,9 @@ pub enum UiMessage {
     ConversationsLoaded(Vec<api::client::ConversationSummary>),
     /// A *list-only* re-fetch of the conversation list, triggered by
     /// [`UiMessage::ConversationListChanged`] (a conversation was
-    /// created/renamed/deleted/(un)archived elsewhere — #1). Unlike
+    /// created/renamed/deleted/(un)archived elsewhere — #1), or delivered by a
+    /// host after a change it made itself that leaves only the sidebar stale (an
+    /// (un)archive). Unlike
     /// [`UiMessage::ConversationsLoaded`], the reducer repaints ONLY the sidebar
     /// (and re-syncs the selection); it deliberately does NOT reload the open
     /// conversation's chat or touch the model picker, so a sibling-client change

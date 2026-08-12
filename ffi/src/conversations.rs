@@ -13,9 +13,9 @@ use desktop_assistant_client_common::AssistantClient;
 
 /// What a transport round-trip failed with.
 ///
-/// Why an error object rather than a `String`: the source chain survives, so a
-/// later caller can inspect the cause instead of reading a message. The only
-/// caller today renders it into a `UiMessage::Error`.
+/// An error object rather than a `String` so the cause stays reachable through
+/// `source()`. The one caller today renders only the outermost message, which is
+/// what the other conversation RPCs in the executor report.
 type TransportError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Which way an (un)archive moves a conversation.
@@ -35,15 +35,24 @@ impl ArchiveChange {
             Self::Unarchive => "unarchive",
         }
     }
+
+    /// The same word as it reads in a report of what did not happen.
+    fn past(self) -> &'static str {
+        match self {
+            Self::Archive => "archived",
+            Self::Unarchive => "unarchived",
+        }
+    }
 }
 
 /// The conversation-inventory calls this core makes on a transport.
 ///
 /// Why a trait of its own over [`AssistantClient`], which already has all four
 /// underlying calls: the transport offers two list calls, and which population
-/// this core reads is one decision, not a decision per call site. Naming the
-/// archive round-trip as a single operation keeps the same discipline for the
-/// change itself.
+/// this core reads is one answer, written once here. The trait states the
+/// answer; what holds the executor to it is
+/// `the_executor_never_reads_the_active_only_list`, since a blanket impl cannot
+/// hide the narrower call from a call site that still has it in scope.
 pub(crate) trait ConversationInventory {
     /// Every conversation the account holds, archived rows included, in the
     /// daemon's order.
@@ -103,13 +112,27 @@ where
     }
 }
 
+/// The report for an (un)archive that was never attempted, because the core has
+/// no connection.
+///
+/// Why it is reported rather than dropped: the change did not happen, and a
+/// person who clicked Archive and was told nothing has no way to tell that from
+/// a change that landed. The list on screen is already correct, so nothing
+/// repaints.
+pub(crate) fn disconnected_report(change: ArchiveChange) -> UiMessage {
+    UiMessage::Error(format!(
+        "Not connected - conversation not {}",
+        change.past()
+    ))
+}
+
 /// The conversation to open when the view has none: the most recent one that is
 /// not archived.
 ///
 /// Why not simply the first row: the inventory carries archived conversations
 /// too, and opening one of those would put back on screen what the user filed
 /// away. `None` means there is nothing to open, and the caller creates a
-/// conversation — what it already did for an empty list.
+/// conversation - what it already did for an empty list.
 pub(crate) fn auto_open_target(
     conversations: &[ConversationSummary],
 ) -> Option<&ConversationSummary> {
@@ -140,9 +163,9 @@ mod tests {
     enum Call {
         Archive(String),
         Unarchive(String),
-        /// `list_conversations` — the active-only population.
+        /// `list_conversations` - the active-only population.
         ListActive,
-        /// `list_conversations_with_archived` — the whole population.
+        /// `list_conversations_with_archived` - the whole population.
         ListAll,
     }
 
@@ -407,28 +430,27 @@ mod tests {
 
     /// Acceptance criterion: an active conversation is still flagged
     /// not-archived, and ordering is unchanged.
+    ///
+    /// Asserted on the list the actor delivers, not on the transport's answer,
+    /// so a refresh that sorted, filtered, or re-flagged the rows on the way
+    /// through would fail here.
     #[tokio::test]
-    async fn the_inventory_keeps_the_daemons_order_and_flags() {
-        let held = vec![
+    async fn the_refreshed_list_keeps_the_daemons_order_and_flags() {
+        let daemon = FakeDaemon::holding(vec![
             summary("newest", false),
             summary("filed", true),
             summary("oldest", false),
-        ];
-        let daemon = FakeDaemon::holding(held.clone());
+        ]);
 
-        let convs = daemon
-            .list_all()
-            .await
-            .expect("the fake daemon lists without failing");
+        let messages = archive_and_relist(&daemon, "filed", ArchiveChange::Archive).await;
 
         assert_eq!(
-            convs
-                .iter()
-                .map(|c| (c.id.clone(), c.archived))
-                .collect::<Vec<_>>(),
-            held.iter()
-                .map(|c| (c.id.clone(), c.archived))
-                .collect::<Vec<_>>(),
+            refreshed_list(&messages),
+            vec![
+                ("newest".to_string(), false),
+                ("filed".to_string(), true),
+                ("oldest".to_string(), false),
+            ]
         );
     }
 
@@ -480,6 +502,42 @@ mod tests {
         match messages.as_slice() {
             [UiMessage::Error(text)] => assert!(text.contains("connection lost"), "{text}"),
             other => panic!("expected one error message, got {other:?}"),
+        }
+    }
+
+    /// The second defect in issue #78 was one call site at a time: every path
+    /// that read the list asked for the active-only population, so no client
+    /// ever saw an archived conversation. [`ConversationInventory::list_all`] is
+    /// now the single reader, but a blanket impl cannot take the narrower call
+    /// away from a call site that still has [`AssistantClient`] in scope - a
+    /// reverted line would compile and pass every behavioural test in this file
+    /// while the archived rows vanished again. This reads the executor and
+    /// requires that no such line exists.
+    #[test]
+    fn the_executor_never_reads_the_active_only_list() {
+        const EXECUTOR: &str = include_str!("engine.rs");
+        assert!(
+            !EXECUTOR.contains("list_conversations()"),
+            "the executor must read the inventory through list_all, which asks \
+             for the archived population too"
+        );
+    }
+
+    /// An (un)archive with no connection never reaches the daemon. It is still a
+    /// change that did not happen, so it is reported rather than dropped, and it
+    /// is reported by the word the user asked for.
+    #[test]
+    fn a_change_that_cannot_be_sent_reports_itself() {
+        match disconnected_report(ArchiveChange::Archive) {
+            UiMessage::Error(text) => {
+                assert!(text.contains("Not connected"), "{text}");
+                assert!(text.contains("not archived"), "{text}");
+            }
+            other => panic!("expected an error message, got {other:?}"),
+        }
+        match disconnected_report(ArchiveChange::Unarchive) {
+            UiMessage::Error(text) => assert!(text.contains("not unarchived"), "{text}"),
+            other => panic!("expected an error message, got {other:?}"),
         }
     }
 

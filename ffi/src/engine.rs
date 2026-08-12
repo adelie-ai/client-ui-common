@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 
 use crate::client_mcp::ClientServerWrite;
 use crate::conversations::{
-    ArchiveChange, ConversationInventory, archive_and_relist, auto_open_target,
+    ArchiveChange, ConversationInventory, archive_and_relist, auto_open_target, disconnected_report,
 };
 use crate::view_event::{ClientServerDto, ViewEvent, view_event_for_signal};
 
@@ -525,6 +525,16 @@ struct Engine {
 /// to the live turn and the echoed `UserMessageAdded` dedupes by exact match.
 /// (KDE's default D-Bus transport drops the key — idempotency is inert there
 /// until a UDS/WS transport carries it; that is harmless.)
+/// Read the JSON a client handed the generic command bridge as a daemon
+/// command.
+///
+/// The bridge's own step, lifted out of the spawn so it can be exercised: a
+/// client that drives an (un)archive this way rather than through the typed
+/// intents depends on this parse accepting the command it names.
+fn parse_bridge_command(json: &str) -> Result<api::Command, String> {
+    serde_json::from_str(json).map_err(|e| format!("invalid command json: {e}"))
+}
+
 fn submit_prompt_message(text: String) -> UiMessage {
     UiMessage::SubmitPrompt {
         prompt: text,
@@ -793,8 +803,8 @@ impl Engine {
         tokio::spawn(async move {
             let (ok, result, error) = match connector {
                 None => (false, None, Some("not connected".to_string())),
-                Some(conn) => match serde_json::from_str::<api::Command>(&command_json) {
-                    Err(e) => (false, None, Some(format!("invalid command json: {e}"))),
+                Some(conn) => match parse_bridge_command(&command_json) {
+                    Err(e) => (false, None, Some(e)),
                     Ok(command) => match conn.client().as_commands() {
                         None => (
                             false,
@@ -947,9 +957,13 @@ impl Engine {
 
     /// Auto-open the most-recent conversation the user has not filed away (or
     /// create one when there is none), mirroring gtk's
-    /// `ensure_active_conversation`. A no-op when an active conversation is
-    /// already set and still present — including an archived one the user
-    /// opened deliberately.
+    /// `ensure_active_conversation`. Only the conversation this core opens *for*
+    /// the user skips archived rows.
+    ///
+    /// A no-op when an active conversation is already set and still present,
+    /// archived or not. So a conversation that is archived while open - by this
+    /// client or another - stays open and readable rather than being closed out
+    /// from under the reader.
     fn ensure_active_conversation(&mut self) {
         if let Some(active) = self.state.current_conversation_id.as_deref()
             && self.state.conversations.iter().any(|c| c.id == active)
@@ -1401,6 +1415,11 @@ impl Engine {
     /// untouched and refreshes nothing on its own.
     fn spawn_set_archived(&self, id: String, change: ArchiveChange) {
         let Some(conn) = self.connector.clone() else {
+            // The one RPC spawn that reports a missing connection rather than
+            // dropping the action, alongside `spawn_send`: a change the user
+            // asked for did not happen, and the list on screen looks exactly as
+            // it would if it had.
+            let _ = self.self_tx.send(ui(disconnected_report(change)));
             return;
         };
         let tx = self.self_tx.clone();
@@ -3033,16 +3052,15 @@ mod turn_state_tests {
 
 /// The generic command bridge (`adele_core_send_command`) is the route a client
 /// may already (un)archive through, and it stays open beside the typed intents.
-/// The bridge's own step is the parse: whatever a client hands it becomes an
-/// `api::Command` or an error. These pin that the archive commands still parse
-/// to the commands they name — the round-trip itself needs a daemon and is not
-/// exercised here.
+///
+/// These exercise the bridge's own parse, which is the step this change could
+/// have broken; the round trip past it needs a daemon and is not exercised here.
 #[cfg(test)]
 mod command_bridge_tests {
     use super::*;
 
     fn parsed(json: &str) -> api::Command {
-        serde_json::from_str(json).expect("the bridge parses a well-formed command")
+        parse_bridge_command(json).expect("the bridge parses a well-formed command")
     }
 
     #[test]
@@ -3063,5 +3081,11 @@ mod command_bridge_tests {
                 id: "c1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn the_bridge_names_the_json_it_cannot_read() {
+        let refusal = parse_bridge_command("{not json").expect_err("malformed json is refused");
+        assert!(refusal.contains("invalid command json"), "{refusal}");
     }
 }
