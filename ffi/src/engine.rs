@@ -22,6 +22,7 @@
 //! connector directly, installs it on connect, and drops it on
 //! [`Effect::ClearClient`].
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -186,7 +187,8 @@ pub enum Intent {
     /// their live status, delivered as a [`ViewEvent::McpClientServers`]. The
     /// sibling of [`RequestMcpBuiltins`]: answerable with no connection (the
     /// server list is a property of what `client-mcp.toml` says), with the live
-    /// tool counts filling in once a connection has started the MCP host.
+    /// tool counts filling in for each server a running MCP host was started
+    /// with. [`mcp_client_servers_event_at`] holds the whole status contract.
     RequestMcpClientServers,
     /// Turn one built-in on or off **for this client's surface**, by writing
     /// `[surfaces.<surface>].disabled_builtins` in the shared `client-mcp.toml`.
@@ -230,7 +232,14 @@ enum CoreMsg {
     /// actor to own (issue #464). Sent right after `InstallConnector` and before
     /// the signal pump starts, so any `ClientToolCall` the pump forwards finds
     /// the host already installed.
-    InstallMcpHost(Arc<McpHost>),
+    ///
+    /// `started` names the external servers the host was started with. The host
+    /// exposes no accessor for that set, and the status of every client-run row
+    /// depends on it, so the connect task carries it across with the host.
+    InstallMcpHost {
+        host: Arc<McpHost>,
+        started: BTreeSet<String>,
+    },
     /// The connect task failed before producing a connector.
     ConnectFailed(String),
     /// A view event produced outside the reducer — the signal pump's direct
@@ -339,27 +348,39 @@ fn mcp_builtins_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> 
 /// when an HTTP endpoint is configured, else `stdio`).
 ///
 /// The status and tool count come from the surface's selection first, then the
-/// host:
+/// set the running host was started with (`started`), then the host's tally:
 ///
 /// - **Not hosted here** — the definition is switched off, or this surface does
 ///   not list it: `disabled`, with a `0` tool count.
 /// - **Hosted, no host running** (`host` is `None`): `enabled` — configured and
 ///   switched on, not yet started.
-/// - **Hosted, host running**: a server whose namespace the host tallies is
-///   `running` with its live tool count; one the host did NOT start — it failed
-///   to launch or list its tools — is absent from the tally and reports `error`.
+/// - **Hosted, host running, not in `started`** — added or switched on since the
+///   host started, so the host was never given it: `enabled`. It starts on the
+///   next connect.
+/// - **Hosted, host running, in `started`, in the tally**: `running`, with its
+///   live tool count.
+/// - **Hosted, host running, in `started`, absent from the tally**: `error` —
+///   the host was given it and it did not launch or list its tools.
 ///
-/// The order matters: a disabled server is absent from a running host's tally
-/// too, so deciding it first is what keeps it from reporting as a failure.
+/// The order matters, because three different things are absent from a running
+/// host's tally and only one of them is a failure: a disabled server, a server
+/// created after the host started, and a server that failed. Deciding the first
+/// two before the tally is what keeps them from reporting as failures.
 ///
 /// The tool-count key is the server's namespace (`cfg.namespace`, or its name
-/// when unset), matching [`McpHost::tool_counts`]'s key exactly.
+/// when unset), matching [`McpHost::tool_counts`]'s key exactly. `started` holds
+/// server *names*, which is what a surface's `enabled` list holds.
 ///
 /// Takes the path explicitly so the on-disk behavior is testable without
 /// touching the developer's real `~/.config/adele/client-mcp.toml`.
 ///
 /// [`McpHost::tool_counts`]: desktop_assistant_client_common::mcp_host::McpHost::tool_counts
-fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &str) -> ViewEvent {
+fn mcp_client_servers_event_at(
+    path: &Path,
+    host: Option<&McpHost>,
+    started: &BTreeSet<String>,
+    surface: &str,
+) -> ViewEvent {
     let cfg = ClientMcpConfig::load(path);
     let counts = host.map(|h| h.tool_counts());
     let hosted: Vec<&str> = cfg
@@ -373,14 +394,10 @@ fn mcp_client_servers_event_at(path: &Path, host: Option<&McpHost>, surface: &st
         .map(|s| {
             let namespace_key = s.namespace.clone().unwrap_or_else(|| s.name.clone());
             let transport = if s.http.is_some() { "http" } else { "stdio" };
-            // With a running host, a hosted server the host is serving reports
-            // its live tool count; one the host never started is absent from the
-            // tally and is surfaced as an error rather than a silent zero. A
-            // server this surface does not host is absent from the tally for a
-            // reason that is not failure, so it is decided before the tally.
             let (status, tool_count) = match &counts {
                 _ if !hosted.contains(&s.name.as_str()) => ("disabled", 0),
                 None => ("enabled", 0),
+                _ if !started.contains(&s.name) => ("enabled", 0),
                 Some(counts) => match counts.get(&namespace_key) {
                     // Saturate rather than wrap: a count that cannot fit is absurd.
                     Some(&n) => ("running", u32::try_from(n).unwrap_or(u32::MAX)),
@@ -447,6 +464,14 @@ struct Engine {
     /// `kde` surface has servers configured); replaced on each connect and shut
     /// down on disconnect.
     mcp_host: Option<Arc<McpHost>>,
+    /// The external server names [`Self::mcp_host`] was started with.
+    ///
+    /// Why the engine keeps it: the host reports which servers it *serves*, not
+    /// which it was *asked* to serve, and the difference is what separates a
+    /// server that failed to start from one created after the host started.
+    /// `McpHost` exposes no accessor for the set, and it lives in another repo.
+    /// Filled on install and emptied with the host, so it never outlives it.
+    mcp_started_servers: BTreeSet<String>,
     self_tx: mpsc::UnboundedSender<CoreMsg>,
     sink: ViewSink,
     /// Per-message model override staged by `SelectModel`, applied on the next
@@ -497,10 +522,11 @@ impl Engine {
                 CoreMsg::Ui(boxed) => self.dispatch(*boxed),
                 CoreMsg::InstallConnector(conn) => self.connector = Some(conn),
                 CoreMsg::EmitView(ev) => self.sink.emit(&ev),
-                CoreMsg::InstallMcpHost(host) => {
+                CoreMsg::InstallMcpHost { host, started } => {
                     // Shut down any prior host before adopting the new one.
                     self.shutdown_mcp_host();
                     self.mcp_host = Some(host);
+                    self.mcp_started_servers = started;
                 }
                 CoreMsg::ConnectFailed(err) => {
                     self.sink.emit(&ViewEvent::ConnectError {
@@ -674,10 +700,12 @@ impl Engine {
         let sink = self.sink;
         let surface = self.mcp_surface.clone();
         let host = self.mcp_host.clone();
+        let started = self.mcp_started_servers.clone();
         tokio::spawn(async move {
             sink.emit(&mcp_client_servers_event_at(
                 &default_client_mcp_path(),
                 host.as_deref(),
+                &started,
                 &surface,
             ));
         });
@@ -716,6 +744,7 @@ impl Engine {
         let sink = self.sink;
         let surface = self.mcp_surface.clone();
         let host = self.mcp_host.clone();
+        let started = self.mcp_started_servers.clone();
         tokio::spawn(async move {
             let path = default_client_mcp_path();
             if let Err(err) = write.apply(&path, &surface).await {
@@ -727,6 +756,7 @@ impl Engine {
             sink.emit(&mcp_client_servers_event_at(
                 &path,
                 host.as_deref(),
+                &started,
                 &surface,
             ));
         });
@@ -817,6 +847,7 @@ impl Engine {
     /// `Arc` there (and when that call finishes) still tears the children down —
     /// `McpClient` kills its child on drop — so the servers never leak.
     fn shutdown_mcp_host(&mut self) {
+        self.mcp_started_servers.clear();
         if let Some(host) = self.mcp_host.take() {
             tokio::spawn(async move {
                 match Arc::try_unwrap(host) {
@@ -965,7 +996,15 @@ impl Engine {
                             )
                             .await,
                         );
-                        let _ = tx.send(CoreMsg::InstallMcpHost(Arc::clone(&host)));
+                        // The names offered to this host, carried across so the
+                        // panel can tell a server that failed to start from one
+                        // configured after the host started.
+                        let started: BTreeSet<String> =
+                            mcp_servers.iter().map(|s| s.name.clone()).collect();
+                        let _ = tx.send(CoreMsg::InstallMcpHost {
+                            host: Arc::clone(&host),
+                            started,
+                        });
                         Some(host)
                     };
                     // Pump signals -> messages. Holds only the receiver (never the
@@ -1351,6 +1390,7 @@ impl Core {
             state: WindowState::default(),
             connector: None,
             mcp_host: None,
+            mcp_started_servers: BTreeSet::new(),
             self_tx: tx.clone(),
             sink,
             staged_override: None,
@@ -1508,12 +1548,15 @@ mod share_context_tests {
     /// Build a bare engine for the field-storage assertions. No tokio runtime is
     /// needed because `SetShareClientContext` only mutates a field — it never
     /// spawns — so a plain `#[test]` suffices.
-    fn test_engine() -> Engine {
+    ///
+    /// Shared with the sibling test modules that assert on an actor field.
+    pub(super) fn test_engine() -> Engine {
         let (tx, _rx) = mpsc::unbounded_channel();
         Engine {
             state: WindowState::default(),
             connector: None,
             mcp_host: None,
+            mcp_started_servers: BTreeSet::new(),
             self_tx: tx,
             sink: ViewSink::new(noop_sink, 0),
             staged_override: None,
@@ -2172,7 +2215,7 @@ done
     #[test]
     fn client_servers_event_reports_the_surface_it_resolved() {
         let (_dir, path) = temp_config(None);
-        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let ev = mcp_client_servers_event_at(&path, None, &BTreeSet::new(), "mac");
         assert_eq!(surface_of(&ev), "mac");
     }
 
@@ -2181,7 +2224,15 @@ done
     #[test]
     fn client_servers_event_is_empty_with_no_config() {
         let (_dir, path) = temp_config(None);
-        assert!(servers_of(&mcp_client_servers_event_at(&path, None, "mac")).is_empty());
+        assert!(
+            servers_of(&mcp_client_servers_event_at(
+                &path,
+                None,
+                &BTreeSet::new(),
+                "mac"
+            ))
+            .is_empty()
+        );
     }
 
     /// The default core → empty client list (the acceptance spec's baseline): no
@@ -2205,7 +2256,7 @@ url = "https://example.test/mcp"
 enabled = ["browser", "remote"]
 "#,
         ));
-        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let ev = mcp_client_servers_event_at(&path, None, &BTreeSet::new(), "mac");
         let servers = servers_of(&ev);
         assert_eq!(servers.len(), 2);
 
@@ -2249,7 +2300,7 @@ enabled = ["browser"]
 enabled = []
 "#,
         ));
-        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let ev = mcp_client_servers_event_at(&path, None, &BTreeSet::new(), "mac");
         let servers = servers_of(&ev);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "browser");
@@ -2272,7 +2323,7 @@ enabled = false
 enabled = ["browser"]
 "#,
         ));
-        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let ev = mcp_client_servers_event_at(&path, None, &BTreeSet::new(), "mac");
         let servers = servers_of(&ev);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].status, "disabled");
@@ -2292,7 +2343,7 @@ command = "/usr/bin/browser-mcp"
 enabled = ["browser"]
 "#,
         ));
-        let ev = mcp_client_servers_event_at(&path, None, "mac");
+        let ev = mcp_client_servers_event_at(&path, None, &BTreeSet::new(), "mac");
         let browser = &servers_of(&ev)[0];
         assert!(browser.namespace.is_none());
     }
@@ -2335,9 +2386,10 @@ enabled = ["good", "broken"]
             .into_iter()
             .cloned()
             .collect();
+        let started: BTreeSet<String> = servers.iter().map(|s| s.name.clone()).collect();
         let host = McpHost::start(&servers).await;
 
-        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), &started, "mac");
         let rows = servers_of(&ev);
 
         let good = rows.iter().find(|s| s.name == "good").expect("good listed");
@@ -2367,7 +2419,7 @@ enabled = ["good", "broken"]
     async fn host_started_before(
         extra_servers: &str,
         hosted_after: &str,
-    ) -> (tempfile::TempDir, PathBuf, McpHost, Vec<String>) {
+    ) -> (tempfile::TempDir, PathBuf, McpHost, BTreeSet<String>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let script = dir.path().join("fake.sh");
         std::fs::write(&script, FAKE_SERVER).expect("write the fake server");
@@ -2393,7 +2445,7 @@ namespace = "ns"
             .into_iter()
             .cloned()
             .collect();
-        let started: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+        let started: BTreeSet<String> = servers.iter().map(|s| s.name.clone()).collect();
         let host = McpHost::start(&servers).await;
 
         std::fs::write(
@@ -2409,7 +2461,7 @@ namespace = "ns"
     /// starts on the next connect, and the row must say so.
     #[tokio::test]
     async fn client_servers_event_reports_a_server_added_while_connected_as_enabled() {
-        let (_dir, cfg_path, host, _started) = host_started_before(
+        let (_dir, cfg_path, host, started) = host_started_before(
             r#"
 [[servers]]
 name = "late"
@@ -2419,7 +2471,7 @@ command = "/usr/bin/late-mcp"
         )
         .await;
 
-        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), &started, "mac");
         let late = servers_of(&ev)
             .iter()
             .find(|s| s.name == "late")
@@ -2437,7 +2489,7 @@ command = "/usr/bin/late-mcp"
     /// not host until now: the running host was not given it either.
     #[tokio::test]
     async fn client_servers_event_reports_a_server_enabled_while_connected_as_enabled() {
-        let (_dir, cfg_path, host, _started) = host_started_before(
+        let (_dir, cfg_path, host, started) = host_started_before(
             r#"
 [[servers]]
 name = "parked"
@@ -2447,7 +2499,7 @@ command = "/usr/bin/parked-mcp"
         )
         .await;
 
-        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), &started, "mac");
         let parked = servers_of(&ev)
             .iter()
             .find(|s| s.name == "parked")
@@ -2461,7 +2513,7 @@ command = "/usr/bin/parked-mcp"
     /// reporting its live tool count.
     #[tokio::test]
     async fn client_servers_event_still_reports_a_served_server_as_running() {
-        let (_dir, cfg_path, host, _started) = host_started_before(
+        let (_dir, cfg_path, host, started) = host_started_before(
             r#"
 [[servers]]
 name = "late"
@@ -2471,7 +2523,7 @@ command = "/usr/bin/late-mcp"
         )
         .await;
 
-        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), &started, "mac");
         let good = servers_of(&ev)
             .iter()
             .find(|s| s.name == "good")
@@ -2480,6 +2532,23 @@ command = "/usr/bin/late-mcp"
         assert_eq!(good.tool_count, 1);
 
         host.shutdown().await;
+    }
+
+    /// A disconnect drops the host, and the names it was started with must go
+    /// with it. A set that outlived its host would keep deciding statuses for a
+    /// host that no longer runs, so a server it had started would report
+    /// `error` instead of falling back to the no-host answer.
+    #[tokio::test]
+    async fn a_disconnect_clears_the_started_server_set() {
+        let mut engine = super::share_context_tests::test_engine();
+        engine.mcp_started_servers = ["good".to_string(), "broken".to_string()]
+            .into_iter()
+            .collect();
+
+        engine.shutdown_mcp_host();
+
+        assert!(engine.mcp_started_servers.is_empty());
+        assert!(engine.mcp_host.is_none());
     }
 
     /// A disabled server is absent from a running host's tally for a reason that
@@ -2518,9 +2587,10 @@ enabled = ["good"]
             .into_iter()
             .cloned()
             .collect();
+        let started: BTreeSet<String> = servers.iter().map(|s| s.name.clone()).collect();
         let host = McpHost::start(&servers).await;
 
-        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), "mac");
+        let ev = mcp_client_servers_event_at(&cfg_path, Some(&host), &started, "mac");
         let rows = servers_of(&ev);
         let parked = rows
             .iter()
@@ -2584,6 +2654,7 @@ mod turn_state_tests {
             state: WindowState::default(),
             connector: None,
             mcp_host: None,
+            mcp_started_servers: BTreeSet::new(),
             self_tx: tx,
             sink: ViewSink::new(recording_sink, 0),
             staged_override: None,

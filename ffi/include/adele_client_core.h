@@ -238,11 +238,14 @@ void adele_core_request_mcp_builtins(Core *core);
 
  The list covers every **defined** server, not only the hosted ones, so a panel
  can show — and switch back on — a server this surface has turned off. A server
- this surface does not host reports `disabled`; a hosted one reports `enabled`
- with a `0` tool count until a connection starts the client MCP host, and
- `running` (with its live tool count) or `error` after that. A machine that
- defines no external servers answers with an empty list — the honest "none
- configured".
+ this surface does not host reports `disabled`. A hosted one reports `enabled`,
+ with a `0` tool count, until a running client MCP host has been started with
+ it — so a server added or switched on during a connection also reports
+ `enabled`, because the running host was never given it and it starts on the
+ next [`adele_core_connect`]. Once a running host has been given it, the row is
+ `running` with its live tool count, or `error` when the host could not start
+ it. A machine that defines no external servers answers with an empty list —
+ the honest "none configured".
 
  # Safety
  `core` must be a live handle from [`adele_core_new`].
