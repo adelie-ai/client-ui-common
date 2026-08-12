@@ -27,6 +27,12 @@ pub struct ConversationSummaryDto {
     pub id: String,
     pub title: String,
     pub message_count: u32,
+    /// Whether the user has filed this conversation away.
+    ///
+    /// The inventory the core sends carries archived rows as well as active
+    /// ones, so a client decides for itself whether to group them, hide them, or
+    /// list them inline. A client that renders every row it is given lists them
+    /// inline.
     pub archived: bool,
 }
 
@@ -551,6 +557,34 @@ mod tests {
         assert!(json.contains(r#""type":"conversations""#));
         assert!(json.contains(r#""id":"c1""#));
         assert!(json.contains(r#""message_count":3"#));
+        assert!(json.contains(r#""archived":false"#));
+    }
+
+    /// The inventory carries archived conversations, and `archived` is the only
+    /// thing a client has to tell one from an active conversation. It must reach
+    /// the JSON, under that name, for the row that is archived.
+    #[test]
+    fn an_archived_conversation_reaches_the_view_flagged() {
+        let convs = vec![
+            ConversationSummary {
+                id: "active".into(),
+                title: "Active".into(),
+                message_count: 1,
+                archived: false,
+            },
+            ConversationSummary {
+                id: "filed".into(),
+                title: "Filed away".into(),
+                message_count: 2,
+                archived: true,
+            },
+        ];
+        let ev = ViewEvent::try_from_view_effect(Effect::SetConversations(convs))
+            .expect("SetConversations is a view effect");
+        let json = ev.to_json().unwrap();
+        assert!(json.contains(r#""id":"filed""#), "{json}");
+        assert!(json.contains(r#""archived":true"#), "{json}");
+        assert!(json.contains(r#""archived":false"#), "{json}");
     }
 
     #[test]

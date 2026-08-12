@@ -115,6 +115,26 @@ void adele_core_new_conversation(Core *core);
 void adele_core_delete_conversation(Core *core, const char *conversation_id);
 
 /*
+ Put a conversation away. The core performs the change and then re-reads the
+ conversation list, so the refreshed inventory arrives as a `conversations`
+ view event with no further call from the client. Each row carries `archived`,
+ so a client groups or hides them as it sees fit.
+
+ # Safety
+ `core` must be a live handle; `conversation_id` must be null or a valid C string.
+ */
+void adele_core_archive_conversation(Core *core, const char *conversation_id);
+
+/*
+ Bring an archived conversation back out. Refreshes the list exactly as
+ [`adele_core_archive_conversation`] does.
+
+ # Safety
+ `core` must be a live handle; `conversation_id` must be null or a valid C string.
+ */
+void adele_core_unarchive_conversation(Core *core, const char *conversation_id);
+
+/*
  Set the `You:` (voice input) state for a conversation.
 
  # Safety

@@ -25,6 +25,7 @@
 
 mod builtins;
 mod client_mcp;
+mod conversations;
 mod engine;
 mod markdown;
 mod view_event;
@@ -222,6 +223,46 @@ pub unsafe extern "C" fn adele_core_delete_conversation(
         return;
     };
     core.send_intent(Intent::DeleteConversation(unsafe {
+        cstr_to_string(conversation_id)
+    }));
+}
+
+/// Put a conversation away. The core performs the change and then re-reads the
+/// conversation list, so the refreshed inventory arrives as a `conversations`
+/// view event with no further call from the client. Each row carries `archived`,
+/// so a client groups or hides them as it sees fit.
+///
+/// # Safety
+/// `core` must be a live handle; `conversation_id` must be null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_archive_conversation(
+    core: *mut Core,
+    conversation_id: *const c_char,
+) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::ArchiveConversation(unsafe {
+        cstr_to_string(conversation_id)
+    }));
+}
+
+/// Bring an archived conversation back out. Refreshes the list exactly as
+/// [`adele_core_archive_conversation`] does.
+///
+/// # Safety
+/// `core` must be a live handle; `conversation_id` must be null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_unarchive_conversation(
+    core: *mut Core,
+    conversation_id: *const c_char,
+) {
+    // SAFETY: contract above.
+    let Some(core) = (unsafe { core.as_ref() }) else {
+        return;
+    };
+    core.send_intent(Intent::UnarchiveConversation(unsafe {
         cstr_to_string(conversation_id)
     }));
 }

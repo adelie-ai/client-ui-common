@@ -109,6 +109,12 @@ cbindgen = "0.29"
 # spec needs its own handle on the shared crate to assert the C ABI's exported
 # bridge names match it.
 adele-markdown = { path = "../markdown" }
+# The conversation-inventory spec stands a fake daemon up at the transport's own
+# trait boundary (`AssistantClient`), so it needs that trait's own tools: the
+# `#[async_trait]` attribute it is declared with, and the `anyhow` error type its
+# methods return.
+anyhow = "1"
+async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }
 # The client-MCP-host wiring tests spin up a `/bin/sh` fake MCP server from a
 # temp dir (mirroring the `mcp_host` unit tests).

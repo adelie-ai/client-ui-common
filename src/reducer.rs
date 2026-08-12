@@ -836,11 +836,14 @@ pub enum Effect {
     LoadConversation(String),
     /// Re-fetch the conversation list from the daemon, then deliver it as
     /// [`UiMessage::ConversationListRefetched`] — a *list-only* refresh used when
-    /// the list changed on another connection (#1). Kept as an effect because it
+    /// the list changed on another connection (#1). A host may deliver the same
+    /// message after a change it made itself, such as an (un)archive, for the
+    /// same reason: only the sidebar is stale. Kept as an effect because it
     /// needs the live client + ui_tx and spawns an async RPC; the decision to run
     /// it lives in `apply`. The result repaints only the sidebar (it does NOT
     /// reload the open conversation or touch the model picker), distinguishing it
-    /// from the connect-time `list_conversations -> ConversationsLoaded` path.
+    /// from the connect-time list load, which arrives as
+    /// [`UiMessage::ConversationsLoaded`] and does both.
     RefetchConversationList,
     /// Clear the chat view.
     ClearChat,
@@ -1314,7 +1317,9 @@ impl WindowState {
                 vec![Effect::RefetchConversationList]
             }
             UiMessage::ConversationListRefetched(convs) => {
-                // The list-only refresh requested by `ConversationListChanged`.
+                // The list-only refresh: requested by `ConversationListChanged`,
+                // or delivered by a host after a change of its own that touches
+                // the sidebar and nothing else (an (un)archive).
                 // Store the fresh list and repaint the sidebar; re-sync the
                 // selection via `EnsureActiveConversation` (a no-op beyond
                 // re-selecting the active row when it is still present — see
@@ -1323,8 +1328,9 @@ impl WindowState {
                 // chat and the model picker must stay exactly as the user left
                 // them. If the open conversation was the one deleted elsewhere,
                 // it is now absent from the list and `EnsureActiveConversation`
-                // falls back to the first conversation (or creates one), which is
-                // the right thing to show.
+                // falls back to another conversation (or creates one), which is
+                // the right thing to show. Which one it falls back to is the
+                // host's decision — see the executor's `ensure_active_conversation`.
                 self.conversations = convs.clone();
                 vec![
                     Effect::SetConversations(convs),

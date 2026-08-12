@@ -42,6 +42,10 @@ use desktop_assistant_client_common::{
 use tokio::sync::mpsc;
 
 use crate::client_mcp::ClientServerWrite;
+use crate::conversations::{
+    ArchiveChange, ConversationInventory, archive_and_relist, auto_open_target,
+    disconnected_report, keeps_open,
+};
 use crate::view_event::{ClientServerDto, ViewEvent, view_event_for_signal};
 
 /// The `client-mcp.toml` surface a core resolves MCP servers (and
@@ -135,6 +139,12 @@ pub enum Intent {
     NewConversation,
     /// The user deleted a conversation.
     DeleteConversation(String),
+    /// The user put a conversation away. The core performs the change and
+    /// re-reads the inventory, so the client's list refreshes on its own.
+    ArchiveConversation(String),
+    /// The user brought an archived conversation back out. Refreshes the list
+    /// the same way [`Intent::ArchiveConversation`] does.
+    UnarchiveConversation(String),
     /// The user changed the `You:` (voice input) setting for a conversation.
     SetVoiceIn {
         conversation_id: String,
@@ -523,6 +533,16 @@ fn submit_prompt_message(text: String) -> UiMessage {
     }
 }
 
+/// Read the JSON a client handed the generic command bridge as a daemon
+/// command.
+///
+/// The bridge's own step, lifted out of the spawn so it can be exercised: a
+/// client that drives an (un)archive this way rather than through the typed
+/// intents depends on this parse accepting the command it names.
+fn parse_bridge_command(json: &str) -> Result<api::Command, String> {
+    serde_json::from_str(json).map_err(|e| format!("invalid command json: {e}"))
+}
+
 impl Engine {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<CoreMsg>) {
         while let Some(msg) = rx.recv().await {
@@ -642,6 +662,10 @@ impl Engine {
             Intent::SelectConversation(id) => self.spawn_get_conversation(id, false),
             Intent::NewConversation => self.spawn_create_conversation(),
             Intent::DeleteConversation(id) => self.spawn_delete_conversation(id),
+            Intent::ArchiveConversation(id) => self.spawn_set_archived(id, ArchiveChange::Archive),
+            Intent::UnarchiveConversation(id) => {
+                self.spawn_set_archived(id, ArchiveChange::Unarchive)
+            }
             Intent::SetVoiceIn {
                 conversation_id,
                 enabled,
@@ -780,8 +804,8 @@ impl Engine {
         tokio::spawn(async move {
             let (ok, result, error) = match connector {
                 None => (false, None, Some("not connected".to_string())),
-                Some(conn) => match serde_json::from_str::<api::Command>(&command_json) {
-                    Err(e) => (false, None, Some(format!("invalid command json: {e}"))),
+                Some(conn) => match parse_bridge_command(&command_json) {
+                    Err(e) => (false, None, Some(e)),
                     Ok(command) => match conn.client().as_commands() {
                         None => (
                             false,
@@ -932,16 +956,23 @@ impl Engine {
         }
     }
 
-    /// Auto-open the most-recent conversation (or create one when the list is
-    /// empty), mirroring gtk's `ensure_active_conversation`. A no-op when an
-    /// active conversation is already set and still present.
+    /// Auto-open the most-recent conversation the user has not filed away (or
+    /// create one when there is none), mirroring gtk's
+    /// `ensure_active_conversation`. Only the conversation this core opens *for*
+    /// the user skips archived rows.
+    ///
+    /// A no-op when an active conversation is already set and still present,
+    /// archived or not. So a conversation that is archived while open - by this
+    /// client or another - stays open and readable rather than being closed out
+    /// from under the reader.
     fn ensure_active_conversation(&mut self) {
-        if let Some(active) = self.state.current_conversation_id.as_deref()
-            && self.state.conversations.iter().any(|c| c.id == active)
-        {
+        if keeps_open(
+            &self.state.conversations,
+            self.state.current_conversation_id.as_deref(),
+        ) {
             return;
         }
-        match self.state.conversations.first() {
+        match auto_open_target(&self.state.conversations) {
             Some(conv) => {
                 let id = conv.id.clone();
                 self.spawn_get_conversation(id, false);
@@ -955,7 +986,8 @@ impl Engine {
     // Each clones the connector Arc + the self-channel and runs off the actor
     // loop, feeding results back as `ui(..)`. A missing connector means
     // we're disconnected — the action is silently dropped (the reducer/UI gate
-    // upstream), except `send`, which rolls its optimistic bubble back.
+    // upstream), except `send`, which rolls its optimistic bubble back, and
+    // `set_archived`, which reports the change that did not happen.
 
     fn spawn_connect(&self, mode: TransportMode, address: String) {
         let tx = self.self_tx.clone();
@@ -1041,7 +1073,7 @@ impl Engine {
                         });
                     }
                     // Initial loads (tui's subscribe_and_load + finish_connection_init).
-                    match conn.client().list_conversations().await {
+                    match conn.client().list_all().await {
                         Ok(convs) => {
                             let _ = tx.send(ui(UiMessage::ConversationsLoaded(convs)));
                         }
@@ -1128,7 +1160,7 @@ impl Engine {
         };
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
-            match conn.client().list_conversations().await {
+            match conn.client().list_all().await {
                 Ok(convs) => {
                     let _ = tx.send(ui(UiMessage::ConversationListRefetched(convs)));
                 }
@@ -1345,7 +1377,7 @@ impl Engine {
                                 .send(ui(UiMessage::Error(format!("load new conversation: {e}"))));
                         }
                     }
-                    if let Ok(convs) = conn.client().list_conversations().await {
+                    if let Ok(convs) = conn.client().list_all().await {
                         let _ = tx.send(ui(UiMessage::ConversationsLoaded(convs)));
                     }
                 }
@@ -1365,13 +1397,38 @@ impl Engine {
             match conn.client().delete_conversation(&id).await {
                 Ok(()) => {
                     let _ = tx.send(ui(UiMessage::ConversationDeleted { id }));
-                    if let Ok(convs) = conn.client().list_conversations().await {
+                    if let Ok(convs) = conn.client().list_all().await {
                         let _ = tx.send(ui(UiMessage::ConversationsLoaded(convs)));
                     }
                 }
                 Err(e) => {
                     let _ = tx.send(ui(UiMessage::Error(format!("delete conversation: {e}"))));
                 }
+            }
+        });
+    }
+
+    /// Put a conversation away (or bring it back) and re-read the inventory, so
+    /// the client's list refreshes without asking for it.
+    ///
+    /// The same shape as [`spawn_delete_conversation`](Self::spawn_delete_conversation):
+    /// the daemon answers an (un)archive with an acknowledgement only, so the
+    /// re-read is what makes the change visible. A client can still drive the
+    /// same daemon command through [`Intent::SendCommand`]; that path is
+    /// untouched and refreshes nothing on its own.
+    fn spawn_set_archived(&self, id: String, change: ArchiveChange) {
+        let Some(conn) = self.connector.clone() else {
+            // The one RPC spawn that reports a missing connection rather than
+            // dropping the action, alongside `spawn_send`: a change the user
+            // asked for did not happen, and the list on screen looks exactly as
+            // it would if it had.
+            let _ = self.self_tx.send(ui(disconnected_report(change)));
+            return;
+        };
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            for msg in archive_and_relist(conn.client(), &id, change).await {
+                let _ = tx.send(ui(msg));
             }
         });
     }
@@ -2993,5 +3050,45 @@ mod turn_state_tests {
             offers(&events).is_empty(),
             "a completed turn must not offer a retry"
         );
+    }
+}
+
+/// The generic command bridge (`adele_core_send_command`) is the route a client
+/// may already (un)archive through, and it stays open beside the typed intents.
+///
+/// These exercise the bridge's own parse, which is the step this change could
+/// have broken; the round trip past it needs a daemon and is not exercised here.
+#[cfg(test)]
+mod command_bridge_tests {
+    use super::*;
+
+    fn parsed(json: &str) -> api::Command {
+        parse_bridge_command(json).expect("the bridge parses a well-formed command")
+    }
+
+    #[test]
+    fn the_bridge_still_carries_an_archive_command() {
+        assert_eq!(
+            parsed(r#"{"archive_conversation":{"id":"c1"}}"#),
+            api::Command::ArchiveConversation {
+                id: "c1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_bridge_still_carries_an_unarchive_command() {
+        assert_eq!(
+            parsed(r#"{"unarchive_conversation":{"id":"c1"}}"#),
+            api::Command::UnarchiveConversation {
+                id: "c1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_bridge_names_the_json_it_cannot_read() {
+        let refusal = parse_bridge_command("{not json").expect_err("malformed json is refused");
+        assert!(refusal.contains("invalid command json"), "{refusal}");
     }
 }

@@ -554,6 +554,8 @@ name = "client-ui-ffi"
 version = "0.1.0"
 dependencies = [
  "adele-markdown",
+ "anyhow",
+ "async-trait",
  "cbindgen",
  "client-ui-common",
  "desktop-assistant-api-model",
