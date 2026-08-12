@@ -217,9 +217,14 @@ fn apply_enabled(
 /// one name from it.
 ///
 /// A surface that already has a section inherits nothing, so it is left alone.
-/// `[surfaces.default]` is never seeded and never changed - it is the fallback
-/// every other surface reads. Only the `enabled` list is inherited:
-/// `disabled_builtins` has no fallback to begin with.
+/// Seeding never reads into or writes to `[surfaces.default]` itself: it is the
+/// fallback every other surface reads, and one surface's edit must not move it.
+/// (Deleting a *definition* is the one write that still reaches it, because
+/// [`ClientMcpConfig::remove_server`] prunes the name from every surface - a
+/// definition that no longer exists must not be listed anywhere.)
+///
+/// Only the `enabled` list is inherited: `disabled_builtins` has no fallback to
+/// begin with.
 pub(crate) fn seed_surface_from_default(cfg: &mut ClientMcpConfig, surface: &str) {
     if surface == DEFAULT_SURFACE || cfg.surfaces.contains_key(surface) {
         return;
@@ -792,10 +797,12 @@ command = "notes-mcp"
         assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["git"]);
     }
 
-    /// `[surfaces.default]` is the fallback every other surface reads, so an edit
-    /// made for one surface must never change it.
+    /// `[surfaces.default]` is the fallback every other surface reads, so adding
+    /// a server for one surface must never change it. (Deleting a definition
+    /// does prune it from every surface, `default` included - see
+    /// `removing_drops_the_definition_and_every_surface_membership`.)
     #[tokio::test]
-    async fn a_write_never_edits_the_default_surface() {
+    async fn an_upsert_never_edits_the_default_surface() {
         let fx = Fixture::new("inherit-default-untouched");
         fx.write(INHERITING);
 
@@ -831,8 +838,10 @@ enabled = []
 
     // --- serialization --------------------------------------------------------
 
-    /// How many writers the concurrency cases dispatch at once. Enough that an
-    /// unserialized read-modify-write loses at least one update on every run.
+    /// How many writers the concurrency cases dispatch at once. Every run of
+    /// these cases against the unserialized code lost several of them; the
+    /// number is high to make a lost update easy to hit, not because any one
+    /// count is guaranteed to lose one.
     const WRITERS: usize = 16;
 
     /// Writes dispatched together must all land. Each edit reads the whole file,
@@ -900,8 +909,11 @@ enabled = []
         assert_eq!(listed, expected);
     }
 
-    /// A refused write must leave the next one free to run: serialization that
-    /// keeps its hold after a failure would stall every later edit.
+    /// A refused write must leave the next one free to run. What this catches is
+    /// a hold that outlives a failure - hand-rolled lock and unlock calls, say,
+    /// with the unlock after an early return - which would stall every later
+    /// edit. The timeout turns that regression into a failure rather than a
+    /// suite that hangs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_write_does_not_block_the_next_one() {
         let fx = Fixture::new("refused-then-next");
