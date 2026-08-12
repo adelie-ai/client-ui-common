@@ -258,6 +258,31 @@ pub fn load_strict(path: &Path) -> Result<ClientMcpConfig, String> {
     }
 }
 
+/// Take the sidecar lock [`ClientMcpConfig::edit`] uses, the way another Adele
+/// client on the machine would, and hold it until the returned file drops.
+///
+/// A `flock` belongs to an open file description, so a second `open` in this
+/// same process contends exactly as a second process does — which is what lets
+/// a test stand in for the other client. The sidecar path is derived here rather
+/// than read from `client-common`, so the test pins the contract instead of
+/// following the implementation.
+#[cfg(test)]
+pub(crate) fn hold_config_lock(config_path: &Path) -> std::fs::File {
+    let mut lock_name = config_path
+        .file_name()
+        .expect("a config path has a file name")
+        .to_os_string();
+    lock_name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config_path.with_file_name(lock_name))
+        .expect("open the sidecar lock");
+    file.try_lock().expect("take the sidecar lock");
+    file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +956,44 @@ enabled = []
         .await
         .expect("the next write must not wait on the refused one");
         next.expect("the next write succeeds");
+
+        assert!(definition(&fx.read(), "notes").is_some());
+    }
+
+    /// The in-process lock orders this core's own writes. It says nothing about
+    /// the other Adele clients on the machine, which write the same file, so the
+    /// write must also take the machine-wide lock on the config's sidecar.
+    ///
+    /// Driven by holding that sidecar lock: a write that takes it is refused,
+    /// and one that ignores it overwrites the other client's transaction.
+    #[tokio::test]
+    async fn a_write_is_refused_while_another_client_holds_the_file_lock() {
+        let fx = Fixture::new("write-file-lock-held");
+        fx.write("");
+        let held = hold_config_lock(&fx.path());
+
+        let err = upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect_err("an edit in flight elsewhere must refuse this write");
+
+        assert!(err.contains("another Adele client is editing"), "{err}");
+        assert!(fx.raw().is_empty(), "nothing was written");
+        drop(held);
+    }
+
+    /// And the refusal is not permanent: once the other client finishes, the
+    /// next write goes through.
+    #[tokio::test]
+    async fn a_write_succeeds_once_the_other_client_releases_the_file_lock() {
+        let fx = Fixture::new("write-file-lock-released");
+        fx.write("");
+        drop(hold_config_lock(&fx.path()));
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("a released lock must not block the next write");
 
         assert!(definition(&fx.read(), "notes").is_some());
     }

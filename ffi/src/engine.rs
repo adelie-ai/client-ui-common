@@ -1961,6 +1961,31 @@ enabled = ["fs", "git"]
         );
     }
 
+    /// The built-in opt-out is the second writer of this shared file, so it has
+    /// to take the machine-wide lock as well: the in-process one orders it
+    /// against the client-run writes of this core only, and every other Adele
+    /// client on the machine writes the same file.
+    ///
+    /// Driven by holding the config's sidecar lock, which is what another
+    /// client's edit in flight holds.
+    #[tokio::test]
+    async fn a_builtin_opt_out_is_refused_while_another_client_holds_the_file_lock() {
+        let (_dir, path) = temp_config(Some(""));
+        let held = crate::client_mcp::hold_config_lock(&path);
+
+        let err = write_builtin_disabled(&path, "mac", "fileio", true)
+            .await
+            .expect_err("an edit in flight elsewhere must refuse this write");
+
+        assert!(err.contains("another Adele client is editing"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file still there"),
+            "",
+            "the refused write must leave the file byte-identical"
+        );
+        drop(held);
+    }
+
     /// The built-in opt-out and the client-run writes edit one file, so they
     /// must share one serialization. Driven concurrently: a lost update shows up
     /// as a missing opt-out or a missing definition.
