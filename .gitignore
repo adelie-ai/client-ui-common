@@ -5,3 +5,4 @@
 
 # Agent worktrees live here; never commit them.
 .worktrees/
+*.status
