@@ -12,6 +12,11 @@
 //! consumer therefore asks for an edit and reads the result back, and never
 //! parses or writes the file itself.
 //!
+//! Every write here goes through [`ClientMcpConfig::edit`], which holds an
+//! exclusive lock on the config's sidecar for the whole read-mutate-write
+//! transaction. That is what orders this core's writes against the *other*
+//! clients on the machine; a lock only helps where every writer takes it.
+//!
 //! Not here: the built-in opt-out (`disabled_builtins`), which is a different
 //! population with its own intent, and anything about the daemon's own MCP
 //! fleet, which is administered over the daemon command channel.
@@ -64,21 +69,22 @@ fn enabled_by_default() -> bool {
     true
 }
 
-/// Orders every read-modify-write of `client-mcp.toml` this core makes.
-///
-/// Why a lock, when [`ClientMcpConfig::save`] is already atomic: the save is
-/// atomic against a *partial read*, so no reader ever sees a torn file. The
-/// unprotected part is the transaction around it (load, change one thing,
-/// save), which two tasks can interleave so that the second save drops the
-/// first one's result. The lock spans the whole transaction.
+/// Orders every read-modify-write of `client-mcp.toml` this core makes, ahead
+/// of the machine-wide lock [`ClientMcpConfig::edit`] takes.
 ///
 /// **One core only.** Each Adele client on the machine holds its own core, and
-/// they all write this one file, so this lock does not order one client's writes
-/// against another's. That needs a lock on the file itself and is a separate
-/// piece of work.
+/// they all write this one file. Ordering *between* clients is `edit`'s sidecar
+/// lock; this one orders the tasks inside a single core.
+///
+/// Why keep it, when `edit` already serializes: `edit` waits a bounded two
+/// seconds for the sidecar and then refuses, so two of this core's own tasks
+/// racing each other could turn into a refusal the person has to see and retry.
+/// Taken first, they queue in this process instead, and only one of them ever
+/// opens and locks the sidecar.
 static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Take the write lock for one read-modify-write of the shared config.
+/// Take the in-process write lock for one read-modify-write of the shared
+/// config. Held across the [`ClientMcpConfig::edit`] call that follows.
 ///
 /// The built-in opt-out in [`crate::engine`] takes the same lock, so the two
 /// populations' writes are ordered against each other and not only within
@@ -87,29 +93,60 @@ pub(crate) async fn lock_writes() -> tokio::sync::MutexGuard<'static, ()> {
     WRITE_LOCK.lock().await
 }
 
+/// Run one [`ClientMcpConfig::edit`] transaction off the async runtime.
+///
+/// `edit` is synchronous and sleeps while another client holds the sidecar lock
+/// — up to two seconds before it gives up — so it must not run on a tokio worker
+/// thread. Both of this crate's write paths go through here.
+///
+/// The caller holds [`WRITE_LOCK`] across the call, so at most one of this
+/// core's tasks is ever waiting on the sidecar.
+///
+/// Dropping this future does not cancel the transaction — a blocking task runs
+/// to completion — so a dropped caller releases [`WRITE_LOCK`] while its own
+/// edit is still in flight. Both write paths run in an un-cancelled
+/// `tokio::spawn`, and the sidecar lock still rules out a lost update either
+/// way; the cost would only be a later edit told to try again.
+pub(crate) async fn edit_config<F>(path: &Path, change: F) -> Result<(), String>
+where
+    F: FnOnce(&mut ClientMcpConfig) -> Result<(), String> + Send + 'static,
+{
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || ClientMcpConfig::edit(&path, change))
+        .await
+        .map_err(|err| format!("the client MCP config edit did not run: {err}"))?
+}
+
 impl ClientServerWrite {
     /// Apply this edit to the config at `path`, for `surface`.
     ///
-    /// Holds [`WRITE_LOCK`] across the load, the change and the save, so an edit
-    /// dispatched while another is in flight waits rather than overwriting it.
+    /// One [`ClientMcpConfig::edit`] transaction: the strict re-read, the change
+    /// and the save all happen inside the lock `edit` holds on the config's
+    /// sidecar, so a concurrent editor in **another** Adele client queues rather
+    /// than losing one of the two changes. [`WRITE_LOCK`] is taken first and
+    /// held across it, ordering this core's own tasks before they reach the
+    /// sidecar.
     ///
     /// Fails without writing anything when the edit is not valid, so a refused
-    /// edit leaves the file exactly as it was. The lock is released either way.
+    /// edit leaves the file exactly as it was. Both locks are released either
+    /// way.
     pub async fn apply(&self, path: &Path, surface: &str) -> Result<(), String> {
         let _guard = lock_writes().await;
-        self.apply_locked(path, surface)
+        let write = self.clone();
+        let surface = surface.to_string();
+        edit_config(path, move |cfg| write.change(cfg, &surface)).await
     }
 
-    /// The transaction itself. Private, and reachable only through
-    /// [`apply`](Self::apply), so no caller can run it unserialized.
-    fn apply_locked(&self, path: &Path, surface: &str) -> Result<(), String> {
-        let mut cfg = load_strict(path)?;
+    /// The change itself, run inside the [`ClientMcpConfig::edit`] transaction
+    /// against the config that transaction re-read under the lock.
+    ///
+    /// Returning `Err` abandons the edit, and `edit` writes nothing.
+    fn change(&self, cfg: &mut ClientMcpConfig, surface: &str) -> Result<(), String> {
         match self {
-            Self::Upsert { server_json } => apply_upsert(&mut cfg, surface, server_json)?,
-            Self::Remove { name } => cfg.remove_server(name.trim())?,
-            Self::SetEnabled { name, enabled } => apply_enabled(&mut cfg, surface, name, *enabled)?,
+            Self::Upsert { server_json } => apply_upsert(cfg, surface, server_json),
+            Self::Remove { name } => cfg.remove_server(name.trim()),
+            Self::SetEnabled { name, enabled } => apply_enabled(cfg, surface, name, *enabled),
         }
-        cfg.save(path)
     }
 }
 
@@ -242,22 +279,6 @@ pub(crate) fn seed_surface_from_default(cfg: &mut ClientMcpConfig, surface: &str
     );
 }
 
-/// Parse the config at `path` strictly, for an edit.
-///
-/// **Fail-closed on a malformed file.** [`ClientMcpConfig::load`] is deliberately
-/// tolerant - an unparseable config degrades to an empty one so a bad file never
-/// stops a client connecting - but saving that empty config back would erase
-/// every server definition on the machine, for every surface. An edit therefore
-/// parses strictly and refuses rather than replacing what it could not read. A
-/// file that is merely *absent* is fine: that is a first write.
-pub fn load_strict(path: &Path) -> Result<ClientMcpConfig, String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => ClientMcpConfig::from_toml(&contents),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ClientMcpConfig::default()),
-        Err(err) => Err(format!("failed to read {}: {err}", path.display())),
-    }
-}
-
 /// Take the sidecar lock [`ClientMcpConfig::edit`] uses, the way another Adele
 /// client on the machine would, and hold it until the returned file drops.
 ///
@@ -315,8 +336,11 @@ mod tests {
             std::fs::write(self.path(), toml).expect("seed config");
         }
 
+        /// The config as it is on disk, parsed strictly: a test that means to
+        /// assert on what was written must not read a tolerant empty default
+        /// when the write produced something unparseable.
         fn read(&self) -> ClientMcpConfig {
-            load_strict(&self.path()).expect("config parses")
+            ClientMcpConfig::from_toml(&self.raw()).expect("config parses")
         }
 
         fn raw(&self) -> String {

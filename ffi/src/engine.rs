@@ -422,14 +422,17 @@ fn mcp_client_servers_event_at(
 /// Add or remove `name` in one surface's `disabled_builtins` list in the client
 /// MCP config at `path`.
 ///
-/// Fail-closed on a malformed file, via [`crate::client_mcp::load_strict`] —
-/// which carries the reasoning, and which every edit to this shared file goes
-/// through.
+/// One [`ClientMcpConfig::edit`] transaction: the strict re-read, the change and
+/// the save all happen inside the lock `edit` holds on the config's sidecar, so
+/// another Adele client editing the same file queues rather than losing one of
+/// the two changes. The strict re-read is what fails closed on a malformed file
+/// — the tolerant loader the read path uses would degrade it to an empty config
+/// and erase every server definition on the machine.
 ///
-/// Serialized against the external client-run writes by the one lock
+/// Serialized against this core's external client-run writes by the one lock
 /// [`crate::client_mcp::lock_writes`] hands out: both populations live in this
-/// file, so ordering one against the other is what keeps either from losing an
-/// update. The lock is held across the load, the change and the save.
+/// file, so ordering one against the other keeps either from queueing on the
+/// sidecar when it could queue in process instead.
 ///
 /// This write materializes a section for `surface`, so it first seeds one from
 /// `[surfaces.default]` via [`crate::client_mcp::seed_surface_from_default`] —
@@ -437,7 +440,8 @@ fn mcp_client_servers_event_at(
 /// the external servers the surface hosts, so it must not drop them.
 ///
 /// An empty `name` is refused: a blank entry is inert noise every other client
-/// sharing the file would then carry.
+/// sharing the file would then carry. It is refused before the lock is taken —
+/// a caller bug is not worth a sidecar open.
 async fn write_builtin_disabled(
     path: &Path,
     surface: &str,
@@ -448,10 +452,14 @@ async fn write_builtin_disabled(
         return Err("built-in server name must not be empty".to_string());
     }
     let _guard = crate::client_mcp::lock_writes().await;
-    let mut cfg = crate::client_mcp::load_strict(path)?;
-    crate::client_mcp::seed_surface_from_default(&mut cfg, surface);
-    cfg.set_builtin_disabled(surface, name, disabled);
-    cfg.save(path)
+    let surface = surface.to_string();
+    let name = name.to_string();
+    crate::client_mcp::edit_config(path, move |cfg| {
+        crate::client_mcp::seed_surface_from_default(cfg, &surface);
+        cfg.set_builtin_disabled(&surface, &name, disabled);
+        Ok(())
+    })
+    .await
 }
 
 /// The actor: owns the reducer state + the connector, runs effects.
