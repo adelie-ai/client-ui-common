@@ -18,7 +18,9 @@
 
 use std::path::Path;
 
-use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, DEFAULT_SURFACE, McpServerConfig, SurfaceConfig,
+};
 
 /// One edit to this surface's external client-run MCP servers.
 ///
@@ -62,12 +64,45 @@ fn enabled_by_default() -> bool {
     true
 }
 
+/// Orders every read-modify-write of `client-mcp.toml` this core makes.
+///
+/// Why a lock, when [`ClientMcpConfig::save`] is already atomic: the save is
+/// atomic against a *partial read*, so no reader ever sees a torn file. The
+/// unprotected part is the transaction around it (load, change one thing,
+/// save), which two tasks can interleave so that the second save drops the
+/// first one's result. The lock spans the whole transaction.
+///
+/// **One core only.** Each Adele client on the machine holds its own core, and
+/// they all write this one file, so this lock does not order one client's writes
+/// against another's. That needs a lock on the file itself and is a separate
+/// piece of work.
+static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take the write lock for one read-modify-write of the shared config.
+///
+/// The built-in opt-out in [`crate::engine`] takes the same lock, so the two
+/// populations' writes are ordered against each other and not only within
+/// themselves.
+pub(crate) async fn lock_writes() -> tokio::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().await
+}
+
 impl ClientServerWrite {
     /// Apply this edit to the config at `path`, for `surface`.
     ///
+    /// Holds [`WRITE_LOCK`] across the load, the change and the save, so an edit
+    /// dispatched while another is in flight waits rather than overwriting it.
+    ///
     /// Fails without writing anything when the edit is not valid, so a refused
-    /// edit leaves the file exactly as it was.
-    pub fn apply(&self, path: &Path, surface: &str) -> Result<(), String> {
+    /// edit leaves the file exactly as it was. The lock is released either way.
+    pub async fn apply(&self, path: &Path, surface: &str) -> Result<(), String> {
+        let _guard = lock_writes().await;
+        self.apply_locked(path, surface)
+    }
+
+    /// The transaction itself. Private, and reachable only through
+    /// [`apply`](Self::apply), so no caller can run it unserialized.
+    fn apply_locked(&self, path: &Path, surface: &str) -> Result<(), String> {
         let mut cfg = load_strict(path)?;
         match self {
             Self::Upsert { server_json } => apply_upsert(&mut cfg, surface, server_json)?,
@@ -118,6 +153,7 @@ fn apply_upsert(cfg: &mut ClientMcpConfig, surface: &str, server_json: &str) -> 
         description: existing.and_then(|s| s.description.clone()),
     };
     cfg.upsert_server(server);
+    seed_surface_from_default(cfg, surface);
     cfg.set_surface_enabled(surface, &name, form.enabled);
     Ok(())
 }
@@ -133,6 +169,12 @@ fn apply_upsert(cfg: &mut ClientMcpConfig, surface: &str, server_json: &str) -> 
 ///
 /// Fails when no definition of that name exists, in either direction, rather
 /// than materializing a surface entry for a server that does not exist.
+///
+/// Turning **on** a definition that reaches its server over HTTP is refused, as
+/// the upsert path refuses to write one: the client MCP host spawns `command`,
+/// which an HTTP definition leaves empty, so the result could only ever fail to
+/// start. Turning one **off** stays allowed - a definition already in a
+/// surface's list needs a way out.
 fn apply_enabled(
     cfg: &mut ClientMcpConfig,
     surface: &str,
@@ -140,13 +182,64 @@ fn apply_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     let name = name.trim();
+    // `None` when nothing of that name is defined; `Some(true)` when the
+    // definition that is reaches its server over HTTP.
+    let over_http = cfg
+        .list_defined_servers()
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.http.is_some());
     if enabled {
+        if over_http == Some(true) {
+            return Err(format!(
+                "server '{name}' is configured for http; this client runs stdio servers only"
+            ));
+        }
         cfg.set_server_enabled(name, true)?;
-    } else if !cfg.list_defined_servers().iter().any(|s| s.name == name) {
+    } else if over_http.is_none() {
         return Err(format!("no such server: {name}"));
     }
+    seed_surface_from_default(cfg, surface);
     cfg.set_surface_enabled(surface, name, enabled);
     Ok(())
+}
+
+/// Give `surface` a section of its own, seeded with the servers it was
+/// inheriting from `[surfaces.default]`.
+///
+/// Every write path materializes a surface section, and an empty one does not
+/// mean the same thing as no section at all:
+/// [`ClientMcpConfig::resolved_servers`] falls back to `[surfaces.default]` only
+/// while the surface has no section, and reads an explicit empty list as "hosts
+/// nothing". So materializing an empty section un-hosts every server the surface
+/// was inheriting, none of which the person edited. Seeding first makes the new
+/// section say what the surface already hosted; the edit then adds or removes
+/// one name from it.
+///
+/// A surface that already has a section inherits nothing, so it is left alone.
+/// Seeding never reads into or writes to `[surfaces.default]` itself: it is the
+/// fallback every other surface reads, and one surface's edit must not move it.
+/// (Deleting a *definition* is the one write that still reaches it, because
+/// [`ClientMcpConfig::remove_server`] prunes the name from every surface - a
+/// definition that no longer exists must not be listed anywhere.)
+///
+/// Only the `enabled` list is inherited: `disabled_builtins` has no fallback to
+/// begin with.
+pub(crate) fn seed_surface_from_default(cfg: &mut ClientMcpConfig, surface: &str) {
+    if surface == DEFAULT_SURFACE || cfg.surfaces.contains_key(surface) {
+        return;
+    }
+    let inherited = cfg.surface_enabled_names(DEFAULT_SURFACE).to_vec();
+    if inherited.is_empty() {
+        return;
+    }
+    cfg.surfaces.insert(
+        surface.to_string(),
+        SurfaceConfig {
+            enabled: inherited,
+            ..Default::default()
+        },
+    );
 }
 
 /// Parse the config at `path` strictly, for an edit.
@@ -226,13 +319,51 @@ mod tests {
         cfg.list_defined_servers().iter().find(|s| s.name == name)
     }
 
+    /// What `surface` actually hosts, after the `[surfaces.default]` fallback and
+    /// the definition-level filter. Sorted, because the answer is a set.
+    fn names_hosted_by(cfg: &ClientMcpConfig, surface: &str) -> Vec<String> {
+        let mut names: Vec<String> = cfg
+            .resolved_servers(surface)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Two servers, both hosted by every surface through `[surfaces.default]`.
+    /// The `mac` surface has no section of its own, so it inherits them.
+    const INHERITING: &str = r#"
+[[servers]]
+name = "fs"
+command = "fileio-mcp"
+
+[[servers]]
+name = "git"
+command = "git-mcp"
+
+[surfaces.default]
+enabled = ["fs", "git"]
+"#;
+
+    /// One definition that reaches its server over HTTP, which the client MCP
+    /// host cannot run: it spawns `command`, and this definition has none.
+    const HTTP_DEFINITION: &str = r#"
+[[servers]]
+name = "search"
+enabled = true
+[servers.http]
+url = "https://mcp.example.com/sse"
+"#;
+
     // --- upsert ---------------------------------------------------------------
 
-    #[test]
-    fn upsert_creates_a_definition_and_joins_this_surface() {
+    #[tokio::test]
+    async fn upsert_creates_a_definition_and_joins_this_surface() {
         let fx = Fixture::new("upsert-creates");
         upsert(r#"{"name":"notes","command":"notes-mcp","args":["--stdio"]}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect("upsert succeeds");
 
         let cfg = fx.read();
@@ -243,20 +374,21 @@ mod tests {
         assert_eq!(names_enabled_for(&cfg, SURFACE), vec!["notes"]);
     }
 
-    #[test]
-    fn upsert_into_a_missing_file_is_a_first_write() {
+    #[tokio::test]
+    async fn upsert_into_a_missing_file_is_a_first_write() {
         let fx = Fixture::new("upsert-first-write");
         assert!(!fx.path().exists());
 
         upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect("first write succeeds");
 
         assert!(definition(&fx.read(), "notes").is_some());
     }
 
-    #[test]
-    fn upsert_preserves_env_secrets_and_description() {
+    #[tokio::test]
+    async fn upsert_preserves_env_secrets_and_description() {
         let fx = Fixture::new("upsert-preserves");
         fx.write(
             r#"
@@ -274,6 +406,7 @@ NOTES_DIR = "/srv/notes"
 
         upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect("edit succeeds");
 
         let cfg = fx.read();
@@ -290,11 +423,12 @@ NOTES_DIR = "/srv/notes"
         );
     }
 
-    #[test]
-    fn upsert_disabled_defines_the_server_but_leaves_this_surface_off_it() {
+    #[tokio::test]
+    async fn upsert_disabled_defines_the_server_but_leaves_this_surface_off_it() {
         let fx = Fixture::new("upsert-disabled");
         upsert(r#"{"name":"notes","command":"notes-mcp","enabled":false}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect("upsert succeeds");
 
         let cfg = fx.read();
@@ -302,11 +436,12 @@ NOTES_DIR = "/srv/notes"
         assert!(names_enabled_for(&cfg, SURFACE).is_empty());
     }
 
-    #[test]
-    fn upsert_normalizes_a_blank_namespace_to_none() {
+    #[tokio::test]
+    async fn upsert_normalizes_a_blank_namespace_to_none() {
         let fx = Fixture::new("upsert-namespace");
         upsert(r#"{"name":"notes","command":"notes-mcp","namespace":"  "}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect("upsert succeeds");
 
         assert_eq!(
@@ -315,30 +450,32 @@ NOTES_DIR = "/srv/notes"
         );
     }
 
-    #[test]
-    fn upsert_refuses_an_empty_name() {
+    #[tokio::test]
+    async fn upsert_refuses_an_empty_name() {
         let fx = Fixture::new("upsert-empty-name");
         let err = upsert(r#"{"name":"  ","command":"notes-mcp"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect_err("an empty name is refused");
 
         assert!(err.contains("name"), "{err}");
         assert!(fx.raw().is_empty(), "nothing was written");
     }
 
-    #[test]
-    fn upsert_refuses_a_server_with_no_command() {
+    #[tokio::test]
+    async fn upsert_refuses_a_server_with_no_command() {
         let fx = Fixture::new("upsert-no-command");
         let err = upsert(r#"{"name":"notes","command":"  "}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect_err("a command is required");
 
         assert!(err.contains("command"), "{err}");
         assert!(fx.raw().is_empty(), "nothing was written");
     }
 
-    #[test]
-    fn upsert_refuses_to_rewrite_an_http_server_as_stdio() {
+    #[tokio::test]
+    async fn upsert_refuses_to_rewrite_an_http_server_as_stdio() {
         let fx = Fixture::new("upsert-http");
         fx.write(
             r#"
@@ -352,6 +489,7 @@ url = "https://mcp.example.com/sse"
 
         let err = upsert(r#"{"name":"remote","command":"remote-mcp"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect_err("an http definition is refused");
 
         assert!(err.contains("http"), "{err}");
@@ -364,11 +502,12 @@ url = "https://mcp.example.com/sse"
         );
     }
 
-    #[test]
-    fn upsert_refuses_a_field_this_core_cannot_honour() {
+    #[tokio::test]
+    async fn upsert_refuses_a_field_this_core_cannot_honour() {
         let fx = Fixture::new("upsert-unknown-field");
         let err = upsert(r#"{"name":"notes","command":"notes-mcp","transport":"http"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect_err("an unknown field is refused");
 
         assert!(err.contains("invalid server json"), "{err}");
@@ -377,8 +516,8 @@ url = "https://mcp.example.com/sse"
 
     // --- enable / disable -----------------------------------------------------
 
-    #[test]
-    fn enabling_joins_this_surface_and_switches_the_definition_on() {
+    #[tokio::test]
+    async fn enabling_joins_this_surface_and_switches_the_definition_on() {
         let fx = Fixture::new("enable-on");
         fx.write(
             r#"
@@ -394,6 +533,7 @@ enabled = false
             enabled: true,
         }
         .apply(&fx.path(), SURFACE)
+        .await
         .expect("enable succeeds");
 
         let cfg = fx.read();
@@ -401,8 +541,8 @@ enabled = false
         assert_eq!(names_enabled_for(&cfg, SURFACE), vec!["notes"]);
     }
 
-    #[test]
-    fn disabling_drops_only_this_surface_and_leaves_others_hosting_it() {
+    #[tokio::test]
+    async fn disabling_drops_only_this_surface_and_leaves_others_hosting_it() {
         let fx = Fixture::new("enable-off");
         fx.write(
             r#"
@@ -424,6 +564,7 @@ enabled = ["notes"]
             enabled: false,
         }
         .apply(&fx.path(), SURFACE)
+        .await
         .expect("disable succeeds");
 
         let cfg = fx.read();
@@ -435,8 +576,8 @@ enabled = ["notes"]
         );
     }
 
-    #[test]
-    fn enabling_an_undefined_server_fails_and_writes_nothing() {
+    #[tokio::test]
+    async fn enabling_an_undefined_server_fails_and_writes_nothing() {
         let fx = Fixture::new("enable-unknown");
         fx.write("");
 
@@ -445,14 +586,15 @@ enabled = ["notes"]
             enabled: true,
         }
         .apply(&fx.path(), SURFACE)
+        .await
         .expect_err("an undefined server is refused");
 
         assert!(err.contains("no such server"), "{err}");
         assert!(fx.raw().is_empty(), "nothing was written");
     }
 
-    #[test]
-    fn disabling_an_undefined_server_fails_and_writes_nothing() {
+    #[tokio::test]
+    async fn disabling_an_undefined_server_fails_and_writes_nothing() {
         let fx = Fixture::new("disable-unknown");
         fx.write("");
 
@@ -461,16 +603,78 @@ enabled = ["notes"]
             enabled: false,
         }
         .apply(&fx.path(), SURFACE)
+        .await
         .expect_err("an undefined server is refused");
 
         assert!(err.contains("no such server"), "{err}");
         assert!(fx.raw().is_empty(), "nothing was written");
     }
 
+    /// A definition with an HTTP endpoint carries no command, and the client MCP
+    /// host spawns a command. Enabling one can only produce a server that fails
+    /// to start, so the write is refused and says why.
+    #[tokio::test]
+    async fn enabling_an_http_definition_is_refused() {
+        let fx = Fixture::new("enable-http");
+        fx.write(HTTP_DEFINITION);
+        let before = fx.raw();
+
+        let err = ClientServerWrite::SetEnabled {
+            name: "search".to_string(),
+            enabled: true,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect_err("an http definition cannot be hosted here");
+
+        assert!(err.contains("http"), "{err}");
+        assert_eq!(fx.raw(), before, "the refusal writes nothing");
+    }
+
+    /// Disabling must keep working: a definition already in a surface's list
+    /// needs a way out, whatever transport it names.
+    #[tokio::test]
+    async fn disabling_an_http_definition_still_works() {
+        let fx = Fixture::new("disable-http");
+        fx.write(&format!(
+            r#"{HTTP_DEFINITION}
+[surfaces.mac]
+enabled = ["search"]
+"#
+        ));
+
+        ClientServerWrite::SetEnabled {
+            name: "search".to_string(),
+            enabled: false,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("disable succeeds");
+
+        assert!(names_enabled_for(&fx.read(), SURFACE).is_empty());
+    }
+
     // --- remove ---------------------------------------------------------------
 
-    #[test]
-    fn removing_drops_the_definition_and_every_surface_membership() {
+    /// Deleting a definition needs no ability to run it, so an HTTP one is
+    /// removable.
+    #[tokio::test]
+    async fn removing_an_http_definition_still_works() {
+        let fx = Fixture::new("remove-http");
+        fx.write(HTTP_DEFINITION);
+
+        ClientServerWrite::Remove {
+            name: "search".to_string(),
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("remove succeeds");
+
+        assert!(definition(&fx.read(), "search").is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_drops_the_definition_and_every_surface_membership() {
         let fx = Fixture::new("remove");
         fx.write(
             r#"
@@ -491,6 +695,7 @@ enabled = ["notes"]
             name: "notes".to_string(),
         }
         .apply(&fx.path(), SURFACE)
+        .await
         .expect("remove succeeds");
 
         let cfg = fx.read();
@@ -499,8 +704,8 @@ enabled = ["notes"]
         assert!(names_enabled_for(&cfg, "gtk").is_empty());
     }
 
-    #[test]
-    fn removing_an_undefined_server_fails_and_writes_nothing() {
+    #[tokio::test]
+    async fn removing_an_undefined_server_fails_and_writes_nothing() {
         let fx = Fixture::new("remove-unknown");
         fx.write("");
 
@@ -508,6 +713,7 @@ enabled = ["notes"]
             name: "ghost".to_string(),
         }
         .apply(&fx.path(), SURFACE)
+        .await
         .expect_err("an undefined server is refused");
 
         assert!(err.contains("no such server"), "{err}");
@@ -516,21 +722,221 @@ enabled = ["notes"]
 
     // --- fail-closed ----------------------------------------------------------
 
-    #[test]
-    fn a_malformed_config_is_refused_rather_than_overwritten() {
+    #[tokio::test]
+    async fn a_malformed_config_is_refused_rather_than_overwritten() {
         let fx = Fixture::new("malformed");
         let broken = "this is not toml {{{";
         fx.write(broken);
 
         upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect_err("a config that cannot be parsed is refused");
 
         assert_eq!(fx.raw(), broken, "the file every client reads is untouched");
     }
 
-    #[test]
-    fn an_edit_leaves_another_surfaces_servers_alone() {
+    // --- inheritance from [surfaces.default] ----------------------------------
+
+    /// Adding a server on a surface that inherits `[surfaces.default]` must not
+    /// un-host what it was inheriting. The write gives the surface a section of
+    /// its own, so that section has to carry the inherited names as well as the
+    /// new one.
+    #[tokio::test]
+    async fn adding_a_server_keeps_what_this_surface_inherited() {
+        let fx = Fixture::new("inherit-upsert");
+        fx.write(INHERITING);
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("upsert succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["fs", "git", "notes"]);
+    }
+
+    /// The same for the enable path: switching one server on for an inheriting
+    /// surface adds to what it hosts rather than replacing it.
+    #[tokio::test]
+    async fn enabling_a_server_keeps_what_this_surface_inherited() {
+        let fx = Fixture::new("inherit-enable");
+        fx.write(&format!(
+            r#"{INHERITING}
+[[servers]]
+name = "notes"
+command = "notes-mcp"
+"#
+        ));
+
+        ClientServerWrite::SetEnabled {
+            name: "notes".to_string(),
+            enabled: true,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("enable succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["fs", "git", "notes"]);
+    }
+
+    /// Switching one inherited server off must remove that one only. The other
+    /// inherited servers were never touched by the person doing the edit.
+    #[tokio::test]
+    async fn disabling_one_inherited_server_keeps_the_others() {
+        let fx = Fixture::new("inherit-disable");
+        fx.write(INHERITING);
+
+        ClientServerWrite::SetEnabled {
+            name: "fs".to_string(),
+            enabled: false,
+        }
+        .apply(&fx.path(), SURFACE)
+        .await
+        .expect("disable succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["git"]);
+    }
+
+    /// `[surfaces.default]` is the fallback every other surface reads, so adding
+    /// a server for one surface must never change it. (Deleting a definition
+    /// does prune it from every surface, `default` included - see
+    /// `removing_drops_the_definition_and_every_surface_membership`.)
+    #[tokio::test]
+    async fn an_upsert_never_edits_the_default_surface() {
+        let fx = Fixture::new("inherit-default-untouched");
+        fx.write(INHERITING);
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("upsert succeeds");
+
+        let cfg = fx.read();
+        assert_eq!(names_enabled_for(&cfg, "default"), ["fs", "git"]);
+        assert!(cfg.surface_disabled_builtins("default").is_empty());
+    }
+
+    /// A surface that already has a section of its own inherits nothing, so the
+    /// write must not import the default list into it.
+    #[tokio::test]
+    async fn a_surface_with_its_own_section_is_not_seeded_from_default() {
+        let fx = Fixture::new("inherit-own-section");
+        fx.write(&format!(
+            r#"{INHERITING}
+[surfaces.mac]
+enabled = []
+"#
+        ));
+
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("upsert succeeds");
+
+        assert_eq!(names_hosted_by(&fx.read(), SURFACE), ["notes"]);
+    }
+
+    // --- serialization --------------------------------------------------------
+
+    /// How many writers the concurrency cases dispatch at once. Every run of
+    /// these cases against the unserialized code lost several of them; the
+    /// number is high to make a lost update easy to hit, not because any one
+    /// count is guaranteed to lose one.
+    const WRITERS: usize = 16;
+
+    /// Writes dispatched together must all land. Each edit reads the whole file,
+    /// changes one thing and writes it back, so two writers that overlap can
+    /// silently drop the first one's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_all_land() {
+        let fx = Fixture::new("concurrent-writes");
+        fx.write("");
+
+        let mut writers = Vec::new();
+        for i in 0..WRITERS {
+            let path = fx.path();
+            writers.push(tokio::spawn(async move {
+                upsert(&format!(r#"{{"name":"s{i:02}","command":"s{i:02}-mcp"}}"#))
+                    .apply(&path, SURFACE)
+                    .await
+            }));
+        }
+        for writer in writers {
+            writer
+                .await
+                .expect("the writer task must not panic")
+                .expect("every write succeeds");
+        }
+
+        let cfg = fx.read();
+        let mut landed: Vec<String> = cfg
+            .list_defined_servers()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        landed.sort_unstable();
+        let expected: Vec<String> = (0..WRITERS).map(|i| format!("s{i:02}")).collect();
+        assert_eq!(landed, expected, "no write may be lost");
+    }
+
+    /// The same file's surface membership must survive the same race: every
+    /// writer joins this surface, so a lost update shows up here too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_all_join_this_surface() {
+        let fx = Fixture::new("concurrent-surface");
+        fx.write("");
+
+        let mut writers = Vec::new();
+        for i in 0..WRITERS {
+            let path = fx.path();
+            writers.push(tokio::spawn(async move {
+                upsert(&format!(r#"{{"name":"s{i:02}","command":"s{i:02}-mcp"}}"#))
+                    .apply(&path, SURFACE)
+                    .await
+            }));
+        }
+        for writer in writers {
+            writer
+                .await
+                .expect("the writer task must not panic")
+                .expect("every write succeeds");
+        }
+
+        let cfg = fx.read();
+        let mut listed = names_enabled_for(&cfg, SURFACE);
+        listed.sort_unstable();
+        let expected: Vec<String> = (0..WRITERS).map(|i| format!("s{i:02}")).collect();
+        assert_eq!(listed, expected);
+    }
+
+    /// A refused write must leave the next one free to run. What this catches is
+    /// a hold that outlives a failure - hand-rolled lock and unlock calls, say,
+    /// with the unlock after an early return - which would stall every later
+    /// edit. The timeout turns that regression into a failure rather than a
+    /// suite that hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_write_does_not_block_the_next_one() {
+        let fx = Fixture::new("refused-then-next");
+        fx.write("");
+
+        upsert(r#"{"name":"notes","command":"  "}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect_err("a command is required");
+
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            upsert(r#"{"name":"notes","command":"notes-mcp"}"#).apply(&fx.path(), SURFACE),
+        )
+        .await
+        .expect("the next write must not wait on the refused one");
+        next.expect("the next write succeeds");
+
+        assert!(definition(&fx.read(), "notes").is_some());
+    }
+
+    #[tokio::test]
+    async fn an_edit_leaves_another_surfaces_servers_alone() {
         let fx = Fixture::new("other-surface");
         fx.write(
             r#"
@@ -547,6 +953,7 @@ disabled_builtins = ["fileio"]
 
         upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
             .apply(&fx.path(), SURFACE)
+            .await
             .expect("upsert succeeds");
 
         let cfg = fx.read();
