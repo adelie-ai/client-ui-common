@@ -95,15 +95,15 @@ pub(crate) async fn lock_writes() -> tokio::sync::MutexGuard<'static, ()> {
 
 /// Run one [`ClientMcpConfig::edit`] transaction off the async runtime.
 ///
-/// `edit` is synchronous and sleeps while another client holds the sidecar lock
-/// — up to two seconds before it gives up — so it must not run on a tokio worker
-/// thread. Both of this crate's write paths go through here.
+/// `edit` is synchronous. It sleeps while another client holds the sidecar
+/// lock, for up to two seconds before it gives up, so it must not run on a
+/// tokio worker thread. Both of this crate's write paths go through here.
 ///
 /// The caller holds [`WRITE_LOCK`] across the call, so at most one of this
 /// core's tasks is ever waiting on the sidecar.
 ///
-/// Dropping this future does not cancel the transaction — a blocking task runs
-/// to completion — so a dropped caller releases [`WRITE_LOCK`] while its own
+/// Dropping this future does not cancel the transaction - a blocking task runs
+/// to completion - so a dropped caller releases [`WRITE_LOCK`] while its own
 /// edit is still in flight. Both write paths run in an un-cancelled
 /// `tokio::spawn`, and the sidecar lock still rules out a lost update either
 /// way; the cost would only be a later edit told to try again.
@@ -283,7 +283,7 @@ pub(crate) fn seed_surface_from_default(cfg: &mut ClientMcpConfig, surface: &str
 /// client on the machine would, and hold it until the returned file drops.
 ///
 /// A `flock` belongs to an open file description, so a second `open` in this
-/// same process contends exactly as a second process does — which is what lets
+/// same process contends exactly as a second process does - which is what lets
 /// a test stand in for the other client. The sidecar path is derived here rather
 /// than read from `client-common`, so the test pins the contract instead of
 /// following the implementation.
@@ -316,20 +316,27 @@ mod tests {
     /// Writes go to a real file because the fail-closed and atomic-save behavior
     /// under test is on-disk behavior; the developer's own
     /// `~/.config/adele/client-mcp.toml` is never touched.
+    ///
+    /// The directory is unique per fixture, not a fixed path derived from
+    /// `name`: the edit lock is machine-wide, so two test binaries running at the
+    /// same time on one shared path contend for the real sidecar lock and refuse
+    /// each other's writes. `name` survives as a prefix, to name the directory a
+    /// failing case leaves behind.
     struct Fixture {
-        dir: PathBuf,
+        dir: tempfile::TempDir,
     }
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("adele-client-mcp-{name}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("temp dir");
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("adele-client-mcp-{name}-"))
+                .tempdir()
+                .expect("temp dir");
             Self { dir }
         }
 
         fn path(&self) -> PathBuf {
-            self.dir.join("client-mcp.toml")
+            self.dir.path().join("client-mcp.toml")
         }
 
         fn write(&self, toml: &str) {
@@ -345,12 +352,6 @@ mod tests {
 
         fn raw(&self) -> String {
             std::fs::read_to_string(self.path()).unwrap_or_default()
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -963,6 +964,12 @@ enabled = []
     /// with the unlock after an early return - which would stall every later
     /// edit. The timeout turns that regression into a failure rather than a
     /// suite that hangs.
+    ///
+    /// The budget only has to separate "released" from "stranded for good", so
+    /// it is wide. The in-process lock is one static shared by the whole test
+    /// binary, and the cases that hold the sidecar lock park on it for the two
+    /// seconds `edit` waits, so a tight budget here fails on an unlucky test
+    /// order rather than on the regression it is for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_write_does_not_block_the_next_one() {
         let fx = Fixture::new("refused-then-next");
@@ -974,7 +981,7 @@ enabled = []
             .expect_err("a command is required");
 
         let next = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             upsert(r#"{"name":"notes","command":"notes-mcp"}"#).apply(&fx.path(), SURFACE),
         )
         .await

@@ -425,9 +425,9 @@ fn mcp_client_servers_event_at(
 /// One [`ClientMcpConfig::edit`] transaction: the strict re-read, the change and
 /// the save all happen inside the lock `edit` holds on the config's sidecar, so
 /// another Adele client editing the same file queues rather than losing one of
-/// the two changes. The strict re-read is what fails closed on a malformed file
-/// — the tolerant loader the read path uses would degrade it to an empty config
-/// and erase every server definition on the machine.
+/// the two changes. The strict re-read is what fails closed on a malformed
+/// file. The tolerant loader the read path uses would degrade that file to an
+/// empty config and erase every server definition on the machine.
 ///
 /// Serialized against this core's external client-run writes by the one lock
 /// [`crate::client_mcp::lock_writes`] hands out: both populations live in this
@@ -440,7 +440,7 @@ fn mcp_client_servers_event_at(
 /// the external servers the surface hosts, so it must not drop them.
 ///
 /// An empty `name` is refused: a blank entry is inert noise every other client
-/// sharing the file would then carry. It is refused before the lock is taken —
+/// sharing the file would then carry. It is refused before the lock is taken -
 /// a caller bug is not worth a sidecar open.
 async fn write_builtin_disabled(
     path: &Path,
