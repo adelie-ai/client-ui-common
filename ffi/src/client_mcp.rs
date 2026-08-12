@@ -12,6 +12,18 @@
 //! consumer therefore asks for an edit and reads the result back, and never
 //! parses or writes the file itself.
 //!
+//! Every write here goes through [`ClientMcpConfig::edit`], which holds an
+//! exclusive lock on the config's sidecar for the whole read-mutate-write
+//! transaction. That is what orders this core's writes against the *other*
+//! clients on the machine; a lock only helps where every writer takes it.
+//!
+//! As far as `flock` reaches, which `edit` is explicit about: on a network home
+//! directory (NFS or SMB) the lock can be local to one host, or refused
+//! outright. `edit` names macOS especially, and `mac` is one of the surfaces
+//! this crate serves, so an Adele whose `~/.config` is on a network share can
+//! still lose an update between two machines. The in-process ordering below is
+//! unaffected, and so is the atomicity of each individual save.
+//!
 //! Not here: the built-in opt-out (`disabled_builtins`), which is a different
 //! population with its own intent, and anything about the daemon's own MCP
 //! fleet, which is administered over the daemon command channel.
@@ -64,52 +76,85 @@ fn enabled_by_default() -> bool {
     true
 }
 
-/// Orders every read-modify-write of `client-mcp.toml` this core makes.
-///
-/// Why a lock, when [`ClientMcpConfig::save`] is already atomic: the save is
-/// atomic against a *partial read*, so no reader ever sees a torn file. The
-/// unprotected part is the transaction around it (load, change one thing,
-/// save), which two tasks can interleave so that the second save drops the
-/// first one's result. The lock spans the whole transaction.
+/// Orders every read-modify-write of `client-mcp.toml` this core makes, ahead
+/// of the machine-wide lock [`ClientMcpConfig::edit`] takes.
 ///
 /// **One core only.** Each Adele client on the machine holds its own core, and
-/// they all write this one file, so this lock does not order one client's writes
-/// against another's. That needs a lock on the file itself and is a separate
-/// piece of work.
+/// they all write this one file. Ordering *between* clients is `edit`'s sidecar
+/// lock; this one orders the tasks inside a single core.
+///
+/// Why keep it, when `edit` already serializes: `edit` waits a bounded two
+/// seconds for the sidecar and then refuses, so two of this core's own tasks
+/// racing each other could turn into a refusal the person has to see and retry.
+/// Taken first, they queue in this process instead, and only one of them ever
+/// opens and locks the sidecar.
+///
+/// It is private to [`edit_config`], which is the only way to reach `edit` from
+/// this crate. Ordering the two locks correctly is then a property of one
+/// function rather than a rule each write path has to remember.
 static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Take the write lock for one read-modify-write of the shared config.
+/// Run one [`ClientMcpConfig::edit`] transaction: the single door from this
+/// crate to a `client-mcp.toml` write.
 ///
-/// The built-in opt-out in [`crate::engine`] takes the same lock, so the two
-/// populations' writes are ordered against each other and not only within
-/// themselves.
-pub(crate) async fn lock_writes() -> tokio::sync::MutexGuard<'static, ()> {
-    WRITE_LOCK.lock().await
+/// Takes [`WRITE_LOCK`] first and holds it across the whole call, then runs the
+/// transaction. Both locks are released on every exit path, including a refusal
+/// and a panic.
+///
+/// `edit` is synchronous. It sleeps while another client holds the sidecar
+/// lock, for up to two seconds before it gives up, so it runs in
+/// `tokio::task::spawn_blocking` rather than on a runtime worker: this core's
+/// runtime has two worker threads, and parking one of them for two seconds
+/// stalls half of it.
+///
+/// **Not re-entrant, either half.** `change` runs on the blocking thread inside
+/// both locks; calling back into `edit_config` from it would deadlock on
+/// [`WRITE_LOCK`]. Both of this crate's change closures are pure in-memory
+/// mutations of the config they are handed.
+///
+/// Dropping this future does not cancel the transaction - a blocking task runs
+/// to completion - so a dropped caller releases [`WRITE_LOCK`] while its own
+/// edit is still in flight. Both write paths run in an un-cancelled
+/// `tokio::spawn`, and the sidecar lock still rules out a lost update either
+/// way; the cost would only be a later edit told to try again.
+pub(crate) async fn edit_config<F>(path: &Path, change: F) -> Result<(), String>
+where
+    F: FnOnce(&mut ClientMcpConfig) -> Result<(), String> + Send + 'static,
+{
+    let _guard = WRITE_LOCK.lock().await;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || ClientMcpConfig::edit(&path, change))
+        .await
+        .map_err(|err| format!("the client MCP config edit did not complete: {err}"))?
 }
 
 impl ClientServerWrite {
     /// Apply this edit to the config at `path`, for `surface`.
     ///
-    /// Holds [`WRITE_LOCK`] across the load, the change and the save, so an edit
-    /// dispatched while another is in flight waits rather than overwriting it.
+    /// One [`ClientMcpConfig::edit`] transaction, via [`edit_config`]: the
+    /// strict re-read, the change and the save all happen inside the lock `edit`
+    /// holds on the config's sidecar, so a concurrent editor in **another**
+    /// Adele client queues rather than losing one of the two changes.
     ///
     /// Fails without writing anything when the edit is not valid, so a refused
-    /// edit leaves the file exactly as it was. The lock is released either way.
+    /// edit leaves the file exactly as it was. Both locks are released either
+    /// way.
     pub async fn apply(&self, path: &Path, surface: &str) -> Result<(), String> {
-        let _guard = lock_writes().await;
-        self.apply_locked(path, surface)
+        let write = self.clone();
+        let surface = surface.to_string();
+        edit_config(path, move |cfg| write.change(cfg, &surface)).await
     }
 
-    /// The transaction itself. Private, and reachable only through
-    /// [`apply`](Self::apply), so no caller can run it unserialized.
-    fn apply_locked(&self, path: &Path, surface: &str) -> Result<(), String> {
-        let mut cfg = load_strict(path)?;
+    /// The change itself, run inside the [`ClientMcpConfig::edit`] transaction
+    /// against the config that transaction re-read under the lock.
+    ///
+    /// Returning `Err` abandons the edit, and `edit` writes nothing.
+    fn change(&self, cfg: &mut ClientMcpConfig, surface: &str) -> Result<(), String> {
         match self {
-            Self::Upsert { server_json } => apply_upsert(&mut cfg, surface, server_json)?,
-            Self::Remove { name } => cfg.remove_server(name.trim())?,
-            Self::SetEnabled { name, enabled } => apply_enabled(&mut cfg, surface, name, *enabled)?,
+            Self::Upsert { server_json } => apply_upsert(cfg, surface, server_json),
+            Self::Remove { name } => cfg.remove_server(name.trim()),
+            Self::SetEnabled { name, enabled } => apply_enabled(cfg, surface, name, *enabled),
         }
-        cfg.save(path)
     }
 }
 
@@ -242,20 +287,29 @@ pub(crate) fn seed_surface_from_default(cfg: &mut ClientMcpConfig, surface: &str
     );
 }
 
-/// Parse the config at `path` strictly, for an edit.
+/// Take the sidecar lock [`ClientMcpConfig::edit`] uses, the way another Adele
+/// client on the machine would, and hold it until the returned file drops.
 ///
-/// **Fail-closed on a malformed file.** [`ClientMcpConfig::load`] is deliberately
-/// tolerant - an unparseable config degrades to an empty one so a bad file never
-/// stops a client connecting - but saving that empty config back would erase
-/// every server definition on the machine, for every surface. An edit therefore
-/// parses strictly and refuses rather than replacing what it could not read. A
-/// file that is merely *absent* is fine: that is a first write.
-pub fn load_strict(path: &Path) -> Result<ClientMcpConfig, String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => ClientMcpConfig::from_toml(&contents),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ClientMcpConfig::default()),
-        Err(err) => Err(format!("failed to read {}: {err}", path.display())),
-    }
+/// A `flock` belongs to an open file description, so a second `open` in this
+/// same process contends exactly as a second process does - which is what lets
+/// a test stand in for the other client. The sidecar path is derived here rather
+/// than read from `client-common`, so the test pins the contract instead of
+/// following the implementation.
+#[cfg(test)]
+pub(crate) fn hold_config_lock(config_path: &Path) -> std::fs::File {
+    let mut lock_name = config_path
+        .file_name()
+        .expect("a config path has a file name")
+        .to_os_string();
+    lock_name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config_path.with_file_name(lock_name))
+        .expect("open the sidecar lock");
+    file.try_lock().expect("take the sidecar lock");
+    file
 }
 
 #[cfg(test)]
@@ -270,38 +324,42 @@ mod tests {
     /// Writes go to a real file because the fail-closed and atomic-save behavior
     /// under test is on-disk behavior; the developer's own
     /// `~/.config/adele/client-mcp.toml` is never touched.
+    ///
+    /// The directory is unique per fixture, not a fixed path derived from
+    /// `name`: the edit lock is machine-wide, so two test binaries running at the
+    /// same time on one shared path contend for the real sidecar lock and refuse
+    /// each other's writes. `name` survives as a prefix, to name the directory a
+    /// failing case leaves behind.
     struct Fixture {
-        dir: PathBuf,
+        dir: tempfile::TempDir,
     }
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("adele-client-mcp-{name}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("temp dir");
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("adele-client-mcp-{name}-"))
+                .tempdir()
+                .expect("temp dir");
             Self { dir }
         }
 
         fn path(&self) -> PathBuf {
-            self.dir.join("client-mcp.toml")
+            self.dir.path().join("client-mcp.toml")
         }
 
         fn write(&self, toml: &str) {
             std::fs::write(self.path(), toml).expect("seed config");
         }
 
+        /// The config as it is on disk, parsed strictly: a test that means to
+        /// assert on what was written must not read a tolerant empty default
+        /// when the write produced something unparseable.
         fn read(&self) -> ClientMcpConfig {
-            load_strict(&self.path()).expect("config parses")
+            ClientMcpConfig::from_toml(&self.raw()).expect("config parses")
         }
 
         fn raw(&self) -> String {
             std::fs::read_to_string(self.path()).unwrap_or_default()
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -722,17 +780,25 @@ enabled = ["notes"]
 
     // --- fail-closed ----------------------------------------------------------
 
+    /// The refusal must be the strict parse, named as such. Every failure the
+    /// edit can return leaves the file untouched, so asserting only on "it
+    /// failed" would be satisfied by a lock failure and pass without the
+    /// fail-closed read ever running.
     #[tokio::test]
     async fn a_malformed_config_is_refused_rather_than_overwritten() {
         let fx = Fixture::new("malformed");
         let broken = "this is not toml {{{";
         fx.write(broken);
 
-        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+        let err = upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
             .apply(&fx.path(), SURFACE)
             .await
             .expect_err("a config that cannot be parsed is refused");
 
+        assert!(
+            err.contains("parse error"),
+            "the refusal must name the parse failure; got: {err}"
+        );
         assert_eq!(fx.raw(), broken, "the file every client reads is untouched");
     }
 
@@ -909,13 +975,46 @@ enabled = []
         assert_eq!(listed, expected);
     }
 
-    /// A refused write must leave the next one free to run. What this catches is
-    /// a hold that outlives a failure - hand-rolled lock and unlock calls, say,
-    /// with the unlock after an early return - which would stall every later
-    /// edit. The timeout turns that regression into a failure rather than a
-    /// suite that hangs.
+    /// A refused write must release the file lock it took, at once.
+    ///
+    /// This is the latency half of "a refusal does not block the next writer",
+    /// and it is measured on the fixture's own sidecar, which no other test
+    /// touches, so the figure means what it says. `hold_config_lock` takes the
+    /// lock with `try_lock` and panics if it cannot, so a lock the refusal
+    /// stranded fails here immediately rather than through a timeout.
+    #[tokio::test]
+    async fn a_refused_write_releases_the_file_lock_at_once() {
+        let fx = Fixture::new("refused-releases-file-lock");
+        fx.write("");
+
+        upsert(r#"{"name":"notes","command":"  "}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect_err("a command is required");
+
+        let started = std::time::Instant::now();
+        let free = hold_config_lock(&fx.path());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "the refused write left the file lock held: took {:?}",
+            started.elapsed()
+        );
+        drop(free);
+    }
+
+    /// A refused write must not strand the in-process lock either, or every
+    /// later edit in this core stalls for good. What this catches is a hold that
+    /// outlives a failure - hand-rolled lock and unlock calls, say, with the
+    /// unlock after an early return.
+    ///
+    /// The budget is a hang guard, deliberately not a latency bound: a stranded
+    /// `tokio::sync::Mutex` guard never releases, so the two cases this
+    /// separates are "some seconds" and "forever". A latency bound cannot be
+    /// asserted here, because the in-process lock is one static shared by the
+    /// whole test binary and several cases park on it for the two seconds `edit`
+    /// waits; the latency claim is the case above, on the fixture's own sidecar.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refused_write_does_not_block_the_next_one() {
+    async fn a_refused_write_does_not_strand_the_in_process_lock() {
         let fx = Fixture::new("refused-then-next");
         fx.write("");
 
@@ -925,14 +1024,131 @@ enabled = []
             .expect_err("a command is required");
 
         let next = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
             upsert(r#"{"name":"notes","command":"notes-mcp"}"#).apply(&fx.path(), SURFACE),
         )
         .await
-        .expect("the next write must not wait on the refused one");
+        .expect("the refused write stranded the in-process lock");
         next.expect("the next write succeeds");
 
         assert!(definition(&fx.read(), "notes").is_some());
+    }
+
+    /// The in-process lock orders this core's own writes. It says nothing about
+    /// the other Adele clients on the machine, which write the same file, so the
+    /// write must also take the machine-wide lock on the config's sidecar.
+    ///
+    /// Driven by holding that sidecar lock: a write that takes it is refused,
+    /// and one that ignores it overwrites the other client's transaction.
+    #[tokio::test]
+    async fn a_write_is_refused_while_another_client_holds_the_file_lock() {
+        let fx = Fixture::new("write-file-lock-held");
+        fx.write("");
+        let held = hold_config_lock(&fx.path());
+
+        let err = upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect_err("an edit in flight elsewhere must refuse this write");
+
+        assert!(err.contains("another Adele client is editing"), "{err}");
+        assert!(fx.raw().is_empty(), "nothing was written");
+        drop(held);
+    }
+
+    /// And the refusal is not permanent: a write that starts while the other
+    /// client still holds the lock retries, and lands once that client is done.
+    ///
+    /// The holder is released from another thread after the write is already in
+    /// flight, so the retry loop is what carries this write through. Releasing
+    /// the holder before dispatching would pass with no retry loop at all, which
+    /// is why the elapsed time is asserted: the write must have waited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_retries_until_the_other_client_releases_the_file_lock() {
+        const HELD_FOR: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let fx = Fixture::new("write-file-lock-released");
+        fx.write("");
+        let held = hold_config_lock(&fx.path());
+        std::thread::spawn(move || {
+            std::thread::sleep(HELD_FOR);
+            drop(held);
+        });
+
+        let started = std::time::Instant::now();
+        upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+            .apply(&fx.path(), SURFACE)
+            .await
+            .expect("the retry must carry the write through once the lock frees");
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= HELD_FOR,
+            "the write did not contend for the lock at all: finished in {waited:?}"
+        );
+        assert!(definition(&fx.read(), "notes").is_some());
+    }
+
+    /// A write that is waiting on the file lock must not park a runtime worker.
+    ///
+    /// `edit` is synchronous and sleeps in its retry loop, so calling it inline
+    /// would own a worker thread for the whole two-second wait. This core's
+    /// runtime has two workers, so that is half of it; the runtime here has one,
+    /// which makes a parked worker the whole runtime, and a probe task that
+    /// cannot be scheduled fails the case.
+    ///
+    /// Two details are what make it discriminate, and both were arrived at by
+    /// running it against an inline `edit`:
+    ///
+    /// - It is a plain `#[test]` driving the runtime from outside. A
+    ///   `#[tokio::test]` body runs inside `block_on`, and that thread also runs
+    ///   spawned tasks, so it picks the probe up itself and the case passes with
+    ///   the write inline.
+    /// - It probes for as long as the write is in flight, rather than once after
+    ///   a fixed pause. The in-process lock is shared by the whole test binary,
+    ///   so a single early probe can land while the write is still queued on
+    ///   that lock and has not reached the sidecar at all.
+    #[test]
+    fn a_write_waiting_on_the_file_lock_leaves_the_runtime_responsive() {
+        /// How long one probe task may take to be scheduled. Far above the
+        /// microseconds a free runtime needs, far below the two seconds a parked
+        /// worker would cost.
+        const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+        let fx = Fixture::new("write-does-not-park-the-runtime");
+        fx.write("");
+        let held = hold_config_lock(&fx.path());
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build the single-worker runtime");
+        let handle = runtime.handle().clone();
+
+        let path = fx.path();
+        let writer = handle.spawn(async move {
+            upsert(r#"{"name":"notes","command":"notes-mcp"}"#)
+                .apply(&path, SURFACE)
+                .await
+        });
+
+        while !writer.is_finished() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            handle.spawn(async move {
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(PROBE_BUDGET).expect(
+                "the runtime must still schedule work while a write waits on the file lock",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        runtime
+            .block_on(writer)
+            .expect("the writer task must not panic")
+            .expect_err("the held lock refuses the write");
+        drop(held);
     }
 
     #[tokio::test]

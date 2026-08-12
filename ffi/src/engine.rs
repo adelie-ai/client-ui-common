@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use client_ui_common::{
     AdeleOutput, Effect, TurnOutcome, UiMessage, WindowState, interactive_default_from_purposes,
@@ -422,14 +423,18 @@ fn mcp_client_servers_event_at(
 /// Add or remove `name` in one surface's `disabled_builtins` list in the client
 /// MCP config at `path`.
 ///
-/// Fail-closed on a malformed file, via [`crate::client_mcp::load_strict`] —
-/// which carries the reasoning, and which every edit to this shared file goes
-/// through.
+/// One [`ClientMcpConfig::edit`] transaction: the strict re-read, the change and
+/// the save all happen inside the lock `edit` holds on the config's sidecar, so
+/// another Adele client editing the same file queues rather than losing one of
+/// the two changes. The strict re-read is what fails closed on a malformed
+/// file. The tolerant loader the read path uses would degrade that file to an
+/// empty config and erase every server definition on the machine.
 ///
-/// Serialized against the external client-run writes by the one lock
-/// [`crate::client_mcp::lock_writes`] hands out: both populations live in this
-/// file, so ordering one against the other is what keeps either from losing an
-/// update. The lock is held across the load, the change and the save.
+/// Serialized against this core's external client-run writes because both go
+/// through [`crate::client_mcp::edit_config`], which takes one in-process lock
+/// before the sidecar: both populations live in this file, so ordering one
+/// against the other keeps either from queueing on the sidecar when it could
+/// queue in process instead.
 ///
 /// This write materializes a section for `surface`, so it first seeds one from
 /// `[surfaces.default]` via [`crate::client_mcp::seed_surface_from_default`] —
@@ -437,7 +442,8 @@ fn mcp_client_servers_event_at(
 /// the external servers the surface hosts, so it must not drop them.
 ///
 /// An empty `name` is refused: a blank entry is inert noise every other client
-/// sharing the file would then carry.
+/// sharing the file would then carry. It is refused before the lock is taken -
+/// a caller bug is not worth a sidecar open.
 async fn write_builtin_disabled(
     path: &Path,
     surface: &str,
@@ -447,11 +453,14 @@ async fn write_builtin_disabled(
     if name.is_empty() {
         return Err("built-in server name must not be empty".to_string());
     }
-    let _guard = crate::client_mcp::lock_writes().await;
-    let mut cfg = crate::client_mcp::load_strict(path)?;
-    crate::client_mcp::seed_surface_from_default(&mut cfg, surface);
-    cfg.set_builtin_disabled(surface, name, disabled);
-    cfg.save(path)
+    let surface = surface.to_string();
+    let name = name.to_string();
+    crate::client_mcp::edit_config(path, move |cfg| {
+        crate::client_mcp::seed_surface_from_default(cfg, &surface);
+        cfg.set_builtin_disabled(&surface, &name, disabled);
+        Ok(())
+    })
+    .await
 }
 
 /// The actor: owns the reducer state + the connector, runs effects.
@@ -1368,13 +1377,43 @@ impl Engine {
     }
 }
 
+/// How long teardown waits for the runtime's threads before it walks away.
+///
+/// `adele_core_free` runs on the C caller's thread, which in adele-mac and
+/// adele-kde is the UI thread, so teardown must not be able to block for a
+/// human-visible time. Dropping a runtime outright waits with **no timeout**
+/// for blocking tasks that have started, and a client MCP config edit sleeps up
+/// to two seconds retrying the sidecar lock while another Adele client holds
+/// it, so quitting during someone else's edit would read as a hang.
+///
+/// Long enough that an ordinary wind-down completes inside it, short enough that
+/// a person clicking quit does not see it.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// The opaque handle the C side holds. Owns the tokio runtime (its drop shuts
 /// the worker threads + the actor down) and the channel into the actor.
 pub struct Core {
-    // Held to keep the worker threads (and thus the actor) alive for the
-    // handle's lifetime; dropped — and joined — when `adele_core_free` runs.
-    _runtime: tokio::runtime::Runtime,
+    /// Held to keep the worker threads (and thus the actor) alive for the
+    /// handle's lifetime. `Some` throughout that lifetime; [`Drop`] takes it to
+    /// shut the runtime down with a bounded wait rather than dropping it.
+    runtime: Option<tokio::runtime::Runtime>,
     tx: mpsc::UnboundedSender<CoreMsg>,
+}
+
+/// Shut the runtime down with a bounded wait, so teardown cannot park the C
+/// caller's thread on work in flight.
+///
+/// Anything still running when [`SHUTDOWN_TIMEOUT`] expires is left to finish
+/// detached, or dies with the process. Both are safe for the one blocking task
+/// this core starts, a `client-mcp.toml` edit: the save is an atomic rename, so
+/// a reader sees the old file or the new one and never a partial write, and the
+/// `flock` on the sidecar is released by the kernel when the process exits.
+impl Drop for Core {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+        }
+    }
 }
 
 impl Core {
@@ -1403,7 +1442,7 @@ impl Core {
         };
         runtime.spawn(engine.run(rx));
         Self {
-            _runtime: runtime,
+            runtime: Some(runtime),
             tx,
         }
     }
@@ -1411,6 +1450,79 @@ impl Core {
     /// Queue a controller intent for the actor.
     pub fn send_intent(&self, intent: Intent) {
         let _ = self.tx.send(CoreMsg::Intent(intent));
+    }
+
+    /// A handle on this core's runtime.
+    ///
+    /// Test-only: the teardown case has to put a blocking task on the very
+    /// runtime that teardown shuts down, which is the whole point of what it
+    /// checks.
+    #[cfg(test)]
+    pub(crate) fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime
+            .as_ref()
+            .expect("the runtime is taken only by Drop, and self is alive here")
+            .handle()
+            .clone()
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    //! Cover what `adele_core_free` costs the caller. It drops the [`Core`] on
+    //! the C caller's thread, which in adele-mac and adele-kde is the UI thread,
+    //! so teardown must not be able to block for a human-visible time.
+    use super::*;
+    use desktop_assistant_client_common::mcp_host::ClientMcpConfig;
+    use std::time::Instant;
+
+    extern "C" fn noop_sink(_user_data: *mut std::ffi::c_void, _json: *const std::ffi::c_char) {}
+
+    /// How long the case allows teardown to take. Well above
+    /// [`SHUTDOWN_TIMEOUT`] and well below the two seconds a blocked edit
+    /// spends retrying, so it separates the bounded shutdown from a wait on the
+    /// edit rather than measuring either precisely.
+    const TEARDOWN_BUDGET: Duration = Duration::from_secs(1);
+
+    /// Quitting while another Adele client holds the config lock must not park
+    /// the caller.
+    ///
+    /// Dropping a tokio runtime waits with no timeout for blocking tasks that
+    /// have started, and a `client-mcp.toml` edit is a blocking task that sleeps
+    /// up to two seconds retrying the sidecar. Teardown therefore shuts the
+    /// runtime down with a bounded wait, leaving a late edit to finish detached.
+    #[test]
+    fn dropping_the_core_does_not_wait_for_an_edit_blocked_on_the_config_lock() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("client-mcp.toml");
+        // Stands in for another Adele client's edit, in flight throughout.
+        let held = crate::client_mcp::hold_config_lock(&path);
+
+        let core = Core::new(ViewSink::new(noop_sink, 0));
+        let edit_path = path.clone();
+        core.runtime_handle().spawn_blocking(move || {
+            // Declines, so this edit writes nothing even if it takes the lock
+            // after teardown has walked away from it.
+            ClientMcpConfig::edit(&edit_path, |_cfg| Err::<(), String>("declined".to_string()))
+        });
+        // Let the blocking task reach the retry loop, so teardown meets an edit
+        // that has started rather than one still queued.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let started = Instant::now();
+        drop(core);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < TEARDOWN_BUDGET,
+            "teardown waited {waited:?} on an edit blocked by another client; \
+             this runs on the caller's UI thread"
+        );
+
+        // Release the other client and give the detached edit time to end, so
+        // the temp directory is not removed while it is still running.
+        drop(held);
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
 
@@ -1905,6 +2017,11 @@ enabled = ["notes"]
     /// degrades an unparseable config to an EMPTY one; saving that back would
     /// erase every server definition on the machine, so the edit path must
     /// refuse instead — and leave the bytes exactly as they were.
+    ///
+    /// The refusal is pinned to the strict parse. Every failure the edit can
+    /// return leaves the file untouched, so asserting only that it failed would
+    /// be satisfied by a lock failure and pass without the fail-closed read ever
+    /// running.
     #[tokio::test]
     async fn a_malformed_config_is_refused_rather_than_overwritten() {
         let original = "this is not = valid toml [[[";
@@ -1913,7 +2030,10 @@ enabled = ["notes"]
         let err = write_builtin_disabled(&path, "mac", "fileio", true)
             .await
             .expect_err("a malformed config must not be silently replaced");
-        assert!(!err.is_empty(), "the failure must explain itself");
+        assert!(
+            err.contains("parse error"),
+            "the refusal must name the parse failure; got: {err}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("file still there"),
             original,
@@ -1959,6 +2079,31 @@ enabled = ["fs", "git"]
             ["fs".to_string(), "git".to_string()],
             "the inheritance fallback must not be edited as a side effect"
         );
+    }
+
+    /// The built-in opt-out is the second writer of this shared file, so it has
+    /// to take the machine-wide lock as well: the in-process one orders it
+    /// against the client-run writes of this core only, and every other Adele
+    /// client on the machine writes the same file.
+    ///
+    /// Driven by holding the config's sidecar lock, which is what another
+    /// client's edit in flight holds.
+    #[tokio::test]
+    async fn a_builtin_opt_out_is_refused_while_another_client_holds_the_file_lock() {
+        let (_dir, path) = temp_config(Some(""));
+        let held = crate::client_mcp::hold_config_lock(&path);
+
+        let err = write_builtin_disabled(&path, "mac", "fileio", true)
+            .await
+            .expect_err("an edit in flight elsewhere must refuse this write");
+
+        assert!(err.contains("another Adele client is editing"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file still there"),
+            "",
+            "the refused write must leave the file byte-identical"
+        );
+        drop(held);
     }
 
     /// The built-in opt-out and the client-run writes edit one file, so they
