@@ -27,6 +27,12 @@ pub struct ConversationSummaryDto {
     pub id: String,
     pub title: String,
     pub message_count: u32,
+    /// Whether the user has filed this conversation away.
+    ///
+    /// The inventory the core sends carries archived rows as well as active
+    /// ones, so a client decides for itself whether to group them, hide them, or
+    /// list them inline. A client that renders every row it is given lists them
+    /// inline.
     pub archived: bool,
 }
 

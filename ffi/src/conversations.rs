@@ -7,9 +7,6 @@
 //! answers must be the same at every call site, and both must be testable
 //! without a daemon.
 
-// The spec below is the only caller until the executor is moved onto this seam.
-#![allow(dead_code)]
-
 use client_ui_common::UiMessage;
 use desktop_assistant_api_model::client::ConversationSummary;
 use desktop_assistant_client_common::AssistantClient;
@@ -62,7 +59,9 @@ pub(crate) trait ConversationInventory {
 
 impl<T: AssistantClient + ?Sized> ConversationInventory for T {
     async fn list_all(&self) -> Result<Vec<ConversationSummary>, TransportError> {
-        self.list_conversations().await.map_err(Into::into)
+        self.list_conversations_with_archived()
+            .await
+            .map_err(Into::into)
     }
 
     async fn set_archived(&self, id: &str, change: ArchiveChange) -> Result<(), TransportError> {
@@ -92,8 +91,16 @@ pub(crate) async fn archive_and_relist<C>(
 where
     C: ConversationInventory + ?Sized,
 {
-    let _ = (client, id, change);
-    Vec::new()
+    if let Err(e) = client.set_archived(id, change).await {
+        return vec![UiMessage::Error(format!(
+            "{} conversation: {e}",
+            change.verb()
+        ))];
+    }
+    match client.list_all().await {
+        Ok(convs) => vec![UiMessage::ConversationListRefetched(convs)],
+        Err(e) => vec![UiMessage::Error(format!("load conversations: {e}"))],
+    }
 }
 
 /// The conversation to open when the view has none: the most recent one that is
@@ -106,7 +113,7 @@ where
 pub(crate) fn auto_open_target(
     conversations: &[ConversationSummary],
 ) -> Option<&ConversationSummary> {
-    conversations.first()
+    conversations.iter().find(|c| !c.archived)
 }
 
 #[cfg(test)]
