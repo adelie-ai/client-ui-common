@@ -381,14 +381,20 @@ impl Editability {
     /// capability grants nothing ([`Capability::permits`] is written out with no
     /// wildcard arm), so it lands read-only.
     ///
-    /// The third rule is this layer's own policy: a daemon running built-in
-    /// defaults is read-only whatever the caller holds. The values a panel shows
-    /// then come from a config file the running process is not acting on, and
-    /// the daemon's own whole-config write path refuses a write in that state
-    /// rather than replace the file with defaults plus one edit
-    /// (`api_surface::refuse_if_overwrite_would_destroy_the_file`). One policy
-    /// for every panel is what keeps that from becoming per-command archaeology
-    /// in five clients.
+    /// The third rule is this layer's own policy, and it is deliberately wider
+    /// than what any one daemon path refuses: a daemon running built-in defaults
+    /// is read-only whatever the caller holds. The values a panel shows then
+    /// come from a config file the running process is not acting on, so a person
+    /// would be editing something other than what is live.
+    ///
+    /// What the daemon itself does is narrower and differs per command. A
+    /// whole-config write is refused outright while the daemon runs defaults
+    /// (`api_surface::refuse_if_overwrite_would_destroy_the_file`). A settings
+    /// write goes straight to the file, so it fails only while the file will not
+    /// parse - once the file parses again the daemon would take the write, even
+    /// though it is still running the defaults it booted with, and this model
+    /// still says read-only. One policy for every panel is worth that, because
+    /// the alternative is per-command archaeology repeated in five clients.
     pub fn for_panel(
         panel: PanelId,
         held: Option<&Capability>,

@@ -9,6 +9,16 @@
 //! `Command` a client sends. It holds the edits in between, so dirty tracking,
 //! validation and the write rules below live in one place instead of five.
 //!
+//! ## One limit this model cannot see
+//!
+//! The daemon resolves the embedding backend from `[purposes.embedding]` when
+//! that entry exists, and falls back to the legacy `[embeddings]` block only
+//! when it does not. `SetEmbeddingsSettings` writes the legacy block. So on a
+//! daemon configured through purposes, an apply succeeds, changes nothing that
+//! runs, and reads back unchanged. Nothing in `EmbeddingsSettingsView` says
+//! which source the values came from, so this model cannot warn about it and
+//! does not pretend to. Tracked as desktop-assistant#1298.
+//!
 //! ## Why a write carries fields the person did not touch
 //!
 //! The daemon's `SetEmbeddingsSettings` is a **replace**, not a patch: it
@@ -46,13 +56,18 @@ use super::{
     ValidationKind, normalize_optional, validate_base_url,
 };
 
-/// The connector whose base URL is not a URL.
+/// The spellings of the connector whose base URL is not a URL.
 ///
 /// `docs/development.md` documents the legacy settings `base_url` for Bedrock as
 /// dual-use - an AWS region (`us-east-1`) or a real endpoint - and the daemon
 /// skips its URL policy for exactly this connector. Validating a bare region as
 /// a URL here would refuse a working configuration.
-const REGION_STYLE_CONNECTOR: &str = "bedrock";
+///
+/// Both spellings, because the daemon accepts both: `Connector::parse` maps
+/// `bedrock` and the legacy `aws-bedrock` to the same connector. Matching one of
+/// them would tell somebody whose configuration works that their endpoint is
+/// wrong, and refuse every write on the panel until they changed it.
+const REGION_STYLE_CONNECTORS: [&str; 2] = ["bedrock", "aws-bedrock"];
 
 /// The fields a person edits, in the order a panel draws them.
 const EDITABLE_FIELDS: [FieldId; 3] = [FieldId::Connector, FieldId::Model, FieldId::BaseUrl];
@@ -144,11 +159,15 @@ impl EmbeddingsPanel {
         Ok(())
     }
 
-    /// Discard every unapplied edit.
+    /// Discard every unapplied edit, and the failure that described them.
+    ///
+    /// The recorded failure is a verdict on values that are no longer on screen,
+    /// exactly as it is after an [`Self::edit`], so it goes with them.
     pub fn revert(&mut self) {
         self.connector_draft = None;
         self.model_draft = None;
         self.base_url_draft = None;
+        self.error = None;
     }
 
     /// Take the daemon's values again after a write, or after a `ConfigChanged`
@@ -250,6 +269,23 @@ impl EmbeddingsPanel {
     /// same edit is a valid pair, and so is switching away from it and typing a
     /// URL.
     fn errors(&self) -> Vec<FieldError> {
+        let mut errors = self.local_errors();
+        // A value the daemon refused is wrong until it changes, so it marks its
+        // own field and blocks Apply exactly as a locally caught one does -
+        // re-sending it would earn the same refusal. A local finding wins on a
+        // field they both name, because it describes what is on screen now.
+        if let Some(SettingsError::Validation { errors: refused }) = &self.error {
+            for error in refused {
+                if !errors.iter().any(|existing| existing.field == error.field) {
+                    errors.push(error.clone());
+                }
+            }
+        }
+        errors
+    }
+
+    /// Everything this model itself rejects about the values as they stand.
+    fn local_errors(&self) -> Vec<FieldError> {
         let mut errors = Vec::new();
         let connector = self.normalize(FieldId::Connector, self.effective(FieldId::Connector));
 
@@ -263,7 +299,9 @@ impl EmbeddingsPanel {
             });
         }
 
-        let region_style = connector.as_deref() == Some(REGION_STYLE_CONNECTOR);
+        let region_style = connector
+            .as_deref()
+            .is_some_and(|c| REGION_STYLE_CONNECTORS.contains(&c));
         if let Some(base_url) = self.normalize(FieldId::BaseUrl, self.effective(FieldId::BaseUrl))
             && !region_style
             && let Err(kind) = validate_base_url(&base_url)
@@ -329,9 +367,17 @@ impl EmbeddingsPanel {
 
     /// The command that applies the panel, or the reason it cannot be applied.
     ///
-    /// A panel with nothing changed still yields a command: the write is
-    /// idempotent - the same values produce the same stored config and no
-    /// further effect - so a client may re-apply without a special case.
+    /// A panel with nothing changed still yields a command, so a client may
+    /// re-apply without a special case. Idempotent in what the daemon then runs:
+    /// the same values resolve to the same backend however often they are sent.
+    ///
+    /// Not free, though, and a view should enable Apply from
+    /// [`Self::apply_state`] rather than offer a re-apply for its own sake: the
+    /// write materializes the derived defaults into the config file, and the
+    /// daemon diffs that file's `[embeddings]` block structurally. A value that
+    /// was absent and is now written down reads as a change, so the daemon
+    /// reports that this panel needs a restart - after an apply that altered
+    /// nothing anyone can see.
     pub fn write_command(&self) -> Result<Command, SettingsError> {
         match self.apply_state() {
             ApplyState::Ready | ApplyState::NoChanges => {}
@@ -844,6 +890,92 @@ mod tests {
                 errors: vec![expected],
             })
         );
+    }
+
+    #[test]
+    fn a_value_the_daemon_refused_marks_its_field_and_blocks_apply() {
+        let mut panel = admin_panel();
+        panel
+            .edit(FieldId::BaseUrl, "https://embed.example.com")
+            .unwrap();
+        let refused = FieldError {
+            field: FieldId::BaseUrl,
+            kind: ValidationKind::RefusedByDaemon("url_target_blocked".to_string()),
+            message: "That address is not allowed.".to_string(),
+        };
+        panel.set_error(SettingsError::Validation {
+            errors: vec![refused.clone()],
+        });
+
+        let view = panel.view();
+        assert_eq!(field(&view, FieldId::BaseUrl).error, Some(refused.clone()));
+        assert_eq!(view.apply, ApplyState::Invalid(vec![refused.clone()]));
+        assert_eq!(
+            panel.write_command(),
+            Err(SettingsError::Validation {
+                errors: vec![refused],
+            })
+        );
+    }
+
+    #[test]
+    fn changing_the_value_after_a_daemon_refusal_re_enables_apply() {
+        let mut panel = admin_panel();
+        panel.set_error(SettingsError::Validation {
+            errors: vec![FieldError {
+                field: FieldId::BaseUrl,
+                kind: ValidationKind::RefusedByDaemon("url_target_blocked".to_string()),
+                message: "That address is not allowed.".to_string(),
+            }],
+        });
+        panel
+            .edit(FieldId::BaseUrl, "https://embed.example.com")
+            .unwrap();
+        assert_eq!(panel.apply_state(), ApplyState::Ready);
+        assert_eq!(field(&panel.view(), FieldId::BaseUrl).error, None);
+    }
+
+    #[test]
+    fn a_local_finding_wins_over_a_daemon_one_on_the_same_field() {
+        let mut panel = admin_panel();
+        panel.edit(FieldId::BaseUrl, "not a url").unwrap();
+        panel.set_error(SettingsError::Validation {
+            errors: vec![FieldError {
+                field: FieldId::BaseUrl,
+                kind: ValidationKind::RefusedByDaemon("url_target_blocked".to_string()),
+                message: "That address is not allowed.".to_string(),
+            }],
+        });
+        let view = panel.view();
+        assert_eq!(
+            field(&view, FieldId::BaseUrl)
+                .error
+                .as_ref()
+                .map(|e| &e.kind),
+            Some(&ValidationKind::MalformedUrl)
+        );
+    }
+
+    #[test]
+    fn revert_discards_the_failure_with_the_edits() {
+        let mut panel = admin_panel();
+        panel.edit(FieldId::Model, "mxbai-embed-large").unwrap();
+        panel.set_error(SettingsError::from_link_failure("connection closed"));
+        panel.revert();
+        assert_eq!(panel.view().error, None);
+        assert_eq!(panel.apply_state(), ApplyState::NoChanges);
+    }
+
+    #[test]
+    fn the_legacy_aws_bedrock_spelling_also_takes_a_region() {
+        // `Connector::parse` maps both spellings to the same connector, so a
+        // working `aws-bedrock` config must not be told its endpoint is wrong.
+        let mut loaded = loaded_view();
+        loaded.connector = "aws-bedrock".to_string();
+        loaded.base_url = "us-east-1".to_string();
+        let panel = EmbeddingsPanel::new(context(Some(Capability::Admin), &[]), loaded);
+        assert_eq!(field(&panel.view(), FieldId::BaseUrl).error, None);
+        assert_eq!(panel.apply_state(), ApplyState::NoChanges);
     }
 
     #[test]
