@@ -286,9 +286,12 @@ pub enum StatusLevel {
 
 /// The value of one field, in the shape a view renders.
 ///
-/// SECURITY: there is deliberately no variant that carries a secret value. A
-/// credential is reported as [`Self::SecretPresence`] - whether one is stored -
-/// which is all the daemon reports and all a panel needs.
+/// SECURITY: no panel puts a secret in one. A credential is reported as
+/// [`Self::SecretPresence`] - whether one is stored - which is all the daemon
+/// reports for it and all a panel needs. That is a rule the panels keep, not one
+/// the type enforces: [`Self::Text`] would hold anything given to it. A panel
+/// that has to *take* a secret needs a variant of its own that a snapshot never
+/// reads back, rather than reusing [`Self::Text`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldValue {
     /// A free-text value the person edits.
@@ -599,6 +602,16 @@ impl SettingsError {
     /// runs on a settings write. They are a judgement about a *value*, so they
     /// land as [`SettingsError::Validation`] on the panel's URL field rather
     /// than as a technical failure a client would offer to retry.
+    ///
+    /// NOT every command carries them yet, and this model cannot make it so.
+    /// The daemon classifies a refusal into a code on `CreateConnection`,
+    /// `UpdateConnection` and `UpsertMcpServer`; `SetEmbeddingsSettings` and the
+    /// other settings writes render theirs through `Display`, so a refused base
+    /// URL arrives with no `ErrorDetail` at all and a host has nothing to
+    /// classify it by ([`Self::from_link_failure`] is then the honest read).
+    /// desktop-assistant#972 tracks classifying the rest. Until it lands, the
+    /// local check in [`validate_base_url`] is what catches a bad URL for this
+    /// panel, and it catches less than the daemon does.
     pub fn from_daemon(
         detail: &ErrorDetail,
         panel: PanelId,
@@ -702,9 +715,23 @@ impl SettingsError {
 pub struct DaemonContext {
     /// Which daemon this is.
     pub instance: InstanceId,
-    /// The capability the daemon reported for this connection. `None` means it
-    /// reported none, which a panel reads as "this daemon predates the
-    /// authorization tier" and not as "no capability".
+    /// The capability the daemon reported for this connection. `None` means the
+    /// daemon reported none, which a panel reads as "this daemon predates the
+    /// authorization tier" and not as "no capability" - so it leaves the
+    /// controls editable.
+    ///
+    /// That makes `None` a claim about the daemon, and a host must not write it
+    /// to mean "I did not ask". Only `GetConfig` and `ConfigChanged` carry the
+    /// capability; a host that read a panel with a dedicated `Get*Settings`
+    /// command has to carry the value forward from the last config it saw. A
+    /// `None` written for convenience would offer a tenant every control and let
+    /// the write fail on submit, which is the defect this model exists to
+    /// remove.
+    ///
+    /// Deliberately the wire field's own shape rather than a third state for
+    /// "not read yet": this mirrors [`Config::caller_capability`] one to one, so
+    /// the two cannot come to mean different things, and a host that does not
+    /// know the capability has a config read available to find out.
     pub caller_capability: Option<Capability>,
     /// The daemon's restart report, verbatim.
     pub restart_required: Vec<String>,
@@ -736,10 +763,14 @@ pub fn normalize_optional(value: &str) -> Option<String> {
 ///
 /// This is a courtesy check that never widens what the daemon accepts: the
 /// daemon's remote-URL policy additionally refuses cloud-metadata addresses,
-/// plain `http` to a public host, and bare hostnames that carry a credential,
-/// and those refusals arrive as [`ValidationKind::RefusedByDaemon`]. What this
-/// catches is the typo worth catching before a round trip - a missing scheme,
-/// and a scheme that is not the web.
+/// plain `http` to a public host, and bare hostnames that carry a credential.
+/// What this catches is the typo worth catching before a round trip - a missing
+/// scheme, and a scheme that is not the web.
+///
+/// A value this accepts can still be refused. On a command the daemon
+/// classifies, that refusal reads as [`ValidationKind::RefusedByDaemon`]; on a
+/// settings write it currently arrives unclassified, which is
+/// [`SettingsError::from_daemon`]'s note and desktop-assistant#972.
 pub fn validate_base_url(value: &str) -> Result<(), ValidationKind> {
     let lower = value.trim().to_ascii_lowercase();
     let rest = lower
@@ -748,9 +779,9 @@ pub fn validate_base_url(value: &str) -> Result<(), ValidationKind> {
         .ok_or(ValidationKind::MalformedUrl)?;
     // A host has to be there and has to end somewhere: the authority runs up to
     // the first `/`, `?` or `#`. `https:///v1` and `https://` both leave it
-    // empty.
+    // empty, and a space inside it is a typed-in mistake rather than a host.
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if host.is_empty() {
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
         return Err(ValidationKind::MalformedUrl);
     }
     Ok(())
@@ -1135,6 +1166,14 @@ mod tests {
         );
         assert_eq!(
             validate_base_url("https:///v1"),
+            Err(ValidationKind::MalformedUrl)
+        );
+    }
+
+    #[test]
+    fn a_base_url_whose_host_contains_a_space_is_rejected() {
+        assert_eq!(
+            validate_base_url("http://embed .example.com/v1"),
             Err(ValidationKind::MalformedUrl)
         );
     }

@@ -24,11 +24,19 @@
 //! - An untouched connector that was inherited is written as a clear, so it goes
 //!   on following the main LLM connector rather than being pinned to whatever it
 //!   happens to resolve to today.
-//! - Any other untouched field is written back as it stands. Nothing says
-//!   whether the model and the base URL were set explicitly, and writing a clear
-//!   on a guess would silently drop an explicitly configured model. Writing the
-//!   value back keeps the running configuration identical, at the cost of
-//!   turning a default that was implicit into one that is written down.
+//! - An untouched model or base URL is written back as it stands **while the
+//!   connector is unchanged**. Nothing says whether either was set explicitly,
+//!   and writing a clear on a guess would silently drop a configured model.
+//!   Writing the value back keeps the running configuration identical, at the
+//!   cost of turning a default that was implicit into one that is written down.
+//! - An untouched model or base URL is written as a **clear** when the connector
+//!   did change. Both defaults are derived from the connector, so echoing them
+//!   would pin one provider's model name and endpoint onto another: switching
+//!   from a local Ollama to a hosted provider would otherwise save that
+//!   provider with a loopback endpoint and a model it does not have. Clearing
+//!   lets the daemon resolve the new connector's own defaults. It can lose an
+//!   explicitly configured model, but a model chosen for the old provider is
+//!   the wrong value for the new one either way.
 
 use desktop_assistant_api_model::{Command, Config, EmbeddingHealth, EmbeddingsSettingsView};
 
@@ -48,15 +56,6 @@ const REGION_STYLE_CONNECTOR: &str = "bedrock";
 
 /// The fields a person edits, in the order a panel draws them.
 const EDITABLE_FIELDS: [FieldId; 3] = [FieldId::Connector, FieldId::Model, FieldId::BaseUrl];
-
-/// The fields the daemon reports, in the order a panel draws them. They are
-/// facts about the running system, so no view offers a control for one.
-const DERIVED_FIELDS: [FieldId; 4] = [
-    FieldId::ApiKeyPresent,
-    FieldId::Available,
-    FieldId::IsDefault,
-    FieldId::Health,
-];
 
 /// The three values a write to this panel carries, already normalized the way
 /// the daemon normalizes them. `None` clears the setting.
@@ -155,10 +154,25 @@ impl EmbeddingsPanel {
     /// Take the daemon's values again after a write, or after a `ConfigChanged`
     /// event. Clears the edits, because they are now what the daemon reports,
     /// and clears the last failure.
+    ///
+    /// Values only. The restart report and the caller's capability arrive on a
+    /// different reply, and a write to this panel changes the restart report -
+    /// the setting is wired once at daemon startup - so a host that re-reads the
+    /// config after applying must hand the new context to [`Self::set_context`]
+    /// as well. Splitting them keeps a host that re-read only the panel from
+    /// having to invent a context it does not have.
     pub fn read_back(&mut self, loaded: EmbeddingsSettingsView) {
         self.loaded = loaded;
         self.revert();
         self.error = None;
+    }
+
+    /// Take the daemon's restart report and the caller's capability again.
+    ///
+    /// Leaves the values and the edits alone: this answers "what is live, and
+    /// what may I change", not "what is configured".
+    pub fn set_context(&mut self, context: DaemonContext) {
+        self.context = context;
     }
 
     /// Record the failure of the last write, so the snapshot carries it.
@@ -285,18 +299,32 @@ impl EmbeddingsPanel {
     /// The three values a write would carry. See the module docs for why an
     /// untouched field is not always left alone.
     pub fn pending_write(&self) -> EmbeddingsWrite {
+        let connector_changed = self.is_field_dirty(FieldId::Connector);
         EmbeddingsWrite {
             // Keyed on the *change*, not on whether anything was typed: retyping
             // the connector that is already inherited is not a request to pin
             // it, and the panel has already reported that nothing changed.
-            connector: match self.is_field_dirty(FieldId::Connector) {
+            connector: match connector_changed {
                 true => self.normalize(FieldId::Connector, self.effective(FieldId::Connector)),
                 false if self.loaded.is_default => None,
                 false => self.normalize(FieldId::Connector, self.stored(FieldId::Connector)),
             },
-            model: self.normalize(FieldId::Model, self.effective(FieldId::Model)),
-            base_url: self.normalize(FieldId::BaseUrl, self.effective(FieldId::BaseUrl)),
+            model: self.derived_from_connector(FieldId::Model, connector_changed),
+            base_url: self.derived_from_connector(FieldId::BaseUrl, connector_changed),
         }
+    }
+
+    /// What a write carries for a field whose default the connector decides.
+    ///
+    /// An edit is written as typed. An untouched field is written back while the
+    /// connector stands, and cleared when it changed, so the daemon resolves the
+    /// new connector's own default instead of inheriting the old one's. See the
+    /// module docs for why each way round.
+    fn derived_from_connector(&self, field: FieldId, connector_changed: bool) -> Option<String> {
+        if !self.is_field_dirty(field) && connector_changed {
+            return None;
+        }
+        self.normalize(field, self.effective(field))
     }
 
     /// The command that applies the panel, or the reason it cannot be applied.
@@ -341,7 +369,22 @@ impl EmbeddingsPanel {
         let errors = self.errors();
         let error_for = |field: FieldId| errors.iter().find(|e| e.field == field).cloned();
 
-        let mut fields = Vec::with_capacity(EDITABLE_FIELDS.len() + DERIVED_FIELDS.len());
+        // The fields the daemon reports, in the order a panel draws them, each
+        // paired with its value. Facts about the running system, so no view
+        // offers a control for one. Written out as pairs rather than looped over
+        // a list of ids: a field added to the list without a value of its own
+        // would otherwise fall to a catch-all and render as something else.
+        let derived = [
+            (
+                FieldId::ApiKeyPresent,
+                FieldValue::SecretPresence(self.loaded.has_api_key),
+            ),
+            (FieldId::Available, FieldValue::Flag(self.loaded.available)),
+            (FieldId::IsDefault, FieldValue::Flag(self.loaded.is_default)),
+            (FieldId::Health, health_value(&self.loaded.health)),
+        ];
+
+        let mut fields = Vec::with_capacity(EDITABLE_FIELDS.len() + derived.len());
         for field in EDITABLE_FIELDS {
             let (label, help) = labels(field);
             fields.push(FieldView {
@@ -354,18 +397,13 @@ impl EmbeddingsPanel {
                 dirty: self.is_field_dirty(field),
             });
         }
-        for field in DERIVED_FIELDS {
+        for (field, value) in derived {
             let (label, help) = labels(field);
             fields.push(FieldView {
                 id: field,
                 label,
                 help,
-                value: match field {
-                    FieldId::ApiKeyPresent => FieldValue::SecretPresence(self.loaded.has_api_key),
-                    FieldId::Available => FieldValue::Flag(self.loaded.available),
-                    FieldId::IsDefault => FieldValue::Flag(self.loaded.is_default),
-                    _ => health_value(&self.loaded.health),
-                },
+                value,
                 editability: Editability::ReadOnly(ReadOnlyReason::Derived),
                 error: None,
                 dirty: false,
@@ -936,6 +974,55 @@ mod tests {
             write.base_url,
             Some("https://embed.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn changing_the_connector_clears_an_untouched_model_and_base_url() {
+        // Both defaults are the old connector's. Echoing them would save a
+        // hosted provider with a loopback endpoint and a model it does not have.
+        let mut panel = admin_panel();
+        panel.edit(FieldId::Connector, "openai").unwrap();
+        let write = panel.pending_write();
+        assert_eq!(write.connector, Some("openai".to_string()));
+        assert_eq!(write.model, None);
+        assert_eq!(write.base_url, None);
+    }
+
+    #[test]
+    fn changing_the_connector_keeps_a_model_edited_in_the_same_change() {
+        let mut panel = admin_panel();
+        panel.edit(FieldId::Connector, "openai").unwrap();
+        panel
+            .edit(FieldId::Model, "text-embedding-3-small")
+            .unwrap();
+        let write = panel.pending_write();
+        assert_eq!(write.connector, Some("openai".to_string()));
+        assert_eq!(write.model, Some("text-embedding-3-small".to_string()));
+        assert_eq!(write.base_url, None);
+    }
+
+    #[test]
+    fn set_context_refreshes_the_restart_report_without_touching_the_values() {
+        let mut panel = admin_panel();
+        panel.edit(FieldId::Model, "mxbai-embed-large").unwrap();
+        panel.set_context(context(Some(Capability::Admin), &["embeddings"]));
+
+        assert_eq!(panel.restart(), RestartState::RestartRequired);
+        assert!(panel.is_dirty());
+        assert_eq!(
+            field(&panel.view(), FieldId::Model).value,
+            FieldValue::Text("mxbai-embed-large".to_string())
+        );
+    }
+
+    #[test]
+    fn read_back_leaves_the_restart_report_alone() {
+        let mut panel = EmbeddingsPanel::new(
+            context(Some(Capability::Admin), &["embeddings"]),
+            loaded_view(),
+        );
+        panel.read_back(loaded_view());
+        assert_eq!(panel.restart(), RestartState::RestartRequired);
     }
 
     #[test]
