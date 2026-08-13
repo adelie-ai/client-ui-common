@@ -33,9 +33,30 @@
 use desktop_assistant_api_model::{Command, Config, EmbeddingHealth, EmbeddingsSettingsView};
 
 use super::{
-    ApplyState, DaemonContext, FieldId, FieldValue, InstanceId, PanelId, ReadOnlyReason,
-    RestartState, SettingsError, SettingsPanelView,
+    ApplyState, DaemonContext, Editability, FieldError, FieldId, FieldValue, FieldView, InstanceId,
+    PanelId, ReadOnlyReason, RestartState, SettingsError, SettingsPanelView, StatusLevel,
+    ValidationKind, normalize_optional, validate_base_url,
 };
+
+/// The connector whose base URL is not a URL.
+///
+/// `docs/development.md` documents the legacy settings `base_url` for Bedrock as
+/// dual-use - an AWS region (`us-east-1`) or a real endpoint - and the daemon
+/// skips its URL policy for exactly this connector. Validating a bare region as
+/// a URL here would refuse a working configuration.
+const REGION_STYLE_CONNECTOR: &str = "bedrock";
+
+/// The fields a person edits, in the order a panel draws them.
+const EDITABLE_FIELDS: [FieldId; 3] = [FieldId::Connector, FieldId::Model, FieldId::BaseUrl];
+
+/// The fields the daemon reports, in the order a panel draws them. They are
+/// facts about the running system, so no view offers a control for one.
+const DERIVED_FIELDS: [FieldId; 4] = [
+    FieldId::ApiKeyPresent,
+    FieldId::Available,
+    FieldId::IsDefault,
+    FieldId::Health,
+];
 
 /// The three values a write to this panel carries, already normalized the way
 /// the daemon normalizes them. `None` clears the setting.
@@ -101,21 +122,43 @@ impl EmbeddingsPanel {
     /// working from a snapshot that told it not to, and a silently dropped edit
     /// would hide that.
     pub fn edit(&mut self, field: FieldId, value: impl Into<String>) -> Result<(), ReadOnlyReason> {
-        let _ = (field, value.into());
-        unimplemented!("EmbeddingsPanel::edit")
+        if !EDITABLE_FIELDS.contains(&field) {
+            return Err(ReadOnlyReason::Derived);
+        }
+        if let Editability::ReadOnly(reason) = self.panel_editability() {
+            return Err(reason);
+        }
+        let value = value.into();
+        match field {
+            FieldId::Connector => self.connector_draft = Some(value),
+            FieldId::Model => self.model_draft = Some(value),
+            FieldId::BaseUrl => self.base_url_draft = Some(value),
+            // Unreachable while `EDITABLE_FIELDS` names exactly the three above;
+            // refusing rather than panicking keeps a later addition to that list
+            // a bug that is reported, not one that aborts the client.
+            _ => return Err(ReadOnlyReason::Derived),
+        }
+        // The recorded failure describes the values as they were sent. They are
+        // no longer those values, so it would be read as a verdict on what is on
+        // screen now.
+        self.error = None;
+        Ok(())
     }
 
     /// Discard every unapplied edit.
     pub fn revert(&mut self) {
-        unimplemented!("EmbeddingsPanel::revert")
+        self.connector_draft = None;
+        self.model_draft = None;
+        self.base_url_draft = None;
     }
 
     /// Take the daemon's values again after a write, or after a `ConfigChanged`
     /// event. Clears the edits, because they are now what the daemon reports,
     /// and clears the last failure.
     pub fn read_back(&mut self, loaded: EmbeddingsSettingsView) {
-        let _ = loaded;
-        unimplemented!("EmbeddingsPanel::read_back")
+        self.loaded = loaded;
+        self.revert();
+        self.error = None;
     }
 
     /// Record the failure of the last write, so the snapshot carries it.
@@ -125,18 +168,135 @@ impl EmbeddingsPanel {
 
     /// Whether any field carries an unapplied edit.
     pub fn is_dirty(&self) -> bool {
-        unimplemented!("EmbeddingsPanel::is_dirty")
+        EDITABLE_FIELDS
+            .iter()
+            .any(|field| self.is_field_dirty(*field))
+    }
+
+    /// Whether one field carries an unapplied edit.
+    ///
+    /// Compared after normalization, so retyping the value that is already
+    /// stored - with a stray space, or a connector in another case - is not a
+    /// change. The daemon would store exactly what it already has.
+    fn is_field_dirty(&self, field: FieldId) -> bool {
+        self.draft(field).is_some_and(|draft| {
+            self.normalize(field, draft) != self.normalize(field, self.stored(field))
+        })
+    }
+
+    /// The unapplied edit for a field, when there is one.
+    fn draft(&self, field: FieldId) -> Option<&str> {
+        match field {
+            FieldId::Connector => self.connector_draft.as_deref(),
+            FieldId::Model => self.model_draft.as_deref(),
+            FieldId::BaseUrl => self.base_url_draft.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The value the daemon reported for a field.
+    fn stored(&self, field: FieldId) -> &str {
+        match field {
+            FieldId::Connector => &self.loaded.connector,
+            FieldId::Model => &self.loaded.model,
+            FieldId::BaseUrl => &self.loaded.base_url,
+            _ => "",
+        }
+    }
+
+    /// What a field would be if the panel were applied now: the edit when there
+    /// is one, else what the daemon reported.
+    fn effective(&self, field: FieldId) -> &str {
+        self.draft(field).unwrap_or_else(|| self.stored(field))
+    }
+
+    /// Normalize one field the way the daemon normalizes it before it stores
+    /// one: every field is trimmed, and a connector is lowercased as well.
+    fn normalize(&self, field: FieldId, value: &str) -> Option<String> {
+        let normalized = normalize_optional(value)?;
+        Some(match field {
+            FieldId::Connector => normalized.to_lowercase(),
+            _ => normalized,
+        })
+    }
+
+    /// Whether this connection may change this panel at all.
+    fn panel_editability(&self) -> Editability {
+        Editability::for_panel(
+            PanelId::Embeddings,
+            self.context.caller_capability.as_ref(),
+            self.restart(),
+        )
+    }
+
+    /// Everything wrong with the values as they stand.
+    ///
+    /// The connector under test is the one that would be *applied*, not the one
+    /// the daemon last reported: switching to Bedrock and typing a region in the
+    /// same edit is a valid pair, and so is switching away from it and typing a
+    /// URL.
+    fn errors(&self) -> Vec<FieldError> {
+        let mut errors = Vec::new();
+        let connector = self.normalize(FieldId::Connector, self.effective(FieldId::Connector));
+
+        if let Some(connector) = connector.as_deref()
+            && connector.split_whitespace().count() > 1
+        {
+            errors.push(FieldError {
+                field: FieldId::Connector,
+                kind: ValidationKind::UnexpectedWhitespace,
+                message: "A connector name has no spaces in it.".to_string(),
+            });
+        }
+
+        let region_style = connector.as_deref() == Some(REGION_STYLE_CONNECTOR);
+        if let Some(base_url) = self.normalize(FieldId::BaseUrl, self.effective(FieldId::BaseUrl))
+            && !region_style
+            && let Err(kind) = validate_base_url(&base_url)
+        {
+            errors.push(FieldError {
+                field: FieldId::BaseUrl,
+                kind,
+                message: "Enter a full http:// or https:// address.".to_string(),
+            });
+        }
+
+        errors
     }
 
     /// Whether Apply has anything to do, and why not when it does not.
+    ///
+    /// A refusal outranks a bad value: telling somebody to fix a field they
+    /// cannot save is the wrong instruction.
     pub fn apply_state(&self) -> ApplyState {
-        unimplemented!("EmbeddingsPanel::apply_state")
+        if let Editability::ReadOnly(reason) = self.panel_editability() {
+            return ApplyState::NotPermitted(reason);
+        }
+        let errors = self.errors();
+        if !errors.is_empty() {
+            return ApplyState::Invalid(errors);
+        }
+        if !self.is_dirty() {
+            return ApplyState::NoChanges;
+        }
+        ApplyState::Ready
     }
 
     /// The three values a write would carry. See the module docs for why an
     /// untouched field is not always left alone.
     pub fn pending_write(&self) -> EmbeddingsWrite {
-        unimplemented!("EmbeddingsPanel::pending_write")
+        EmbeddingsWrite {
+            // Keyed on the *change*, not on whether anything was typed: retyping
+            // the connector that is already inherited is not a request to pin
+            // it, and the panel has already reported that nothing changed.
+            connector: match self.is_field_dirty(FieldId::Connector) {
+                true => self.normalize(FieldId::Connector, self.effective(FieldId::Connector)),
+                false if self.loaded.is_default => None,
+                false => self.normalize(FieldId::Connector, self.stored(FieldId::Connector)),
+            },
+            model: self.normalize(FieldId::Model, self.effective(FieldId::Model)),
+            base_url: self.normalize(FieldId::BaseUrl, self.effective(FieldId::BaseUrl)),
+        }
     }
 
     /// The command that applies the panel, or the reason it cannot be applied.
@@ -145,12 +305,83 @@ impl EmbeddingsPanel {
     /// idempotent - the same values produce the same stored config and no
     /// further effect - so a client may re-apply without a special case.
     pub fn write_command(&self) -> Result<Command, SettingsError> {
-        unimplemented!("EmbeddingsPanel::write_command")
+        match self.apply_state() {
+            ApplyState::Ready | ApplyState::NoChanges => {}
+            ApplyState::Invalid(errors) => return Err(SettingsError::Validation { errors }),
+            ApplyState::NotPermitted(reason) => {
+                let message = reason.message();
+                return Err(match reason {
+                    ReadOnlyReason::CapabilityRequired { required, held } => {
+                        SettingsError::NotAuthorized {
+                            required,
+                            held,
+                            message,
+                        }
+                    }
+                    // `Derived` never reaches here: it belongs to a field, not
+                    // to a panel. Refusing on it anyway keeps the match total
+                    // without a panic on a case a later change could create.
+                    ReadOnlyReason::ConfigNotLoaded | ReadOnlyReason::Derived => {
+                        SettingsError::DaemonNotWritable { message }
+                    }
+                });
+            }
+        }
+        let write = self.pending_write();
+        Ok(Command::SetEmbeddingsSettings {
+            connector: write.connector,
+            model: write.model,
+            base_url: write.base_url,
+        })
     }
 
     /// The whole panel as one value a view renders.
     pub fn view(&self) -> SettingsPanelView {
-        unimplemented!("EmbeddingsPanel::view")
+        let editability = self.panel_editability();
+        let errors = self.errors();
+        let error_for = |field: FieldId| errors.iter().find(|e| e.field == field).cloned();
+
+        let mut fields = Vec::with_capacity(EDITABLE_FIELDS.len() + DERIVED_FIELDS.len());
+        for field in EDITABLE_FIELDS {
+            let (label, help) = labels(field);
+            fields.push(FieldView {
+                id: field,
+                label,
+                help,
+                value: FieldValue::Text(self.effective(field).to_string()),
+                editability: editability.clone(),
+                error: error_for(field),
+                dirty: self.is_field_dirty(field),
+            });
+        }
+        for field in DERIVED_FIELDS {
+            let (label, help) = labels(field);
+            fields.push(FieldView {
+                id: field,
+                label,
+                help,
+                value: match field {
+                    FieldId::ApiKeyPresent => FieldValue::SecretPresence(self.loaded.has_api_key),
+                    FieldId::Available => FieldValue::Flag(self.loaded.available),
+                    FieldId::IsDefault => FieldValue::Flag(self.loaded.is_default),
+                    _ => health_value(&self.loaded.health),
+                },
+                editability: Editability::ReadOnly(ReadOnlyReason::Derived),
+                error: None,
+                dirty: false,
+            });
+        }
+
+        SettingsPanelView {
+            instance: self.context.instance.clone(),
+            panel: PanelId::Embeddings,
+            title: PanelId::Embeddings.title(),
+            fields,
+            restart: self.restart(),
+            apply: self.apply_state(),
+            dirty: self.is_dirty(),
+            error: self.error.clone(),
+        }
     }
 }
 
@@ -160,8 +391,62 @@ impl EmbeddingsPanel {
 /// `unknown` stays distinct from `disabled`: a backend whose health was never
 /// determined must not be drawn as switched off.
 pub fn health_value(health: &EmbeddingHealth) -> FieldValue {
-    let _ = health;
-    unimplemented!("health_value")
+    let (level, text, detail) = match health {
+        EmbeddingHealth::Ok => (StatusLevel::Ok, "ok", None),
+        EmbeddingHealth::Disabled => (StatusLevel::Info, "disabled", None),
+        EmbeddingHealth::Unavailable { reason } => {
+            (StatusLevel::Warning, "unavailable", Some(reason.clone()))
+        }
+        EmbeddingHealth::Unknown => (StatusLevel::Unknown, "unknown", None),
+    };
+    FieldValue::Status {
+        level,
+        text: text.to_string(),
+        detail,
+    }
+}
+
+/// The label and help line for one field. Static text: this crate carries no
+/// translation layer, and every client says the same thing.
+fn labels(field: FieldId) -> (&'static str, Option<&'static str>) {
+    match field {
+        FieldId::Connector => (
+            "Connector",
+            Some(
+                "Which provider produces the embeddings. Leave it empty to follow the main model connector.",
+            ),
+        ),
+        FieldId::Model => (
+            "Model",
+            Some("The embedding model. Leave it empty to use the connector's default."),
+        ),
+        FieldId::BaseUrl => (
+            "Base URL",
+            Some(
+                "Where the connector is reached. Leave it empty to use the connector's default. For Bedrock this is an AWS region.",
+            ),
+        ),
+        FieldId::ApiKeyPresent => (
+            "API key",
+            Some("Whether a credential is stored for this connector. The value is never shown."),
+        ),
+        FieldId::Available => (
+            "Available",
+            Some("Whether this connector can produce embeddings at all."),
+        ),
+        FieldId::IsDefault => (
+            "Inherited",
+            Some(
+                "Whether the connector follows the main model connector rather than being set here.",
+            ),
+        ),
+        FieldId::Health => (
+            "Health",
+            Some(
+                "What the daemon sees right now. Without a working backend, search falls back to full text.",
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -593,6 +878,33 @@ mod tests {
         let mut panel = admin_panel();
         panel.edit(FieldId::Connector, "OpenAI").unwrap();
         assert_eq!(panel.pending_write().connector, Some("openai".to_string()));
+    }
+
+    #[test]
+    fn retyping_an_inherited_connector_unchanged_does_not_pin_it() {
+        let mut loaded = loaded_view();
+        loaded.is_default = true;
+        let mut panel = EmbeddingsPanel::new(context(Some(Capability::Admin), &[]), loaded);
+        panel.edit(FieldId::Connector, "ollama").unwrap();
+        panel.edit(FieldId::Model, "mxbai-embed-large").unwrap();
+        assert_eq!(panel.pending_write().connector, None);
+    }
+
+    #[test]
+    fn changing_an_inherited_connector_pins_it() {
+        let mut loaded = loaded_view();
+        loaded.is_default = true;
+        let mut panel = EmbeddingsPanel::new(context(Some(Capability::Admin), &[]), loaded);
+        panel.edit(FieldId::Connector, "openai").unwrap();
+        assert_eq!(panel.pending_write().connector, Some("openai".to_string()));
+    }
+
+    #[test]
+    fn an_edit_clears_a_failure_that_described_the_old_values() {
+        let mut panel = admin_panel();
+        panel.set_error(SettingsError::from_link_failure("connection closed"));
+        panel.edit(FieldId::Model, "mxbai-embed-large").unwrap();
+        assert_eq!(panel.view().error, None);
     }
 
     #[test]

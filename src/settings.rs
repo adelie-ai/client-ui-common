@@ -35,7 +35,7 @@
 
 pub mod embeddings;
 
-use desktop_assistant_api_model::{Capability, Config, ErrorDetail};
+use desktop_assistant_api_model::{Capability, Config, ErrorCode, ErrorDetail};
 
 /// Which daemon a panel is bound to.
 ///
@@ -152,14 +152,30 @@ pub enum ConfigArea {
 impl ConfigArea {
     /// Read one key from the daemon's restart report.
     pub fn from_key(key: &str) -> ConfigArea {
-        let _ = key;
-        unimplemented!("ConfigArea::from_key")
+        match key {
+            "config_load_failed" => ConfigArea::ConfigLoadFailed,
+            "database" => ConfigArea::Database,
+            "embeddings" => ConfigArea::Embeddings,
+            "ws_auth" => ConfigArea::WsAuth,
+            "tls" => ConfigArea::Tls,
+            "authz" => ConfigArea::Authz,
+            "recall" => ConfigArea::Recall,
+            other => ConfigArea::Other(other.to_string()),
+        }
     }
 
     /// The stable key the daemon uses for this area.
     pub fn as_key(&self) -> &str {
-        let _ = self;
-        unimplemented!("ConfigArea::as_key")
+        match self {
+            ConfigArea::ConfigLoadFailed => "config_load_failed",
+            ConfigArea::Database => "database",
+            ConfigArea::Embeddings => "embeddings",
+            ConfigArea::WsAuth => "ws_auth",
+            ConfigArea::Tls => "tls",
+            ConfigArea::Authz => "authz",
+            ConfigArea::Recall => "recall",
+            ConfigArea::Other(key) => key,
+        }
     }
 }
 
@@ -185,15 +201,31 @@ impl RestartState {
     /// did not load at all, saying "a restart applies your embeddings change"
     /// would be false - the file it came from is not in force.
     pub fn for_panel(panel: PanelId, report: &[String]) -> RestartState {
-        let _ = (panel, report);
-        unimplemented!("RestartState::for_panel")
+        let areas = || report.iter().map(|key| ConfigArea::from_key(key));
+        if areas().any(|area| area == ConfigArea::ConfigLoadFailed) {
+            return RestartState::ConfigNotLoaded;
+        }
+        let own = panel.config_area();
+        if areas().any(|area| area == own) {
+            return RestartState::RestartRequired;
+        }
+        RestartState::InForce
     }
 
     /// Text fit to show the person using the client, or `None` when there is
     /// nothing to say.
     pub fn message(self) -> Option<&'static str> {
-        let _ = self;
-        unimplemented!("RestartState::message")
+        match self {
+            RestartState::InForce => None,
+            RestartState::RestartRequired => {
+                Some("This is configured but not running. Restart the daemon to apply it.")
+            }
+            RestartState::ConfigNotLoaded => Some(
+                "The daemon could not read its config file, so it is running built-in \
+                 defaults. The values here are the file's, not the running ones. Repair the \
+                 file to make them live.",
+            ),
+        }
     }
 }
 
@@ -300,8 +332,24 @@ pub enum ReadOnlyReason {
 impl ReadOnlyReason {
     /// Text fit to show the person using the client.
     pub fn message(&self) -> String {
-        let _ = self;
-        unimplemented!("ReadOnlyReason::message")
+        match self {
+            ReadOnlyReason::Derived => {
+                "The daemon reports this. It is not a setting you can change.".to_string()
+            }
+            ReadOnlyReason::CapabilityRequired { required, held } => match held {
+                Some(held) => format!(
+                    "Changing this needs the {} capability. This connection has {}.",
+                    required.label(),
+                    held.label(),
+                ),
+                None => format!("Changing this needs the {} capability.", required.label()),
+            },
+            ReadOnlyReason::ConfigNotLoaded => {
+                "The daemon could not read its config file and is running built-in defaults. \
+                 Repair the file before you change these settings."
+                    .to_string()
+            }
+        }
     }
 }
 
@@ -328,15 +376,36 @@ impl Editability {
     /// authorization tier and would accept the write, so the panel stays
     /// editable rather than hiding a control that works. An unrecognized
     /// capability grants nothing ([`Capability::permits`] is written out with no
-    /// wildcard arm), so it lands read-only. And a daemon running built-in
-    /// defaults is read-only whatever the caller holds.
+    /// wildcard arm), so it lands read-only.
+    ///
+    /// The third rule is this layer's own policy: a daemon running built-in
+    /// defaults is read-only whatever the caller holds. The values a panel shows
+    /// then come from a config file the running process is not acting on, and
+    /// the daemon's own whole-config write path refuses a write in that state
+    /// rather than replace the file with defaults plus one edit
+    /// (`api_surface::refuse_if_overwrite_would_destroy_the_file`). One policy
+    /// for every panel is what keeps that from becoming per-command archaeology
+    /// in five clients.
     pub fn for_panel(
         panel: PanelId,
         held: Option<&Capability>,
         restart: RestartState,
     ) -> Editability {
-        let _ = (panel, held, restart);
-        unimplemented!("Editability::for_panel")
+        if restart == RestartState::ConfigNotLoaded {
+            return Editability::ReadOnly(ReadOnlyReason::ConfigNotLoaded);
+        }
+        let required = panel.write_capability();
+        match held {
+            // The daemon reported nothing, so it predates the authorization
+            // tier and would take the write. Hiding a control that works would
+            // be the worse error.
+            None => Editability::Editable,
+            Some(held) if held.permits(&required) => Editability::Editable,
+            Some(held) => Editability::ReadOnly(ReadOnlyReason::CapabilityRequired {
+                required,
+                held: Some(held.clone()),
+            }),
+        }
     }
 }
 
@@ -495,6 +564,31 @@ pub enum SettingsErrorKind {
     DaemonNotWritable,
 }
 
+impl SettingsErrorKind {
+    /// Stable identifier for the kind, for a log line or the C ABI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SettingsErrorKind::Transport => "transport",
+            SettingsErrorKind::NotAuthorized => "not_authorized",
+            SettingsErrorKind::Validation => "validation",
+            SettingsErrorKind::Unsupported => "unsupported",
+            SettingsErrorKind::DaemonNotWritable => "daemon_not_writable",
+        }
+    }
+}
+
+impl std::fmt::Display for SettingsError {
+    /// The kind and the message. The kind is what a reader of a log needs
+    /// first, because it says what would have to change for the request to
+    /// succeed. Neither part can carry a credential: the model holds no secret
+    /// value, and the daemon's own message is written not to quote one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind().as_str(), self.message())
+    }
+}
+
+impl std::error::Error for SettingsError {}
+
 impl SettingsError {
     /// Classify a daemon error frame for `panel`.
     ///
@@ -510,16 +604,48 @@ impl SettingsError {
         panel: PanelId,
         held: Option<&Capability>,
     ) -> SettingsError {
-        let _ = (detail, panel, held);
-        unimplemented!("SettingsError::from_daemon")
+        match &detail.code {
+            ErrorCode::NotAuthorized => SettingsError::NotAuthorized {
+                required: panel.write_capability(),
+                held: held.cloned(),
+                message: detail.message.clone(),
+            },
+            ErrorCode::Unsupported => SettingsError::Unsupported {
+                message: detail.message.clone(),
+            },
+            ErrorCode::Other(code) if is_url_policy_code(code) => {
+                match panel.url_field() {
+                    Some(field) => SettingsError::Validation {
+                        errors: vec![FieldError {
+                            field,
+                            kind: ValidationKind::RefusedByDaemon(code.clone()),
+                            message: detail.message.clone(),
+                        }],
+                    },
+                    // The panel has no URL field, so the code cannot be about
+                    // one of its values. Reporting it as a validation error on
+                    // no field would say less than reporting it as it arrived.
+                    None => SettingsError::Transport {
+                        message: detail.message.clone(),
+                        retryable: detail.retryable,
+                    },
+                }
+            }
+            _ => SettingsError::Transport {
+                message: detail.message.clone(),
+                retryable: detail.retryable,
+            },
+        }
     }
 
     /// A failure with no daemon verdict: the link broke, or the daemon predates
     /// the structured error detail. Always a transport failure, and retryable -
     /// nothing was learned about the request itself.
     pub fn from_link_failure(message: impl Into<String>) -> SettingsError {
-        let _ = message.into();
-        unimplemented!("SettingsError::from_link_failure")
+        SettingsError::Transport {
+            message: message.into(),
+            retryable: true,
+        }
     }
 
     /// The discriminant, for a view that branches on the kind.
@@ -534,15 +660,33 @@ impl SettingsError {
     }
 
     /// Whether repeating the identical request could plausibly succeed.
+    ///
+    /// Only a transport failure ever is. A refusal, a rejected value and a
+    /// command the daemon does not implement all answer the same way however
+    /// often they are asked.
     pub fn retryable(&self) -> bool {
-        let _ = self;
-        unimplemented!("SettingsError::retryable")
+        match self {
+            SettingsError::Transport { retryable, .. } => *retryable,
+            SettingsError::NotAuthorized { .. }
+            | SettingsError::Validation { .. }
+            | SettingsError::Unsupported { .. }
+            | SettingsError::DaemonNotWritable { .. } => false,
+        }
     }
 
     /// Text fit to show the person using the client.
     pub fn message(&self) -> String {
-        let _ = self;
-        unimplemented!("SettingsError::message")
+        match self {
+            SettingsError::Transport { message, .. }
+            | SettingsError::NotAuthorized { message, .. }
+            | SettingsError::Unsupported { message }
+            | SettingsError::DaemonNotWritable { message } => message.clone(),
+            SettingsError::Validation { errors } => errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
     }
 }
 
@@ -584,8 +728,8 @@ impl DaemonContext {
 /// panel that compared raw text would call a leading space an unapplied change
 /// and would send a blank as a value instead of a clear.
 pub fn normalize_optional(value: &str) -> Option<String> {
-    let _ = value;
-    unimplemented!("normalize_optional")
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Accept a base URL only when it is an absolute `http`/`https` URL with a host.
@@ -597,14 +741,36 @@ pub fn normalize_optional(value: &str) -> Option<String> {
 /// catches is the typo worth catching before a round trip - a missing scheme,
 /// and a scheme that is not the web.
 pub fn validate_base_url(value: &str) -> Result<(), ValidationKind> {
-    let _ = value;
-    unimplemented!("validate_base_url")
+    let lower = value.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .ok_or(ValidationKind::MalformedUrl)?;
+    // A host has to be there and has to end somewhere: the authority runs up to
+    // the first `/`, `?` or `#`. `https:///v1` and `https://` both leave it
+    // empty.
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(ValidationKind::MalformedUrl);
+    }
+    Ok(())
+}
+
+/// Whether a daemon error code came from its remote-URL policy.
+///
+/// The codes are the policy's own (`mcp-client::url_policy::UrlPolicyError::code`),
+/// which the daemon carries as `ErrorCode::Other` rather than inventing a second
+/// classification. Matching them is what turns "the request failed" into "this
+/// URL is not acceptable, and here is the field it was typed into".
+fn is_url_policy_code(code: &str) -> bool {
+    matches!(
+        code,
+        "url_malformed" | "url_scheme_not_allowed" | "url_insecure_scheme" | "url_target_blocked"
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use desktop_assistant_api_model::ErrorCode;
-
     use super::*;
 
     fn detail(code: ErrorCode, retryable: bool) -> ErrorDetail {
@@ -913,8 +1079,12 @@ mod tests {
                 None,
             ),
             SettingsError::from_link_failure("gone"),
+            SettingsError::DaemonNotWritable {
+                message: "repair the config file".to_string(),
+            },
         ] {
             assert!(!error.message().is_empty());
+            assert!(error.to_string().contains(&error.message()));
         }
     }
 
@@ -985,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn field_keys_are_stable_and_unique() {
+    fn no_two_field_keys_collide() {
         let ids = [
             FieldId::Connector,
             FieldId::Model,
