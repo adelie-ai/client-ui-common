@@ -27,6 +27,10 @@ mod mcp_servers;
 mod message;
 mod reducer;
 mod selected_models;
+// A namespace rather than the flat re-export the modules above use: the settings
+// vocabulary grows one module per panel, and its names (`FieldValue`,
+// `ApplyState`, `PanelId`) belong to settings rather than to the chat reducer.
+pub mod settings;
 
 pub use adele_voice_client_common::AdeleOutput;
 pub use context_usage::{ContextFillLevel, ContextUsageView};
