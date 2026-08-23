@@ -19,6 +19,7 @@ warnings = "deny"
 
 [lints.clippy]
 all = "deny"
+undocumented_unsafe_blocks = "deny"
 
 # Compiled-in ("built-in") MCP servers hosted in-process (da#538), the same
 # mechanism adele-gtk and adele-tui use — but **default-OFF here**. This cdylib

@@ -113,11 +113,15 @@ pub unsafe extern "C" fn adele_core_connect(
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointers are valid NUL-terminated strings
+    // for the duration of this call.
     let mode = match unsafe { cstr_to_string(transport) }.as_str() {
         "ws" => TransportMode::Ws,
         "uds" => TransportMode::Uds,
         _ => TransportMode::Dbus,
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     let address = unsafe { cstr_to_string(address) };
     core.send_intent(Intent::Connect { mode, address });
 }
@@ -132,6 +136,8 @@ pub unsafe extern "C" fn adele_core_send_prompt(core: *mut Core, text: *const c_
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::SendPrompt(unsafe { cstr_to_string(text) }));
 }
 
@@ -191,6 +197,8 @@ pub unsafe extern "C" fn adele_core_select_conversation(
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::SelectConversation(unsafe {
         cstr_to_string(conversation_id)
     }));
@@ -222,6 +230,8 @@ pub unsafe extern "C" fn adele_core_delete_conversation(
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::DeleteConversation(unsafe {
         cstr_to_string(conversation_id)
     }));
@@ -243,6 +253,8 @@ pub unsafe extern "C" fn adele_core_archive_conversation(
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::ArchiveConversation(unsafe {
         cstr_to_string(conversation_id)
     }));
@@ -262,6 +274,8 @@ pub unsafe extern "C" fn adele_core_unarchive_conversation(
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::UnarchiveConversation(unsafe {
         cstr_to_string(conversation_id)
     }));
@@ -282,6 +296,8 @@ pub unsafe extern "C" fn adele_core_set_voice_in(
         return;
     };
     core.send_intent(Intent::SetVoiceIn {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         conversation_id: unsafe { cstr_to_string(conversation_id) },
         enabled,
     });
@@ -303,8 +319,12 @@ pub unsafe extern "C" fn adele_core_set_adele_output(
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointers are valid NUL-terminated strings
+    // for the duration of this call.
     let level = adele_output_from_str(&unsafe { cstr_to_string(level) });
     core.send_intent(Intent::SetAdeleOutput {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         conversation_id: unsafe { cstr_to_string(conversation_id) },
         level,
     });
@@ -328,8 +348,14 @@ pub unsafe extern "C" fn adele_core_select_model(
         return;
     };
     core.send_intent(Intent::SelectModel {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         connection_id: unsafe { cstr_to_string(connection_id) },
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         model_id: unsafe { cstr_to_string(model_id) },
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         effort: unsafe { cstr_to_string(effort) },
     });
 }
@@ -344,6 +370,8 @@ pub unsafe extern "C" fn adele_core_cancel_task(core: *mut Core, task_id: *const
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::CancelTask(unsafe { cstr_to_string(task_id) }));
 }
 
@@ -358,6 +386,8 @@ pub unsafe extern "C" fn adele_core_fetch_task_logs(core: *mut Core, task_id: *c
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::FetchTaskLogs(unsafe { cstr_to_string(task_id) }));
 }
 
@@ -375,6 +405,8 @@ pub unsafe extern "C" fn adele_core_set_ws_jwt(core: *mut Core, jwt: *const c_ch
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::SetWsJwt(unsafe { cstr_to_string(jwt) }));
 }
 
@@ -416,6 +448,8 @@ pub unsafe extern "C" fn adele_core_set_mcp_surface(core: *mut Core, surface: *c
     let Some(core) = (unsafe { core.as_ref() }) else {
         return;
     };
+    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+    // for the duration of this call.
     core.send_intent(Intent::SetMcpSurface(unsafe { cstr_to_string(surface) }));
 }
 
@@ -504,6 +538,8 @@ pub unsafe extern "C" fn adele_core_set_mcp_builtin_disabled(
         return;
     };
     core.send_intent(Intent::SetMcpBuiltinDisabled {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         name: unsafe { cstr_to_string(name) },
         disabled,
     });
@@ -547,6 +583,8 @@ pub unsafe extern "C" fn adele_core_upsert_mcp_client_server(
         return;
     };
     core.send_intent(Intent::WriteMcpClientServer(ClientServerWrite::Upsert {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         server_json: unsafe { cstr_to_string(server_json) },
     }));
 }
@@ -571,6 +609,8 @@ pub unsafe extern "C" fn adele_core_remove_mcp_client_server(core: *mut Core, na
         return;
     };
     core.send_intent(Intent::WriteMcpClientServer(ClientServerWrite::Remove {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         name: unsafe { cstr_to_string(name) },
     }));
 }
@@ -611,6 +651,8 @@ pub unsafe extern "C" fn adele_core_set_mcp_client_server_enabled(
     };
     core.send_intent(Intent::WriteMcpClientServer(
         ClientServerWrite::SetEnabled {
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
             name: unsafe { cstr_to_string(name) },
             enabled,
         },
@@ -637,7 +679,11 @@ pub unsafe extern "C" fn adele_core_send_command(
         return;
     };
     core.send_intent(Intent::SendCommand {
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         request_id: unsafe { cstr_to_string(request_id) },
+        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+        // for the duration of this call.
         command_json: unsafe { cstr_to_string(command_json) },
     });
 }
