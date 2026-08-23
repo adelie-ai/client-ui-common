@@ -69,20 +69,14 @@ pub type ViewCallback =
 
 /// A thread-safe wrapper around the C callback + its `user_data`.
 ///
-/// `user_data` is carried as `usize` (not a raw pointer) so the sink is `Send`;
-/// the `unsafe impl`s assert the contract the C caller must uphold: the callback
-/// is safe to invoke from any thread and `user_data` stays valid until
-/// `adele_core_free`.
+/// `user_data` is carried as `usize` (not a raw pointer) so the sink is `Send`.
+/// The C caller must uphold these requirements: the callback is safe to invoke
+/// from any thread, and `user_data` stays valid until `adele_core_free` is called.
 #[derive(Clone, Copy)]
 pub struct ViewSink {
     callback: ViewCallback,
     user_data: usize,
 }
-
-// SAFETY: the C caller guarantees `callback` is thread-safe and `user_data`
-// outlives the core; we never dereference `user_data` in Rust.
-unsafe impl Send for ViewSink {}
-unsafe impl Sync for ViewSink {}
 
 impl ViewSink {
     pub fn new(callback: ViewCallback, user_data: usize) -> Self {

@@ -23,6 +23,7 @@ warnings = "deny"
 
 [lints.clippy]
 all = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 # The shared client core consumes only wasm-clean TYPES — never a transport.
