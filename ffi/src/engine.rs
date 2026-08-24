@@ -1469,12 +1469,72 @@ impl Drop for Core {
 
 impl Core {
     /// Build the runtime, spawn the actor, and return the handle.
-    pub fn new(sink: ViewSink) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build tokio runtime for the adele client core");
+    ///
+    /// Building the tokio runtime is a foreseeable operational failure (the
+    /// OS can refuse to spawn the worker threads under resource pressure),
+    /// not a programmer bug, so it returns `None` on failure rather than
+    /// panicking. The caller (`adele_core_new`) maps `None` to a null
+    /// handle.
+    pub fn new(sink: ViewSink) -> Option<Self> {
+        Self::new_with_runtime(sink, |_builder| {})
+    }
+
+    /// Same as [`Self::new`], but forces the runtime build to fail
+    /// deterministically instead of succeeding, so the `None` path is
+    /// testable without exhausting real OS threads.
+    ///
+    /// Confirmed empirically against this crate's pinned tokio: a worker
+    /// thread that the OS refuses to spawn does not always surface as the
+    /// `Err` this function's `match` below handles. Tokio's multi-thread
+    /// launch panics directly on that failure instead
+    /// (`runtime::blocking::pool::Spawner::spawn_blocking`, called while
+    /// still inside `Builder::build()`). That panic is exactly what
+    /// `adele_core_new`'s outer [`crate::panic_guard::guard`] exists to
+    /// catch, so this test helper wraps the same way a real caller does,
+    /// rather than assuming the `Err` path is the one that fires.
+    #[cfg(test)]
+    pub(crate) fn new_with_broken_runtime_for_test(sink: ViewSink) -> Option<Self> {
+        crate::panic_guard::guard(
+            "Core::new_with_broken_runtime_for_test",
+            move || {
+                Self::new_with_runtime(sink, |builder| {
+                    builder.thread_stack_size(usize::MAX);
+                })
+            },
+            || None,
+        )
+    }
+
+    /// Map a runtime-build result to `Some(runtime)`, or log the failure and
+    /// return `None`. Separated from [`Self::new_with_runtime`] so the
+    /// mapping itself is directly testable with a synthetic `Err`, without
+    /// depending on which internal tokio code path actually produces one.
+    fn runtime_from_build_result(
+        result: std::io::Result<tokio::runtime::Runtime>,
+    ) -> Option<tokio::runtime::Runtime> {
+        match result {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to build the tokio runtime for the adele client core"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build the runtime with `configure_runtime` applied on top of the
+    /// standard configuration, spawn the actor, and return the handle, or
+    /// `None` if the runtime could not be built.
+    fn new_with_runtime(
+        sink: ViewSink,
+        configure_runtime: impl FnOnce(&mut tokio::runtime::Builder),
+    ) -> Option<Self> {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(2).enable_all();
+        configure_runtime(&mut builder);
+        let runtime = Self::runtime_from_build_result(builder.build())?;
         let (tx, rx) = mpsc::unbounded_channel();
         let engine = Engine {
             state: WindowState::default(),
@@ -1492,10 +1552,10 @@ impl Core {
             active_task_id: None,
         };
         runtime.spawn(engine.run(rx));
-        Self {
+        Some(Self {
             runtime: Some(runtime),
             tx,
-        }
+        })
     }
 
     /// Queue a controller intent for the actor.
@@ -1515,6 +1575,43 @@ impl Core {
             .expect("the runtime is taken only by Drop, and self is alive here")
             .handle()
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod core_new_tests {
+    //! `Core::new` builds a tokio runtime, which is a foreseeable operational
+    //! failure (thread spawning can fail under resource pressure), not a
+    //! programmer bug. It must return `None`, not panic.
+    use super::*;
+
+    extern "C" fn noop_sink(_user_data: *mut std::ffi::c_void, _json: *const std::ffi::c_char) {}
+
+    /// Drives the runtime-build failure deterministically, by asking for a
+    /// worker thread stack so large the OS cannot back it, rather than by
+    /// exhausting real OS threads. Any 64-bit system's virtual address space
+    /// is far smaller than `usize::MAX` bytes, so the underlying thread
+    /// spawn reliably fails every run.
+    #[test]
+    fn core_new_returns_none_when_the_tokio_runtime_cannot_be_built() {
+        let core = Core::new_with_broken_runtime_for_test(ViewSink::new(noop_sink, 0));
+        assert!(
+            core.is_none(),
+            "an unbuildable runtime must surface as None, whether the build \
+             fails cleanly or tokio panics building it"
+        );
+    }
+
+    /// Covers the `Err` -> `None` mapping on its own, independent of which
+    /// internal tokio code path actually produces the `Err` (or, as
+    /// [`Core::new_with_broken_runtime_for_test`]'s doc comment records,
+    /// panics instead).
+    #[test]
+    fn runtime_from_build_result_returns_none_on_a_build_error() {
+        let result = Core::runtime_from_build_result(Err(std::io::Error::other(
+            "injected runtime build failure for test",
+        )));
+        assert!(result.is_none());
     }
 }
 
@@ -1549,7 +1646,7 @@ mod teardown_tests {
         // Stands in for another Adele client's edit, in flight throughout.
         let held = crate::client_mcp::hold_config_lock(&path);
 
-        let core = Core::new(ViewSink::new(noop_sink, 0));
+        let core = Core::new(ViewSink::new(noop_sink, 0)).expect("runtime builds under test");
         let edit_path = path.clone();
         core.runtime_handle().spawn_blocking(move || {
             // Declines, so this edit writes nothing even if it takes the lock

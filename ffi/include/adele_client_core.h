@@ -32,8 +32,9 @@ extern "C" {
 /*
  Create a core instance. `callback` receives view-event JSON strings;
  `user_data` is passed back to it verbatim (carry your C++ `this` here).
- Returns an opaque handle, or null if `callback` is null. Free it with
- [`adele_core_free`].
+ Returns an opaque handle, or null if `callback` is null, if the runtime
+ could not be constructed, or if a caught panic swallowed the attempt.
+ Free the handle with [`adele_core_free`].
 
  The callback type is spelled inline (rather than via the `ViewCallback`
  alias) so cbindgen emits a real nullable C function pointer rather than an
@@ -43,6 +44,8 @@ Core *adele_core_new(void (*callback)(void *user_data, const char *json), void *
 
 /*
  Destroy a core instance, shutting down its runtime and connection.
+
+ A caught panic returns having freed nothing, the same as a null `core`.
 
  # Safety
  `core` must be a handle returned by [`adele_core_new`] (or null), and must
@@ -55,6 +58,8 @@ void adele_core_free(Core *core);
  unrecognised), `"uds"`, or `"ws"`; `address` is the UDS socket path or WS url
  (empty for the default), ignored for D-Bus.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`]; `transport`/`address`
  must be null or valid NUL-terminated C strings.
@@ -63,6 +68,8 @@ void adele_core_connect(Core *core, const char *transport, const char *address);
 
 /*
  Send a prompt into the open conversation.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `text` must be null or a valid C string.
@@ -74,6 +81,8 @@ void adele_core_send_prompt(Core *core, const char *text);
  recall / a chip's edit affordance). The text loads via a `composer_text` view
  event; re-submitting reinserts it in place. An out-of-range index is ignored.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`].
  */
@@ -82,6 +91,8 @@ void adele_core_edit_queued(Core *core, uintptr_t index);
 /*
  Remove queued message `index` (a chip's x) without sending it. An
  out-of-range index is ignored.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle from [`adele_core_new`].
@@ -92,6 +103,8 @@ void adele_core_remove_queued(Core *core, uintptr_t index);
  Abandon an in-progress queued-message edit: the checked-out message returns
  to the queue unchanged and the composer clears. A no-op when not editing.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`].
  */
@@ -99,6 +112,8 @@ void adele_core_cancel_queued_edit(Core *core);
 
 /*
  Open (load) a conversation by id.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -108,6 +123,8 @@ void adele_core_select_conversation(Core *core, const char *conversation_id);
 /*
  Create a new conversation and open it.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`].
  */
@@ -115,6 +132,8 @@ void adele_core_new_conversation(Core *core);
 
 /*
  Delete a conversation by id.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -127,6 +146,8 @@ void adele_core_delete_conversation(Core *core, const char *conversation_id);
  view event with no further call from the client. Each row carries `archived`,
  so a client groups or hides them as it sees fit.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle; `conversation_id` must be null or a valid C string.
  */
@@ -136,6 +157,8 @@ void adele_core_archive_conversation(Core *core, const char *conversation_id);
  Bring an archived conversation back out. Refreshes the list exactly as
  [`adele_core_archive_conversation`] does.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle; `conversation_id` must be null or a valid C string.
  */
@@ -143,6 +166,8 @@ void adele_core_unarchive_conversation(Core *core, const char *conversation_id);
 
 /*
  Set the `You:` (voice input) state for a conversation.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -152,6 +177,8 @@ void adele_core_set_voice_in(Core *core, const char *conversation_id, bool enabl
 /*
  Set the `Adele:` (voice output) level for a conversation. `level` is
  `"disabled"`, `"on_demand"`, or `"always"` (anything else ⇒ `"disabled"`).
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `conversation_id`/`level` must be null or valid
@@ -164,6 +191,8 @@ void adele_core_set_adele_output(Core *core, const char *conversation_id, const 
  `connection_id`/`model_id` clears it (inherit the default); `effort` is
  `"low"`/`"medium"`/`"high"` or empty (no effort hint).
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle; the string args must be null or valid C strings.
  */
@@ -175,6 +204,8 @@ void adele_core_select_model(Core *core,
 /*
  Request cancellation of a background task by id.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle; `task_id` must be null or a valid C string.
  */
@@ -183,6 +214,8 @@ void adele_core_cancel_task(Core *core, const char *task_id);
 /*
  Fetch a background task's log page; the result arrives later as a `task_logs`
  view event.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `task_id` must be null or a valid C string.
@@ -195,6 +228,8 @@ void adele_core_fetch_task_logs(Core *core, const char *task_id);
  D-Bus / `/login` token minting — the path a client with no local token minter
  (e.g. macOS, which has no D-Bus bridge) uses after obtaining a token
  out-of-band from the daemon's `/login`. Ignored for non-WS transports.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `jwt` must be null or a valid C string.
@@ -209,6 +244,8 @@ void adele_core_set_ws_jwt(Core *core, const char *jwt);
  core and applied when the next connect builds its `ConnectionConfig`, so a
  change takes effect on the following (re)connect. This backs the KDE KCM
  "Share device info with the assistant" checkbox.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle from [`adele_core_new`].
@@ -225,6 +262,8 @@ void adele_core_set_share_client_context(Core *core, bool enabled);
  starts the client MCP host, so a later change applies on the next
  (re)connect. A NULL or empty name is ignored and the core keeps its default
  surface (`kde`), which is what adele-kde relies on by never calling this.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle from [`adele_core_new`]; `surface` must be NULL
@@ -245,6 +284,8 @@ void adele_core_set_mcp_surface(Core *core, const char *surface);
  says, so a settings panel can call this before the first connect. A core built
  with no `mcp-*` feature — adele-kde's — answers with an empty list, which is
  the honest "none linked in" rather than a missing reply.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle from [`adele_core_new`].
@@ -274,6 +315,8 @@ void adele_core_request_mcp_builtins(Core *core);
  it. A machine that defines no external servers answers with an empty list —
  the honest "none configured".
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`].
  */
@@ -293,6 +336,8 @@ void adele_core_request_mcp_client_servers(Core *core);
  at start. An `mcp_builtins` view event follows either way (including on
  failure, which also emits a `toast`), carrying the pending state so the panel
  stays honest in the meantime. A NULL or empty `name` is refused.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
@@ -326,6 +371,8 @@ void adele_core_set_mcp_builtin_disabled(Core *core, const char *name, bool disa
  failure, which also emits a `toast`), carrying the state on disk so the panel
  never keeps an edit that did not land.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`]; `server_json` must be
  NULL or a valid NUL-terminated UTF-8 string, borrowed for the call.
@@ -342,6 +389,8 @@ void adele_core_upsert_mcp_client_server(Core *core, const char *server_json);
  Removing a name that is not defined is refused (and toasted) rather than
  silently accepted. The event and timing contract is
  [`adele_core_upsert_mcp_client_server`]'s.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
@@ -371,6 +420,8 @@ void adele_core_remove_mcp_client_server(Core *core, const char *name);
 
  The event and timing contract is [`adele_core_upsert_mcp_client_server`]'s.
 
+ A caught panic returns having sent nothing, the same as a null `core`.
+
  # Safety
  `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
  valid NUL-terminated UTF-8 string, borrowed for the call.
@@ -383,6 +434,8 @@ void adele_core_set_mcp_client_server_enabled(Core *core, const char *name, bool
  `command_result` view event carrying the same `request_id`, so the caller can
  correlate the reply. This is the generic settings/management channel
  (connections, purposes, knowledge base) beyond the typed chat intents.
+
+ A caught panic returns having sent nothing, the same as a null `core`.
 
  # Safety
  `core` must be a live handle; `request_id`/`command_json` must be null or
@@ -400,6 +453,12 @@ void adele_core_send_command(Core *core, const char *request_id, const char *com
  `ADELE_CORE_ABI_VERSION` from the header you compiled against. Rebuild
  your consumer against the current header on any mismatch, including a
  lower runtime value; do not attempt partial compatibility.
+
+ This cannot panic today; it reads one constant. It still runs behind the
+ panic guard, because every entry point does. A caught panic returns `0`,
+ which is not a version this crate ever assigns -- see
+ [`ADELE_CORE_ABI_VERSION`] -- so a consumer reads `0` as "no usable
+ version" rather than mistaking it for a real one.
  */
 uint32_t adele_core_abi_version(void);
 
@@ -416,7 +475,8 @@ uint32_t adele_core_abi_version(void);
  statement with the escaping already done.
 
  Returns a caller-owned string to release with [`adele_core_string_free`];
- null input renders as the empty string. Never returns null.
+ null input renders as the empty string. Never returns null: a caught panic
+ returns the cached rendering of empty input instead.
 
  # Safety
  `text` must be null or point to a valid NUL-terminated C string that stays
@@ -434,7 +494,8 @@ char *adele_core_render_markdown(const char *text);
  which keeps the pinned script hash — and therefore the page — unchanged.
 
  Returns a caller-owned string to release with [`adele_core_string_free`];
- null input renders an empty bubble. Never returns null.
+ null input renders an empty bubble. Never returns null: a caught panic
+ returns the cached rendering of an empty bubble instead.
 
  # Safety
  `text` must be null or point to a valid NUL-terminated C string that stays
@@ -447,7 +508,8 @@ char *adele_core_render_markdown_document(const char *text);
  to. The host must register a handler under exactly this name; an embedded
  engine does not self-size inside a native stack view.
 
- Returns a `'static` pointer — do not free it.
+ Returns a `'static` pointer -- do not free it. A caught panic returns the
+ same `'static` pointer the success path would have produced.
  */
 const char *adele_core_markdown_height_handler_name(void);
 
@@ -466,7 +528,8 @@ const char *adele_core_markdown_height_handler_name(void);
  it.
 
  Returns a caller-owned string to release with [`adele_core_string_free`];
- null input yields the statement that clears the bubble. Never returns null.
+ null input yields the statement that clears the bubble. Never returns null:
+ a caught panic returns that same clearing statement instead.
 
  # Safety
  `text` must be null or point to a valid NUL-terminated C string that stays
@@ -483,7 +546,8 @@ char *adele_core_markdown_set_content_script(const char *text);
  [`adele_core_markdown_set_content_script`], which returns the whole call
  already escaped.
 
- Returns a `'static` pointer — do not free it.
+ Returns a `'static` pointer -- do not free it. A caught panic returns the
+ same `'static` pointer the success path would have produced.
  */
 const char *adele_core_markdown_set_content_function(void);
 
@@ -491,6 +555,8 @@ const char *adele_core_markdown_set_content_function(void);
  Free a string returned by [`adele_core_render_markdown`],
  [`adele_core_render_markdown_document`] or
  [`adele_core_markdown_set_content_script`]. Null is a no-op.
+
+ A caught panic returns having freed nothing, the same as a null `text`.
 
  # Safety
  `text` must be null, or a pointer returned by one of those three functions

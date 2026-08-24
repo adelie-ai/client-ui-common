@@ -120,3 +120,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 # The client-MCP-host wiring tests spin up a `/bin/sh` fake MCP server from a
 # temp dir (mirroring the `mcp_host` unit tests).
 tempfile = "3"
+# The panic_guard spec captures the tracing output guard() emits, to check a
+# caught panic is logged with its payload and location. A hand-rolled
+# Subscriber would duplicate what this crate already tests; it also sits in
+# the dependency tree already (pulled in by other workspace members), so this
+# adds no new crate to the build.
+tracing-subscriber = "0.3"
