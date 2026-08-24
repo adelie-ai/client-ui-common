@@ -572,6 +572,7 @@ dependencies = [
  "terminal-mcp",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "weather-forecast-mcp",
  "web-mcp",

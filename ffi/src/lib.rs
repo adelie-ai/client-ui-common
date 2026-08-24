@@ -1,14 +1,20 @@
 //! `libadele_client_core` — the native C ABI for C/C++ Adelie clients.
 //!
-//! A thin, panic-free C surface over the shared **`client-ui-common`** reducer
-//! (the same `WindowState` state machine gtk/tui run) plus a **`client-common`
+//! A thin C surface over the shared **`client-ui-common`** reducer (the same
+//! `WindowState` state machine gtk/tui run) plus a **`client-common`
 //! `Connector`** — by default in **D-Bus mode** (the `org.desktopAssistant`
 //! bridge), the canonical KDE transport. The model + controller + transport all
 //! live here in safe Rust; the C++/QML side is glue only.
 //!
+//! Every `extern "C"` entry point in this crate runs its body behind this
+//! crate's internal `panic_guard::guard` helper, so a Rust panic never
+//! unwinds into the caller. A caught panic is logged (payload and source
+//! location) and the call returns the documented neutral value instead --
+//! see each function's doc comment for what that value is.
+//!
 //! # Shape of the ABI
 //!
-//! - [`adele_core_new`] takes a [`ViewCallback`] + `user_data` and returns an
+//! - [`adele_core_new`] takes a `ViewCallback` + `user_data` and returns an
 //!   opaque `AdeleCore *`. The callback is invoked (on a worker thread) with a
 //!   JSON `ViewEvent` string for every view update — see `view_event.rs` for the
 //!   `{"type": ...}` schema. The C++ side marshals each onto its UI thread.
@@ -27,7 +33,10 @@ mod builtins;
 mod client_mcp;
 mod conversations;
 mod engine;
+#[cfg(test)]
+mod entry_point_coverage;
 mod markdown;
+mod panic_guard;
 mod view_event;
 
 // The markdown surface is `no_mangle`, so the cdylib exports it either way;
@@ -64,8 +73,9 @@ pub(crate) unsafe fn cstr_to_string(ptr: *const c_char) -> String {
 
 /// Create a core instance. `callback` receives view-event JSON strings;
 /// `user_data` is passed back to it verbatim (carry your C++ `this` here).
-/// Returns an opaque handle, or null if `callback` is null. Free it with
-/// [`adele_core_free`].
+/// Returns an opaque handle, or null if `callback` is null, if the runtime
+/// could not be constructed, or if a caught panic swallowed the attempt.
+/// Free the handle with [`adele_core_free`].
 ///
 /// The callback type is spelled inline (rather than via the `ViewCallback`
 /// alias) so cbindgen emits a real nullable C function pointer rather than an
@@ -75,30 +85,49 @@ pub extern "C" fn adele_core_new(
     callback: Option<extern "C" fn(user_data: *mut c_void, json: *const c_char)>,
     user_data: *mut c_void,
 ) -> *mut Core {
-    let Some(callback) = callback else {
-        return std::ptr::null_mut();
-    };
-    let sink = ViewSink::new(callback, user_data as usize);
-    Box::into_raw(Box::new(Core::new(sink)))
+    panic_guard::guard(
+        "adele_core_new",
+        move || {
+            let Some(callback) = callback else {
+                return std::ptr::null_mut();
+            };
+            let sink = ViewSink::new(callback, user_data as usize);
+            match Core::new(sink) {
+                Some(core) => Box::into_raw(Box::new(core)),
+                None => std::ptr::null_mut(),
+            }
+        },
+        std::ptr::null_mut,
+    )
 }
 
 /// Destroy a core instance, shutting down its runtime and connection.
+///
+/// A caught panic returns having freed nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a handle returned by [`adele_core_new`] (or null), and must
 /// not be used after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_free(core: *mut Core) {
-    if core.is_null() {
-        return;
-    }
-    // SAFETY: `core` came from `Box::into_raw` in `adele_core_new`.
-    drop(unsafe { Box::from_raw(core) });
+    panic_guard::guard(
+        "adele_core_free",
+        move || {
+            if core.is_null() {
+                return;
+            }
+            // SAFETY: `core` came from `Box::into_raw` in `adele_core_new`.
+            drop(unsafe { Box::from_raw(core) });
+        },
+        || (),
+    );
 }
 
 /// Connect to the daemon. `transport` is `"dbus"` (default for anything
 /// unrecognised), `"uds"`, or `"ws"`; `address` is the UDS socket path or WS url
 /// (empty for the default), ignored for D-Bus.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`]; `transport`/`address`
@@ -109,82 +138,122 @@ pub unsafe extern "C" fn adele_core_connect(
     transport: *const c_char,
     address: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointers are valid NUL-terminated strings
-    // for the duration of this call.
-    let mode = match unsafe { cstr_to_string(transport) }.as_str() {
-        "ws" => TransportMode::Ws,
-        "uds" => TransportMode::Uds,
-        _ => TransportMode::Dbus,
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    let address = unsafe { cstr_to_string(address) };
-    core.send_intent(Intent::Connect { mode, address });
+    panic_guard::guard(
+        "adele_core_connect",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointers are valid NUL-terminated strings
+            // for the duration of this call.
+            let mode = match unsafe { cstr_to_string(transport) }.as_str() {
+                "ws" => TransportMode::Ws,
+                "uds" => TransportMode::Uds,
+                _ => TransportMode::Dbus,
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            let address = unsafe { cstr_to_string(address) };
+            core.send_intent(Intent::Connect { mode, address });
+        },
+        || (),
+    );
 }
 
 /// Send a prompt into the open conversation.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `text` must be null or a valid C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_send_prompt(core: *mut Core, text: *const c_char) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::SendPrompt(unsafe { cstr_to_string(text) }));
+    panic_guard::guard(
+        "adele_core_send_prompt",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::SendPrompt(unsafe { cstr_to_string(text) }));
+        },
+        || (),
+    );
 }
 
 /// Check out queued message `index` into the composer to edit it (up-arrow
 /// recall / a chip's edit affordance). The text loads via a `composer_text` view
 /// event; re-submitting reinserts it in place. An out-of-range index is ignored.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_edit_queued(core: *mut Core, index: usize) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::EditQueued(index));
+    panic_guard::guard(
+        "adele_core_edit_queued",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::EditQueued(index));
+        },
+        || (),
+    );
 }
 
 /// Remove queued message `index` (a chip's x) without sending it. An
 /// out-of-range index is ignored.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_remove_queued(core: *mut Core, index: usize) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::RemoveQueued(index));
+    panic_guard::guard(
+        "adele_core_remove_queued",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::RemoveQueued(index));
+        },
+        || (),
+    );
 }
 
 /// Abandon an in-progress queued-message edit: the checked-out message returns
 /// to the queue unchanged and the composer clears. A no-op when not editing.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_cancel_queued_edit(core: *mut Core) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::CancelQueuedEdit);
+    panic_guard::guard(
+        "adele_core_cancel_queued_edit",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::CancelQueuedEdit);
+        },
+        || (),
+    );
 }
 
 /// Open (load) a conversation by id.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -193,31 +262,47 @@ pub unsafe extern "C" fn adele_core_select_conversation(
     core: *mut Core,
     conversation_id: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::SelectConversation(unsafe {
-        cstr_to_string(conversation_id)
-    }));
+    panic_guard::guard(
+        "adele_core_select_conversation",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::SelectConversation(unsafe {
+                cstr_to_string(conversation_id)
+            }));
+        },
+        || (),
+    );
 }
 
 /// Create a new conversation and open it.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_new_conversation(core: *mut Core) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::NewConversation);
+    panic_guard::guard(
+        "adele_core_new_conversation",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::NewConversation);
+        },
+        || (),
+    );
 }
 
 /// Delete a conversation by id.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -226,21 +311,29 @@ pub unsafe extern "C" fn adele_core_delete_conversation(
     core: *mut Core,
     conversation_id: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::DeleteConversation(unsafe {
-        cstr_to_string(conversation_id)
-    }));
+    panic_guard::guard(
+        "adele_core_delete_conversation",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::DeleteConversation(unsafe {
+                cstr_to_string(conversation_id)
+            }));
+        },
+        || (),
+    );
 }
 
 /// Put a conversation away. The core performs the change and then re-reads the
 /// conversation list, so the refreshed inventory arrives as a `conversations`
 /// view event with no further call from the client. Each row carries `archived`,
 /// so a client groups or hides them as it sees fit.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -249,19 +342,27 @@ pub unsafe extern "C" fn adele_core_archive_conversation(
     core: *mut Core,
     conversation_id: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::ArchiveConversation(unsafe {
-        cstr_to_string(conversation_id)
-    }));
+    panic_guard::guard(
+        "adele_core_archive_conversation",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::ArchiveConversation(unsafe {
+                cstr_to_string(conversation_id)
+            }));
+        },
+        || (),
+    );
 }
 
 /// Bring an archived conversation back out. Refreshes the list exactly as
 /// [`adele_core_archive_conversation`] does.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -270,18 +371,26 @@ pub unsafe extern "C" fn adele_core_unarchive_conversation(
     core: *mut Core,
     conversation_id: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::UnarchiveConversation(unsafe {
-        cstr_to_string(conversation_id)
-    }));
+    panic_guard::guard(
+        "adele_core_unarchive_conversation",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::UnarchiveConversation(unsafe {
+                cstr_to_string(conversation_id)
+            }));
+        },
+        || (),
+    );
 }
 
 /// Set the `You:` (voice input) state for a conversation.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `conversation_id` must be null or a valid C string.
@@ -291,20 +400,28 @@ pub unsafe extern "C" fn adele_core_set_voice_in(
     conversation_id: *const c_char,
     enabled: bool,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::SetVoiceIn {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        conversation_id: unsafe { cstr_to_string(conversation_id) },
-        enabled,
-    });
+    panic_guard::guard(
+        "adele_core_set_voice_in",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::SetVoiceIn {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                conversation_id: unsafe { cstr_to_string(conversation_id) },
+                enabled,
+            });
+        },
+        || (),
+    );
 }
 
 /// Set the `Adele:` (voice output) level for a conversation. `level` is
 /// `"disabled"`, `"on_demand"`, or `"always"` (anything else ⇒ `"disabled"`).
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `conversation_id`/`level` must be null or valid
@@ -315,24 +432,32 @@ pub unsafe extern "C" fn adele_core_set_adele_output(
     conversation_id: *const c_char,
     level: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointers are valid NUL-terminated strings
-    // for the duration of this call.
-    let level = adele_output_from_str(&unsafe { cstr_to_string(level) });
-    core.send_intent(Intent::SetAdeleOutput {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        conversation_id: unsafe { cstr_to_string(conversation_id) },
-        level,
-    });
+    panic_guard::guard(
+        "adele_core_set_adele_output",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointers are valid NUL-terminated strings
+            // for the duration of this call.
+            let level = adele_output_from_str(&unsafe { cstr_to_string(level) });
+            core.send_intent(Intent::SetAdeleOutput {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                conversation_id: unsafe { cstr_to_string(conversation_id) },
+                level,
+            });
+        },
+        || (),
+    );
 }
 
 /// Stage (or clear) a per-message model override for the next send. Empty
 /// `connection_id`/`model_id` clears it (inherit the default); `effort` is
 /// `"low"`/`"medium"`/`"high"` or empty (no effort hint).
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; the string args must be null or valid C strings.
@@ -343,52 +468,74 @@ pub unsafe extern "C" fn adele_core_select_model(
     model_id: *const c_char,
     effort: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::SelectModel {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        connection_id: unsafe { cstr_to_string(connection_id) },
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        model_id: unsafe { cstr_to_string(model_id) },
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        effort: unsafe { cstr_to_string(effort) },
-    });
+    panic_guard::guard(
+        "adele_core_select_model",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::SelectModel {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                connection_id: unsafe { cstr_to_string(connection_id) },
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                model_id: unsafe { cstr_to_string(model_id) },
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                effort: unsafe { cstr_to_string(effort) },
+            });
+        },
+        || (),
+    );
 }
 
 /// Request cancellation of a background task by id.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `task_id` must be null or a valid C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_cancel_task(core: *mut Core, task_id: *const c_char) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::CancelTask(unsafe { cstr_to_string(task_id) }));
+    panic_guard::guard(
+        "adele_core_cancel_task",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::CancelTask(unsafe { cstr_to_string(task_id) }));
+        },
+        || (),
+    );
 }
 
 /// Fetch a background task's log page; the result arrives later as a `task_logs`
 /// view event.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle; `task_id` must be null or a valid C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_fetch_task_logs(core: *mut Core, task_id: *const c_char) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::FetchTaskLogs(unsafe { cstr_to_string(task_id) }));
+    panic_guard::guard(
+        "adele_core_fetch_task_logs",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::FetchTaskLogs(unsafe { cstr_to_string(task_id) }));
+        },
+        || (),
+    );
 }
 
 /// Stage an explicit WebSocket bearer token for the next [`adele_core_connect`]
@@ -397,17 +544,25 @@ pub unsafe extern "C" fn adele_core_fetch_task_logs(core: *mut Core, task_id: *c
 /// (e.g. macOS, which has no D-Bus bridge) uses after obtaining a token
 /// out-of-band from the daemon's `/login`. Ignored for non-WS transports.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle; `jwt` must be null or a valid C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_set_ws_jwt(core: *mut Core, jwt: *const c_char) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::SetWsJwt(unsafe { cstr_to_string(jwt) }));
+    panic_guard::guard(
+        "adele_core_set_ws_jwt",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::SetWsJwt(unsafe { cstr_to_string(jwt) }));
+        },
+        || (),
+    );
 }
 
 /// Set whether basic device context (name, username, home dir, hostname,
@@ -418,15 +573,23 @@ pub unsafe extern "C" fn adele_core_set_ws_jwt(core: *mut Core, jwt: *const c_ch
 /// change takes effect on the following (re)connect. This backs the KDE KCM
 /// "Share device info with the assistant" checkbox.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_set_share_client_context(core: *mut Core, enabled: bool) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::SetShareClientContext(enabled));
+    panic_guard::guard(
+        "adele_core_set_share_client_context",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::SetShareClientContext(enabled));
+        },
+        || (),
+    );
 }
 
 /// Declare which `client-mcp.toml` surface this client resolves its MCP servers
@@ -439,18 +602,26 @@ pub unsafe extern "C" fn adele_core_set_share_client_context(core: *mut Core, en
 /// (re)connect. A NULL or empty name is ignored and the core keeps its default
 /// surface (`kde`), which is what adele-kde relies on by never calling this.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`]; `surface` must be NULL
 /// or a valid NUL-terminated UTF-8 string, borrowed for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_set_mcp_surface(core: *mut Core, surface: *const c_char) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-    // for the duration of this call.
-    core.send_intent(Intent::SetMcpSurface(unsafe { cstr_to_string(surface) }));
+    panic_guard::guard(
+        "adele_core_set_mcp_surface",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+            // for the duration of this call.
+            core.send_intent(Intent::SetMcpSurface(unsafe { cstr_to_string(surface) }));
+        },
+        || (),
+    );
 }
 
 /// Ask for this client's compiled-in ("built-in") MCP servers and their status
@@ -466,15 +637,23 @@ pub unsafe extern "C" fn adele_core_set_mcp_surface(core: *mut Core, surface: *c
 /// with no `mcp-*` feature — adele-kde's — answers with an empty list, which is
 /// the honest "none linked in" rather than a missing reply.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_request_mcp_builtins(core: *mut Core) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::RequestMcpBuiltins);
+    panic_guard::guard(
+        "adele_core_request_mcp_builtins",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::RequestMcpBuiltins);
+        },
+        || (),
+    );
 }
 
 /// Ask for this client's external client-run MCP servers — the `client-mcp.toml`
@@ -499,15 +678,23 @@ pub unsafe extern "C" fn adele_core_request_mcp_builtins(core: *mut Core) {
 /// it. A machine that defines no external servers answers with an empty list —
 /// the honest "none configured".
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_request_mcp_client_servers(core: *mut Core) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::RequestMcpClientServers);
+    panic_guard::guard(
+        "adele_core_request_mcp_client_servers",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::RequestMcpClientServers);
+        },
+        || (),
+    );
 }
 
 /// Turn one built-in MCP server off (`disabled = true`) or back on for **this
@@ -524,6 +711,8 @@ pub unsafe extern "C" fn adele_core_request_mcp_client_servers(core: *mut Core) 
 /// failure, which also emits a `toast`), carrying the pending state so the panel
 /// stays honest in the meantime. A NULL or empty `name` is refused.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
 /// valid NUL-terminated UTF-8 string, borrowed for the call.
@@ -533,16 +722,22 @@ pub unsafe extern "C" fn adele_core_set_mcp_builtin_disabled(
     name: *const c_char,
     disabled: bool,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::SetMcpBuiltinDisabled {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        name: unsafe { cstr_to_string(name) },
-        disabled,
-    });
+    panic_guard::guard(
+        "adele_core_set_mcp_builtin_disabled",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::SetMcpBuiltinDisabled {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                name: unsafe { cstr_to_string(name) },
+                disabled,
+            });
+        },
+        || (),
+    );
 }
 
 /// Add one **external client-run** MCP server to the shared `client-mcp.toml`,
@@ -570,6 +765,8 @@ pub unsafe extern "C" fn adele_core_set_mcp_builtin_disabled(
 /// failure, which also emits a `toast`), carrying the state on disk so the panel
 /// never keeps an edit that did not land.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`]; `server_json` must be
 /// NULL or a valid NUL-terminated UTF-8 string, borrowed for the call.
@@ -578,15 +775,21 @@ pub unsafe extern "C" fn adele_core_upsert_mcp_client_server(
     core: *mut Core,
     server_json: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::WriteMcpClientServer(ClientServerWrite::Upsert {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        server_json: unsafe { cstr_to_string(server_json) },
-    }));
+    panic_guard::guard(
+        "adele_core_upsert_mcp_client_server",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::WriteMcpClientServer(ClientServerWrite::Upsert {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                server_json: unsafe { cstr_to_string(server_json) },
+            }));
+        },
+        || (),
+    );
 }
 
 /// Delete one external client-run MCP server from the shared `client-mcp.toml`.
@@ -599,20 +802,28 @@ pub unsafe extern "C" fn adele_core_upsert_mcp_client_server(
 /// silently accepted. The event and timing contract is
 /// [`adele_core_upsert_mcp_client_server`]'s.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
 /// valid NUL-terminated UTF-8 string, borrowed for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn adele_core_remove_mcp_client_server(core: *mut Core, name: *const c_char) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::WriteMcpClientServer(ClientServerWrite::Remove {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        name: unsafe { cstr_to_string(name) },
-    }));
+    panic_guard::guard(
+        "adele_core_remove_mcp_client_server",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::WriteMcpClientServer(ClientServerWrite::Remove {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                name: unsafe { cstr_to_string(name) },
+            }));
+        },
+        || (),
+    );
 }
 
 /// Turn one external client-run MCP server on or off **for this client's
@@ -636,6 +847,8 @@ pub unsafe extern "C" fn adele_core_remove_mcp_client_server(core: *mut Core, na
 ///
 /// The event and timing contract is [`adele_core_upsert_mcp_client_server`]'s.
 ///
+/// A caught panic returns having sent nothing, the same as a null `core`.
+///
 /// # Safety
 /// `core` must be a live handle from [`adele_core_new`]; `name` must be NULL or a
 /// valid NUL-terminated UTF-8 string, borrowed for the call.
@@ -645,18 +858,24 @@ pub unsafe extern "C" fn adele_core_set_mcp_client_server_enabled(
     name: *const c_char,
     enabled: bool,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::WriteMcpClientServer(
-        ClientServerWrite::SetEnabled {
-            // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-            // for the duration of this call.
-            name: unsafe { cstr_to_string(name) },
-            enabled,
+    panic_guard::guard(
+        "adele_core_set_mcp_client_server_enabled",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::WriteMcpClientServer(
+                ClientServerWrite::SetEnabled {
+                    // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                    // for the duration of this call.
+                    name: unsafe { cstr_to_string(name) },
+                    enabled,
+                },
+            ));
         },
-    ));
+        || (),
+    );
 }
 
 /// Send an arbitrary management command (an `api::Command` serialized as JSON)
@@ -664,6 +883,8 @@ pub unsafe extern "C" fn adele_core_set_mcp_client_server_enabled(
 /// `command_result` view event carrying the same `request_id`, so the caller can
 /// correlate the reply. This is the generic settings/management channel
 /// (connections, purposes, knowledge base) beyond the typed chat intents.
+///
+/// A caught panic returns having sent nothing, the same as a null `core`.
 ///
 /// # Safety
 /// `core` must be a live handle; `request_id`/`command_json` must be null or
@@ -674,18 +895,24 @@ pub unsafe extern "C" fn adele_core_send_command(
     request_id: *const c_char,
     command_json: *const c_char,
 ) {
-    // SAFETY: contract above.
-    let Some(core) = (unsafe { core.as_ref() }) else {
-        return;
-    };
-    core.send_intent(Intent::SendCommand {
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        request_id: unsafe { cstr_to_string(request_id) },
-        // SAFETY: C caller guarantees pointer is valid NUL-terminated string
-        // for the duration of this call.
-        command_json: unsafe { cstr_to_string(command_json) },
-    });
+    panic_guard::guard(
+        "adele_core_send_command",
+        move || {
+            // SAFETY: contract above.
+            let Some(core) = (unsafe { core.as_ref() }) else {
+                return;
+            };
+            core.send_intent(Intent::SendCommand {
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                request_id: unsafe { cstr_to_string(request_id) },
+                // SAFETY: C caller guarantees pointer is valid NUL-terminated string
+                // for the duration of this call.
+                command_json: unsafe { cstr_to_string(command_json) },
+            });
+        },
+        || (),
+    );
 }
 
 /// The ABI version of this crate's `extern "C"` surface: every entry point,
@@ -697,12 +924,29 @@ pub unsafe extern "C" fn adele_core_send_command(
 /// `ADELE_CORE_ABI_VERSION` from the header you compiled against. Rebuild
 /// your consumer against the current header on any mismatch, including a
 /// lower runtime value; do not attempt partial compatibility.
+///
+/// This cannot panic today; it reads one constant. It still runs behind the
+/// panic guard, because every entry point does. A caught panic returns `0`,
+/// which is not a version this crate ever assigns -- see
+/// [`ADELE_CORE_ABI_VERSION`] -- so a consumer reads `0` as "no usable
+/// version" rather than mistaking it for a real one.
 #[unsafe(no_mangle)]
 pub extern "C" fn adele_core_abi_version() -> u32 {
-    ADELE_CORE_ABI_VERSION
+    panic_guard::guard("adele_core_abi_version", || ADELE_CORE_ABI_VERSION, || 0)
 }
 
 /// The ABI version [`adele_core_abi_version`] returns, as a plain constant so
 /// the header carries `#define ADELE_CORE_ABI_VERSION` for a consumer that
 /// wants a compile-time value to compare against.
 pub const ADELE_CORE_ABI_VERSION: u32 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adele_core_new_returns_null_when_callback_is_null() {
+        let core = adele_core_new(None, std::ptr::null_mut());
+        assert!(core.is_null(), "a null callback must yield a null handle");
+    }
+}
