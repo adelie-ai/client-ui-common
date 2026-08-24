@@ -5,8 +5,8 @@ default:
 # These repos run their gate locally rather than in GitHub Actions. `check` is
 # the whole of it: formatting, lints, tests, and the reducer's wasm build.
 
-# Full local gate: formatting, lints, tests, wasm-clean reducer
-check: fmt-check lint test wasm
+# Full local gate: formatting, lints, tests, wasm-clean reducer, ABI-bump check
+check: fmt-check lint test wasm check-abi-bump
 
 # Verify formatting without modifying files
 fmt-check:
@@ -34,6 +34,12 @@ test:
 # Build the reducer for wasm32 — it must stay transport-free and tokio-free
 wasm:
     cargo build -p client-ui-common --target wasm32-unknown-unknown
+
+# Catch an un-bumped ADELE_CORE_ABI_VERSION against the last commit's header.
+# Stated limits live in the script itself and in AGENTS.md; a passing run is
+# not proof of full coverage — see both before trusting this.
+check-abi-bump:
+    ./scripts/check-abi-bump.sh
 
 # Dependency advisories. Run whenever Cargo.lock changed.
 audit:

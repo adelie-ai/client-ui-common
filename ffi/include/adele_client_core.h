@@ -13,6 +13,13 @@
 #include <stdlib.h>
 
 /*
+ The ABI version [`adele_core_abi_version`] returns, as a plain constant so
+ the header carries `#define ADELE_CORE_ABI_VERSION` for a consumer that
+ wants a compile-time value to compare against.
+ */
+#define ADELE_CORE_ABI_VERSION 1
+
+/*
  The opaque handle the C side holds. Owns the tokio runtime (its drop shuts
  the worker threads + the actor down) and the channel into the actor.
  */
@@ -382,6 +389,19 @@ void adele_core_set_mcp_client_server_enabled(Core *core, const char *name, bool
  valid C strings.
  */
 void adele_core_send_command(Core *core, const char *request_id, const char *command_json);
+
+/*
+ The ABI version of this crate's `extern "C"` surface: every entry point,
+ its signature, and the layout of any struct that crosses the boundary.
+
+ A single monotonically increasing counter, not a major/minor pair: there
+ is no compatibility promise between versions, so a consumer must treat any
+ difference as a mismatch. Compare the value returned here against
+ `ADELE_CORE_ABI_VERSION` from the header you compiled against. Rebuild
+ your consumer against the current header on any mismatch, including a
+ lower runtime value; do not attempt partial compatibility.
+ */
+uint32_t adele_core_abi_version(void);
 
 /*
  Render untrusted markdown into a **sanitized HTML fragment**, for a host

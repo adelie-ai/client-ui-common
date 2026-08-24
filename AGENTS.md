@@ -25,6 +25,42 @@ duplicated in a client's build graph). Where that sourcing blocks work here, tra
 than working around it inside this crate. Warnings are denied mechanically via
 the workspace `[lints]` (`rust.warnings` / `clippy.all` = "deny").
 
+## C ABI version bump policy
+
+`ffi/src/lib.rs` exports `ADELE_CORE_ABI_VERSION` (`adele_core_abi_version()` at runtime, `#define
+ADELE_CORE_ABI_VERSION` in the generated header). It is a single counter, not a major/minor pair:
+there is no compatibility promise between versions, so any difference means "rebuild against the
+current header", never "probably fine".
+
+Bump it by exactly one for any change to an `extern "C"` item in `ffi/src/`:
+
+- Removing an entry point.
+- Changing a signature: parameter types, count, order, or return type.
+- Changing the layout of any struct that crosses the boundary.
+- Changing runtime semantics without changing a signature. Nothing mechanical catches this; it
+  is a review item.
+- Adding an entry point or a struct field. An additive change would be compatible under a
+  compatibility scheme, but this crate does not run one, so it still bumps. The counter always
+  means "rebuild exactly this", never "at least this".
+
+Do not bump for doc-comment text, internal refactors, or `cbindgen.toml` formatting that does
+not change declaration text.
+
+As of this policy, no struct crosses the boundary. `Core` is an opaque forward declaration, and
+every other value is a primitive, a C string, or a callback pointer.
+
+`scripts/check-abi-bump.sh`, wired into `just check`, catches the common case mechanically: an
+entry point added, removed, or re-signed with no version bump. Its limits are stated in the
+script itself and must stay stated there, not implied by its passing:
+
+- It runs only when someone runs `just check`. `just install-hooks` does not exist yet
+  (tracked in #88), so nothing forces a contributor to run it.
+- It compares the generated header against `git show HEAD:...`, the last commit. An un-bumped
+  change that is already committed passes on every later run, because the check then compares
+  the un-bumped header against itself.
+- A semantics change with no signature change produces no header diff at all, so the script
+  cannot see it. Review is the only thing that catches that case.
+
 ## Rust Conventions
 
 Apply these consistently. The repo gate in **Overrides and additions to the shared base** is the floor.
@@ -90,13 +126,16 @@ rule the base does not have.
 ### 3.1 The gate for this repo (addition)
 
 The `adelie-ai` repos have no CI. The gate is local and the author runs it. `just check` runs
-all four of these in order. Run it, or run them by hand:
+all five of these in order. Run it, or run them by hand:
 
 1. `cargo fmt --check`
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace`
 4. The reducer still builds wasm-clean:
    `cargo build -p client-ui-common --target wasm32-unknown-unknown`.
+5. `scripts/check-abi-bump.sh` - flags an `extern "C"` header change with no
+   `ADELE_CORE_ABI_VERSION` bump. See "C ABI version bump policy" above for what it does and
+   does not catch.
 
 `--workspace` on steps 2 and 3 is load-bearing, not decoration. This workspace has a **root
 package** as well as members, and a cargo command with no package selection defaults to the
