@@ -126,3 +126,8 @@ tempfile = "3"
 # the dependency tree already (pulled in by other workspace members), so this
 # adds no new crate to the build.
 tracing-subscriber = "0.3"
+# The cstr_n_to_string spec maps a guard page directly after the input bytes
+# (mmap + mprotect) to prove a short `len` cannot read past it. It is already
+# in the dependency tree (pulled in transitively by tokio), so this adds no
+# new crate to the build.
+libc = "0.2"

@@ -563,6 +563,7 @@ dependencies = [
  "fileio-mcp",
  "geocode-mcp",
  "internet-radio-mcp",
+ "libc",
  "openstreetmap-mcp",
  "serde",
  "serde_json",
