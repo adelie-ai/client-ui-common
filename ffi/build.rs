@@ -55,9 +55,22 @@ fn main() {
             }
             bindings.write_to_file(&out);
         }
-        // Don't fail the cdylib build if header generation hiccups — surface it
-        // as a warning so `cargo build` still produces the `.so`, and CI's
-        // header-presence check (which runs cbindgen directly) is the gate.
-        Err(e) => println!("cargo:warning=cbindgen header generation failed: {e}"),
+        // A plain syntax error in this crate's own source. rustc parses the
+        // same source right after this build script exits and reports it
+        // with the file, line, and a caret — a strictly better diagnostic
+        // than cbindgen's syn error. Warn and let the build carry on to that
+        // rustc failure rather than panicking here and hiding it.
+        Err(cbindgen::Error::ParseSyntaxError { .. }) => {
+            println!(
+                "cargo:warning=cbindgen could not parse this crate; see the rustc error below"
+            );
+        }
+        // Every other cbindgen::Error variant (a `cargo metadata`/`Cargo.toml`
+        // problem, a file cbindgen expected but could not open, cbindgen's own
+        // `cargo rustc -Zunpretty=expanded` failing) is not something rustc
+        // would ever report on its own. This repository has no CI, so a
+        // silently stale header defeats the ABI version constant it is meant
+        // to carry (#86); fail the build rather than only printing a warning.
+        Err(e) => panic!("cbindgen header generation failed: {e}"),
     }
 }

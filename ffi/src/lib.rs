@@ -687,3 +687,22 @@ pub unsafe extern "C" fn adele_core_send_command(
         command_json: unsafe { cstr_to_string(command_json) },
     });
 }
+
+/// The ABI version of this crate's `extern "C"` surface: every entry point,
+/// its signature, and the layout of any struct that crosses the boundary.
+///
+/// A single monotonically increasing counter, not a major/minor pair: there
+/// is no compatibility promise between versions, so a consumer must treat any
+/// difference as a mismatch. Compare the value returned here against
+/// `ADELE_CORE_ABI_VERSION` from the header you compiled against. Rebuild
+/// your consumer against the current header on any mismatch, including a
+/// lower runtime value; do not attempt partial compatibility.
+#[unsafe(no_mangle)]
+pub extern "C" fn adele_core_abi_version() -> u32 {
+    ADELE_CORE_ABI_VERSION
+}
+
+/// The ABI version [`adele_core_abi_version`] returns, as a plain constant so
+/// the header carries `#define ADELE_CORE_ABI_VERSION` for a consumer that
+/// wants a compile-time value to compare against.
+pub const ADELE_CORE_ABI_VERSION: u32 = 1;
