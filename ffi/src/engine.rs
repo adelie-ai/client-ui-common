@@ -23,6 +23,7 @@
 //! [`Effect::ClearClient`].
 
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,6 +223,11 @@ pub enum Intent {
         request_id: String,
         command_json: String,
     },
+    /// Test-only: makes [`Engine::handle_intent`] panic, so a test can drive
+    /// the per-message panic barrier (issue #90) without depending on a real
+    /// production panic site. Never compiles into the released cdylib.
+    #[cfg(test)]
+    PanicForTest,
 }
 
 /// The actor's single input channel.
@@ -259,6 +265,19 @@ enum CoreMsg {
 /// Wrap a reducer message as a (boxed) channel item.
 fn ui(msg: UiMessage) -> CoreMsg {
     CoreMsg::Ui(Box::new(msg))
+}
+
+/// A short label for `msg`'s variant, used only to name a caught panic in
+/// the log (issue #90). Reads the discriminant only, never the payload.
+fn step_label(msg: &CoreMsg) -> &'static str {
+    match msg {
+        CoreMsg::Intent(_) => "Engine::step(Intent)",
+        CoreMsg::Ui(_) => "Engine::step(Ui)",
+        CoreMsg::InstallConnector(_) => "Engine::step(InstallConnector)",
+        CoreMsg::EmitView(_) => "Engine::step(EmitView)",
+        CoreMsg::InstallMcpHost { .. } => "Engine::step(InstallMcpHost)",
+        CoreMsg::ConnectFailed(_) => "Engine::step(ConnectFailed)",
+    }
 }
 
 /// Parse a "low"/"medium"/"high" token into an [`api::EffortLevel`]; anything
@@ -537,30 +556,95 @@ fn parse_bridge_command(json: &str) -> Result<api::Command, String> {
     serde_json::from_str(json).map_err(|e| format!("invalid command json: {e}"))
 }
 
+/// Test-only: a [`ViewEvent::Toast`] whose text is exactly this marker makes
+/// [`Engine::run`]'s `CoreMsg::EmitView` step panic, so a test can prove that
+/// step -- one the panic barrier does not single out, since it wraps the
+/// whole match -- is actually covered by it (issue #90). Checked only in the
+/// arm itself, never inspected anywhere else; never compiles into the
+/// released cdylib.
+#[cfg(test)]
+const EMIT_VIEW_PANIC_MARKER: &str = "CoreMsg::EmitView panic marker for actor containment tests";
+
 impl Engine {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<CoreMsg>) {
         while let Some(msg) = rx.recv().await {
-            match msg {
-                CoreMsg::Intent(intent) => self.handle_intent(intent),
-                CoreMsg::Ui(boxed) => self.dispatch(*boxed),
-                CoreMsg::InstallConnector(conn) => self.connector = Some(conn),
-                CoreMsg::EmitView(ev) => self.sink.emit(&ev),
+            let label = step_label(&msg);
+            self.contain_message(label, |engine| match msg {
+                CoreMsg::Intent(intent) => engine.handle_intent(intent),
+                CoreMsg::Ui(boxed) => engine.dispatch(*boxed),
+                CoreMsg::InstallConnector(conn) => engine.connector = Some(conn),
+                CoreMsg::EmitView(ev) => {
+                    #[cfg(test)]
+                    if let ViewEvent::Toast { text } = ev.as_ref()
+                        && text == EMIT_VIEW_PANIC_MARKER
+                    {
+                        panic!("CoreMsg::EmitView: intentional panic for actor containment tests");
+                    }
+                    engine.sink.emit(&ev);
+                }
                 CoreMsg::InstallMcpHost { host, started } => {
                     // Shut down any prior host before adopting the new one.
-                    self.shutdown_mcp_host();
-                    self.mcp_host = Some(host);
-                    self.mcp_started_servers = started;
+                    engine.shutdown_mcp_host();
+                    engine.mcp_host = Some(host);
+                    engine.mcp_started_servers = started;
                 }
                 CoreMsg::ConnectFailed(err) => {
-                    self.sink.emit(&ViewEvent::ConnectError {
+                    engine.sink.emit(&ViewEvent::ConnectError {
                         message: err.clone(),
                     });
-                    self.sink.emit(&ViewEvent::Status {
+                    engine.sink.emit(&ViewEvent::Status {
                         text: format!("Connection failed: {err}"),
                     });
-                    self.sink.emit(&ViewEvent::SendSensitive { value: false });
+                    engine.sink.emit(&ViewEvent::SendSensitive { value: false });
                 }
-            }
+            });
+        }
+    }
+
+    /// Run one message-processing step behind a panic barrier, so a panic
+    /// inside a single message never ends the actor task (issue #90).
+    ///
+    /// `step` runs the *whole* per-message match in [`Self::run`] -- every
+    /// arm, not just the ones that call into the reducer. An earlier version
+    /// wrapped only `CoreMsg::Intent` and `CoreMsg::Ui`, reasoning that the
+    /// other arms only assigned a field or forwarded to `sink.emit` and so
+    /// carried no comparable panic risk. That reasoning was a claim with
+    /// nothing enforcing it: the next arm added, or the next line added to
+    /// an existing one, could make it false with no failure to catch the
+    /// drift. Wrapping the whole match removes the claim instead of
+    /// maintaining it.
+    ///
+    /// `step` takes `&mut Engine` because message handling mutates reducer
+    /// state and runs further effects. That reference genuinely crosses the
+    /// unwind boundary, so this asserts unwind safety instead of requiring
+    /// it — see [`crate::panic_guard::guard_actor_step`] for why that
+    /// assertion is honest here rather than a shortcut.
+    ///
+    /// **A caught panic does not roll back a partial mutation.** A panic
+    /// partway through `step` can leave `self.state` holding whatever
+    /// change had landed so far. `commit_send`'s optimistic local echo,
+    /// pushed into `conv.messages` before the rest of that function runs,
+    /// is the concrete example: a panic after that push and before the
+    /// matching effect leaves the echo in place with nothing to back it.
+    /// This function does not detect or undo that; it buys exactly one
+    /// thing, which is true and smaller — the actor keeps serving the
+    /// *next* message, and the failure is visible instead of silent.
+    ///
+    /// On a caught panic, logs through [`crate::panic_guard`] (the same
+    /// helper every `extern "C"` entry point uses, per #84) and emits a
+    /// [`ViewEvent::Toast`] so the failure reaches the person using the
+    /// client, not only the log.
+    fn contain_message(&mut self, label: &str, step: impl FnOnce(&mut Self)) {
+        let engine = &mut *self;
+        let outcome =
+            crate::panic_guard::guard_actor_step(label, AssertUnwindSafe(move || step(engine)));
+        if outcome.is_err() {
+            self.sink.emit(&ViewEvent::Toast {
+                text: "Something went wrong handling that action. The app is \
+                       still running; reopen the conversation if something \
+                       looks out of sync."
+                    .to_string(),
+            });
         }
     }
 
@@ -697,6 +781,10 @@ impl Engine {
                 request_id,
                 command_json,
             } => self.spawn_send_command(request_id, command_json),
+            #[cfg(test)]
+            Intent::PanicForTest => {
+                panic!("Intent::PanicForTest: intentional panic for actor containment tests")
+            }
         }
     }
 
@@ -1551,6 +1639,10 @@ impl Core {
             mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
             active_task_id: None,
         };
+        // The `JoinHandle` is discarded: every arm of `Engine::run`'s match
+        // is now behind `contain_message`'s panic barrier (issue #90), so
+        // the handle carries no information that `send_intent`'s own
+        // send-failure check does not already give.
         runtime.spawn(engine.run(rx));
         Some(Self {
             runtime: Some(runtime),
@@ -1559,8 +1651,16 @@ impl Core {
     }
 
     /// Queue a controller intent for the actor.
+    ///
+    /// If the actor task is gone, the channel send fails and the intent is
+    /// dropped; this logs that rather than discarding it silently, so a dead
+    /// actor is discoverable instead of invisible. There is no return path
+    /// to report the failure to the C caller here (see the `extern "C"`
+    /// wrapper this backs), so a log line is the whole of what this can do.
     pub fn send_intent(&self, intent: Intent) {
-        let _ = self.tx.send(CoreMsg::Intent(intent));
+        if self.tx.send(CoreMsg::Intent(intent)).is_err() {
+            tracing::error!("send_intent: the actor task is gone; intent dropped");
+        }
     }
 
     /// A handle on this core's runtime.
@@ -3181,5 +3281,316 @@ mod command_bridge_tests {
     fn the_bridge_names_the_json_it_cannot_read() {
         let refusal = parse_bridge_command("{not json").expect_err("malformed json is refused");
         assert!(refusal.contains("invalid command json"), "{refusal}");
+    }
+}
+
+/// Issue #90: a panic inside one actor message must not end the actor task.
+///
+/// These drive [`Engine::run`] itself over a real channel, spawned the same
+/// way [`Core::new_with_runtime`] spawns it, so they exercise the actual
+/// per-message barrier rather than calling `handle_intent` or `dispatch`
+/// directly and inferring the loop's behaviour around them.
+#[cfg(test)]
+mod actor_containment_tests {
+    use super::*;
+    use std::ffi::CStr;
+    use std::io;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Events the recording sink captured, oldest first.
+    fn recorded() -> &'static Mutex<Vec<String>> {
+        static EVENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Serializes the cases in this module, which share `recorded()`.
+    ///
+    /// An async-aware lock: these cases hold their guard across an `.await`
+    /// while they poll for the actor's reply, and a `std::sync::Mutex` guard
+    /// must never cross an await point (clippy's `await_holding_lock`).
+    fn test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    extern "C" fn recording_sink(_user_data: *mut std::ffi::c_void, json: *const std::ffi::c_char) {
+        // SAFETY: the sink is only ever called by `ViewSink::emit`, which passes
+        // a NUL-terminated C string that outlives the call.
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        recorded().lock().expect("event buffer poisoned").push(text);
+    }
+
+    /// A real actor: an `Engine` plus the channel `Core::new_with_runtime`
+    /// would give it, minus the tokio runtime itself (the `#[tokio::test]`
+    /// executor stands in for that).
+    fn new_test_actor() -> (
+        Engine,
+        mpsc::UnboundedSender<CoreMsg>,
+        mpsc::UnboundedReceiver<CoreMsg>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let engine = Engine {
+            state: WindowState::default(),
+            connector: None,
+            mcp_host: None,
+            mcp_started_servers: BTreeSet::new(),
+            self_tx: tx.clone(),
+            sink: ViewSink::new(recording_sink, 0),
+            staged_override: None,
+            ws_jwt: None,
+            share_client_context: true,
+            mcp_surface: DEFAULT_MCP_SURFACE.to_string(),
+            active_task_id: None,
+        };
+        (engine, tx, rx)
+    }
+
+    /// Poll `predicate` until it holds or `timeout` elapses; returns whether
+    /// it held. The actor's replies arrive on a spawned task, not
+    /// synchronously with the `send` that provoked them, so the tests poll
+    /// instead of asserting immediately after sending.
+    async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The criterion that matters: a panic inside one message must not stop
+    /// the actor from handling the next one.
+    #[tokio::test]
+    async fn actor_survives_a_panicking_message_and_still_processes_the_next_one() {
+        let _guard = test_lock().lock().await;
+        recorded().lock().expect("event buffer poisoned").clear();
+        let (engine, tx, rx) = new_test_actor();
+        tokio::spawn(engine.run(rx));
+
+        // Sends are not asserted here: whether either one is accepted is
+        // itself part of what a passing vs. a neutered run tells apart (a
+        // dead actor's receiver can already be gone by the second send).
+        // The assertion below is the one thing that decides this test.
+        let _ = tx.send(CoreMsg::Intent(Intent::PanicForTest));
+        let _ = tx.send(CoreMsg::EmitView(Box::new(ViewEvent::Toast {
+            text: "ordinary message sent after the panic".to_string(),
+        })));
+
+        let processed = wait_until(Duration::from_secs(2), || {
+            recorded()
+                .lock()
+                .expect("event buffer poisoned")
+                .iter()
+                .any(|e| e.contains("ordinary message sent after the panic"))
+        })
+        .await;
+
+        assert!(
+            processed,
+            "the actor never processed the message sent after the panic; \
+             the panic must have ended the actor task"
+        );
+    }
+
+    /// `CoreMsg::EmitView` is not one of the arms an earlier version of this
+    /// barrier singled out for containment (only `CoreMsg::Intent` and
+    /// `CoreMsg::Ui` were). Wrapping the whole match (issue #90) must cover
+    /// it anyway, with no per-arm exception list to keep in sync.
+    #[tokio::test]
+    async fn actor_survives_a_panic_in_the_emit_view_step_and_still_processes_the_next_one() {
+        let _guard = test_lock().lock().await;
+        recorded().lock().expect("event buffer poisoned").clear();
+        let (engine, tx, rx) = new_test_actor();
+        tokio::spawn(engine.run(rx));
+
+        // See the assertion below for why neither send here is checked.
+        let _ = tx.send(CoreMsg::EmitView(Box::new(ViewEvent::Toast {
+            text: EMIT_VIEW_PANIC_MARKER.to_string(),
+        })));
+        let _ = tx.send(CoreMsg::EmitView(Box::new(ViewEvent::Toast {
+            text: "ordinary message sent after the EmitView panic".to_string(),
+        })));
+
+        let processed = wait_until(Duration::from_secs(2), || {
+            recorded()
+                .lock()
+                .expect("event buffer poisoned")
+                .iter()
+                .any(|e| e.contains("ordinary message sent after the EmitView panic"))
+        })
+        .await;
+
+        assert!(
+            processed,
+            "the actor never processed the message sent after a panic in the \
+             EmitView step; that step must still be uncontained"
+        );
+    }
+
+    /// A caught actor panic must surface to the person using the client, not
+    /// only to a log file.
+    #[tokio::test]
+    async fn caught_actor_panic_emits_a_toast() {
+        let _guard = test_lock().lock().await;
+        recorded().lock().expect("event buffer poisoned").clear();
+        let (engine, tx, rx) = new_test_actor();
+        tokio::spawn(engine.run(rx));
+
+        let _ = tx.send(CoreMsg::Intent(Intent::PanicForTest));
+
+        let toasted = wait_until(Duration::from_secs(2), || {
+            recorded()
+                .lock()
+                .expect("event buffer poisoned")
+                .iter()
+                .any(|e| e.contains("\"type\":\"toast\""))
+        })
+        .await;
+
+        assert!(
+            toasted,
+            "a caught actor panic must emit a ViewEvent::Toast, but none arrived"
+        );
+    }
+
+    /// A tracing writer that appends every formatted log line into a shared
+    /// buffer, so a test can assert on what the actor logged.
+    #[derive(Clone, Default)]
+    struct CaptureBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for CaptureBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A caught actor panic must write a log line naming the panic, the same
+    /// way every `extern "C"` entry point's caught panic does (#84).
+    #[tokio::test]
+    async fn caught_actor_panic_logs_a_line_naming_the_panic() {
+        let _guard = test_lock().lock().await;
+        recorded().lock().expect("event buffer poisoned").clear();
+        let buffer = CaptureBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let (engine, tx, rx) = new_test_actor();
+        tokio::spawn(engine.run(rx));
+        let _ = tx.send(CoreMsg::Intent(Intent::PanicForTest));
+        let _ = tx.send(CoreMsg::EmitView(Box::new(ViewEvent::Toast {
+            text: "marker after the panic".to_string(),
+        })));
+
+        // Wait for the message after the panic to land, which happens after
+        // the panic's own logging and toast, so its arrival orders the log
+        // write before this read.
+        wait_until(Duration::from_secs(2), || {
+            recorded()
+                .lock()
+                .expect("event buffer poisoned")
+                .iter()
+                .any(|e| e.contains("marker after the panic"))
+        })
+        .await;
+
+        let output = String::from_utf8_lossy(
+            &buffer
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+        )
+        .into_owned();
+        assert!(
+            output.contains("Engine::step(Intent)"),
+            "log did not name the contained step: {output}"
+        );
+        assert!(
+            output.contains("Intent::PanicForTest"),
+            "log did not carry the panic payload: {output}"
+        );
+    }
+
+    /// A caught actor panic must not take the whole process down with it.
+    ///
+    /// An uncaught panic that unwinds across a non-Rust ABI boundary aborts
+    /// the process outright -- every thread, including this one and the test
+    /// harness itself -- so nothing past that point could ever run. Spawning
+    /// a brand new OS thread after the panic and getting a real answer back
+    /// from it is the process demonstrating its own continued existence,
+    /// not just this test function returning normally.
+    #[tokio::test]
+    async fn caught_actor_panic_does_not_abort_the_process() {
+        let (engine, tx, rx) = new_test_actor();
+        tokio::spawn(engine.run(rx));
+        let _ = tx.send(CoreMsg::Intent(Intent::PanicForTest));
+
+        let still_alive = std::thread::spawn(|| 2 + 2)
+            .join()
+            .expect("a fresh OS thread must still be able to start and finish normally");
+        assert_eq!(
+            still_alive, 4,
+            "the process must still run new work after a caught actor panic"
+        );
+    }
+
+    /// `send_intent` logs when the actor is gone instead of discarding the
+    /// send failure silently.
+    #[test]
+    fn send_intent_logs_when_the_actor_task_is_gone() {
+        let (tx, rx) = mpsc::unbounded_channel::<CoreMsg>();
+        drop(rx);
+        let core = Core { runtime: None, tx };
+
+        let buffer = CaptureBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            core.send_intent(Intent::NewConversation);
+        });
+
+        let logged = String::from_utf8_lossy(
+            &buffer
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+        )
+        .into_owned();
+        assert!(
+            logged.contains("actor task is gone"),
+            "send_intent must log when the actor's receiver is gone: {logged}"
+        );
     }
 }
