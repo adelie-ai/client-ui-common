@@ -13,7 +13,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::panic::{self, UnwindSafe};
+use std::panic::{self, AssertUnwindSafe, UnwindSafe};
 use std::sync::Once;
 
 thread_local! {
@@ -118,6 +118,44 @@ where
             // type, and every downcast below would fail.
             log_panic(label, &location, &*payload);
             fallback()
+        }
+    }
+}
+
+/// Run `f` behind the same panic barrier [`guard`] uses, for a caller whose
+/// closure carries a `&mut` reference across the boundary.
+///
+/// [`guard`]'s own doc explains why it requires `F: UnwindSafe` and never
+/// accepts [`AssertUnwindSafe`] itself: every argument an `extern "C"` entry
+/// point takes is already unconditionally [`UnwindSafe`], so asserting it
+/// would hide a real future mistake instead of describing an existing one.
+/// The FFI actor's per-message loop (issue #90) is a different situation.
+/// `Engine::handle_intent` and `Engine::dispatch` need `&mut Engine` to
+/// cross the boundary, and a `&mut` reference is excluded from
+/// [`UnwindSafe`] on purpose: a panic partway through a mutation can leave
+/// the referent holding a partial change. That risk is real here, not a
+/// formality — a caught panic on the actor does not undo whatever the
+/// message was in the middle of changing. The caller states that
+/// explicitly by wrapping its own closure in [`AssertUnwindSafe`] and
+/// passing it here; this function contributes only the logging [`guard`]
+/// already does, so both boundaries are logged the same way.
+///
+/// Returns `Ok(value)` on success, or `Err(())` after logging on a caught
+/// panic. Unlike [`guard`], there is no single fallback value that fits
+/// every message shape, so the caller decides what happens next.
+pub(crate) fn guard_actor_step<F, R>(label: &str, f: AssertUnwindSafe<F>) -> Result<R, ()>
+where
+    F: FnOnce() -> R,
+{
+    install_hook();
+    match panic::catch_unwind(f) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let location = LAST_PANIC_LOCATION
+                .with(|cell| cell.borrow_mut().take())
+                .unwrap_or_else(|| "unknown location".to_string());
+            log_panic(label, &location, &*payload);
+            Err(())
         }
     }
 }
