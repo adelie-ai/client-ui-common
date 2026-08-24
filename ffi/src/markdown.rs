@@ -1,4 +1,4 @@
-//! C ABI for the shared markdown → sanitized-HTML pipeline.
+//! C ABI for the shared markdown -> sanitized-HTML pipeline.
 //!
 //! Every other entry point in this crate queues an intent and returns
 //! immediately. These are the exception: rendering is pure, cheap, and the
@@ -25,7 +25,7 @@
 //!
 //! `adele_core_render_markdown`, `adele_core_render_markdown_document` and
 //! `adele_core_markdown_set_content_script` return a NUL-terminated string
-//! allocated by this library. Release it with [`adele_core_string_free`] —
+//! allocated by this library. Release it with [`adele_core_string_free`] --
 //! never the caller's `free`, since the allocators need not match. The
 //! bridge-name accessors return `'static` pointers that must **not** be freed.
 
@@ -34,8 +34,8 @@ use std::sync::OnceLock;
 
 use adele_markdown::bubble;
 
-use crate::cstr_to_string;
 use crate::panic_guard;
+use crate::{cstr_n_to_string, cstr_to_string};
 
 /// Move an owned `String` out to C as a caller-owned NUL-terminated buffer.
 ///
@@ -60,11 +60,19 @@ fn cached_owned_string(
     into_c_string(cache.get_or_init(render).clone())
 }
 
+/// Shared logic behind [`adele_core_render_markdown`] and
+/// [`adele_core_render_markdown_n`]: run the already-decoded input through
+/// the sanitized-fragment pipeline.
+fn render_markdown_impl(input: String) -> *mut c_char {
+    maybe_panic_for_test();
+    into_c_string(adele_markdown::markdown_to_html(&input))
+}
+
 /// Render untrusted markdown into a **sanitized HTML fragment**, for a host
 /// that splices markup into a page it builds itself.
 ///
 /// The fragment is inert markup, not script. Do **not** format it into
-/// JavaScript source — a rendered fragment carries raw double quotes and raw
+/// JavaScript source -- a rendered fragment carries raw double quotes and raw
 /// newlines, so interpolating one into a call ends the string literal and
 /// executes whatever the reply put after it, outside the page's pinned
 /// `script-src`. To push content into a bubble page, call
@@ -83,10 +91,9 @@ pub unsafe extern "C" fn adele_core_render_markdown(text: *const c_char) -> *mut
     panic_guard::guard(
         "adele_core_render_markdown",
         move || {
-            maybe_panic_for_test();
             // SAFETY: contract above.
             let input = unsafe { cstr_to_string(text) };
-            into_c_string(adele_markdown::markdown_to_html(&input))
+            render_markdown_impl(input)
         },
         || {
             static EMPTY_FRAGMENT: OnceLock<String> = OnceLock::new();
@@ -95,13 +102,54 @@ pub unsafe extern "C" fn adele_core_render_markdown(text: *const c_char) -> *mut
     )
 }
 
+/// Length-carrying twin of [`adele_core_render_markdown`]. `text_len` is the
+/// number of bytes at `text` -- see [`cstr_n_to_string`] for the exact decode
+/// semantics (null/zero-length -> empty, embedded NUL kept, invalid UTF-8
+/// replaced lossily).
+///
+/// Returns a caller-owned string to release with [`adele_core_string_free`].
+/// Never returns null: a caught panic returns the cached rendering of empty
+/// input instead.
+///
+/// # Safety
+/// `text` must be null (with any length), or point to at least `text_len`
+/// readable bytes for the duration of the call. A length longer than the
+/// pointer's true allocation is the caller's error and is not detectable
+/// here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_render_markdown_n(
+    text: *const c_char,
+    text_len: usize,
+) -> *mut c_char {
+    panic_guard::guard(
+        "adele_core_render_markdown_n",
+        move || {
+            // SAFETY: contract above.
+            let input = unsafe { cstr_n_to_string(text, text_len) };
+            render_markdown_impl(input)
+        },
+        || {
+            static EMPTY_FRAGMENT: OnceLock<String> = OnceLock::new();
+            cached_owned_string(&EMPTY_FRAGMENT, || adele_markdown::markdown_to_html(""))
+        },
+    )
+}
+
+/// Shared logic behind [`adele_core_render_markdown_document`] and
+/// [`adele_core_render_markdown_document_n`]: run the already-decoded input
+/// through the bubble-document pipeline.
+fn render_markdown_document_impl(input: String) -> *mut c_char {
+    maybe_panic_for_test();
+    into_c_string(bubble::document(&input))
+}
+
 /// Render untrusted markdown into a **complete, CSP-locked page** for a single
 /// message bubble: transparent background, system-appearance aware, no network,
 /// self-reporting height, and an in-place update hook.
 ///
 /// This is what a host loads once per message (with a null base URL);
 /// subsequent updates go through [`adele_core_markdown_set_content_script`],
-/// which keeps the pinned script hash — and therefore the page — unchanged.
+/// which keeps the pinned script hash -- and therefore the page -- unchanged.
 ///
 /// Returns a caller-owned string to release with [`adele_core_string_free`];
 /// null input renders an empty bubble. Never returns null: a caught panic
@@ -115,10 +163,42 @@ pub unsafe extern "C" fn adele_core_render_markdown_document(text: *const c_char
     panic_guard::guard(
         "adele_core_render_markdown_document",
         move || {
-            maybe_panic_for_test();
             // SAFETY: contract above.
             let input = unsafe { cstr_to_string(text) };
-            into_c_string(bubble::document(&input))
+            render_markdown_document_impl(input)
+        },
+        || {
+            static EMPTY_DOCUMENT: OnceLock<String> = OnceLock::new();
+            cached_owned_string(&EMPTY_DOCUMENT, || bubble::document(""))
+        },
+    )
+}
+
+/// Length-carrying twin of [`adele_core_render_markdown_document`].
+/// `text_len` is the number of bytes at `text` -- see [`cstr_n_to_string`]
+/// for the exact decode semantics (null/zero-length -> empty, embedded NUL
+/// kept, invalid UTF-8 replaced lossily).
+///
+/// Returns a caller-owned string to release with [`adele_core_string_free`].
+/// Never returns null: a caught panic returns the cached rendering of an
+/// empty bubble instead.
+///
+/// # Safety
+/// `text` must be null (with any length), or point to at least `text_len`
+/// readable bytes for the duration of the call. A length longer than the
+/// pointer's true allocation is the caller's error and is not detectable
+/// here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_render_markdown_document_n(
+    text: *const c_char,
+    text_len: usize,
+) -> *mut c_char {
+    panic_guard::guard(
+        "adele_core_render_markdown_document_n",
+        move || {
+            // SAFETY: contract above.
+            let input = unsafe { cstr_n_to_string(text, text_len) };
+            render_markdown_document_impl(input)
         },
         || {
             static EMPTY_DOCUMENT: OnceLock<String> = OnceLock::new();
@@ -150,8 +230,16 @@ pub extern "C" fn adele_core_markdown_height_handler_name() -> *const c_char {
     )
 }
 
+/// Shared logic behind [`adele_core_markdown_set_content_script`] and
+/// [`adele_core_markdown_set_content_script_n`]: run the already-decoded
+/// input through the streaming-update statement pipeline.
+fn markdown_set_content_script_impl(input: String) -> *mut c_char {
+    maybe_panic_for_test();
+    into_c_string(bubble::set_content_script(&input))
+}
+
 /// Render untrusted markdown into the **complete JavaScript statement** that
-/// swaps it into an already-loaded bubble page — the streaming update that
+/// swaps it into an already-loaded bubble page -- the streaming update that
 /// follows [`adele_core_render_markdown_document`].
 ///
 /// Evaluate the returned string verbatim (`WKWebView.evaluateJavaScript`). It
@@ -177,10 +265,42 @@ pub unsafe extern "C" fn adele_core_markdown_set_content_script(
     panic_guard::guard(
         "adele_core_markdown_set_content_script",
         move || {
-            maybe_panic_for_test();
             // SAFETY: contract above.
             let input = unsafe { cstr_to_string(text) };
-            into_c_string(bubble::set_content_script(&input))
+            markdown_set_content_script_impl(input)
+        },
+        || {
+            static CLEAR_SCRIPT: OnceLock<String> = OnceLock::new();
+            cached_owned_string(&CLEAR_SCRIPT, || bubble::set_content_script(""))
+        },
+    )
+}
+
+/// Length-carrying twin of [`adele_core_markdown_set_content_script`].
+/// `text_len` is the number of bytes at `text` -- see [`cstr_n_to_string`]
+/// for the exact decode semantics (null/zero-length -> empty, embedded NUL
+/// kept, invalid UTF-8 replaced lossily).
+///
+/// Returns a caller-owned string to release with [`adele_core_string_free`].
+/// Never returns null: a caught panic returns the same clearing statement
+/// instead.
+///
+/// # Safety
+/// `text` must be null (with any length), or point to at least `text_len`
+/// readable bytes for the duration of the call. A length longer than the
+/// pointer's true allocation is the caller's error and is not detectable
+/// here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn adele_core_markdown_set_content_script_n(
+    text: *const c_char,
+    text_len: usize,
+) -> *mut c_char {
+    panic_guard::guard(
+        "adele_core_markdown_set_content_script_n",
+        move || {
+            // SAFETY: contract above.
+            let input = unsafe { cstr_n_to_string(text, text_len) };
+            markdown_set_content_script_impl(input)
         },
         || {
             static CLEAR_SCRIPT: OnceLock<String> = OnceLock::new();
@@ -192,7 +312,7 @@ pub unsafe extern "C" fn adele_core_markdown_set_content_script(
 /// Name of the global function that swaps a new render into an already-loaded
 /// bubble page.
 ///
-/// For hosts that bind the page themselves — installing their own wrapper, or
+/// For hosts that bind the page themselves -- installing their own wrapper, or
 /// asserting the bridge is present. It is **not** how to push content: use
 /// [`adele_core_markdown_set_content_script`], which returns the whole call
 /// already escaped.
