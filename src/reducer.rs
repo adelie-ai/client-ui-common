@@ -589,26 +589,34 @@ impl WindowState {
         Effect::SetQueuedMessages { messages, editing }
     }
 
-    /// Commit `prompt` as a real send into the currently-open conversation:
-    /// draw the optimistic user bubble, drop the saved draft, and emit the send
-    /// RPC. Shared by the direct-send path ([`UiMessage::SubmitPrompt`], idle
-    /// with an empty queue) and the queue flush. Caller guarantees a current
-    /// conversation exists and it is idle (no in-flight stream). Does NOT touch
-    /// the live composer widget — the caller decides whether to clear it (a
-    /// direct send clears it; a background flush must not clobber a fresh
-    /// draft).
-    fn commit_send(&mut self, prompt: String, idempotency_key: Option<String>) -> Vec<Effect> {
-        let conversation_id = self
-            .current_conversation_id
-            .clone()
-            .expect("commit_send requires a current conversation (caller contract)");
+    /// Commit `prompt` as a real send into `conversation_id`: draw the
+    /// optimistic user bubble, drop the saved draft, and emit the send RPC.
+    /// Shared by the direct-send path ([`UiMessage::SubmitPrompt`], idle with
+    /// an empty queue) and the queue flush. Both callers resolve
+    /// `conversation_id` from `current_conversation_id` themselves, while it
+    /// is still known to be `Some`, and pass the value in (#91) — so there is
+    /// no `Option` here for this function to fail to unwrap. Caller also
+    /// guarantees the conversation is idle (no in-flight stream). Does NOT
+    /// touch the live composer widget — the caller decides whether to clear
+    /// it (a direct send clears it; a background flush must not clobber a
+    /// fresh draft).
+    fn commit_send(
+        &mut self,
+        conversation_id: String,
+        prompt: String,
+        idempotency_key: Option<String>,
+    ) -> Vec<Effect> {
         // Optimistic local echo of our own send (#1): draw the user bubble now
         // so the turn feels instant. The daemon assigns the real id when it
         // persists the turn; the echoed-back `UserMessageAdded` is de-duped by
         // its `idempotency_key` (exact match, #570) or — keyless — by
         // request_id, so an empty id here is correct. Stamp the bubble with the
         // send's key so the echo can find it regardless of content or ordering.
-        if let Some(conv) = self.current_conversation_mut() {
+        if let Some(conv) = self
+            .open
+            .get_mut(&conversation_id)
+            .and_then(|m| m.detail.as_mut())
+        {
             conv.messages.push(ChatMessage {
                 id: String::new(),
                 role: "user".to_string(),
@@ -684,7 +692,7 @@ impl WindowState {
         // abandoned flush restores them to `outbox` for retry instead of dropping
         // them. (Was `mem::take`-and-discard — the source of the loss.)
         model.pending_flush = queued;
-        let mut effects = self.commit_send(combined, combined_key);
+        let mut effects = self.commit_send(id, combined, combined_key);
         effects.push(self.queued_snapshot_effect());
         effects
     }
@@ -1438,7 +1446,7 @@ impl WindowState {
                 if let Some(model) = self.open.get_mut(&conversation_id) {
                     model.composer.clear();
                 }
-                self.commit_send(prompt, idempotency_key)
+                self.commit_send(conversation_id, prompt, idempotency_key)
             }
             UiMessage::EditQueued { index } => {
                 // Check out queued item `index` into the composer to edit it
@@ -2480,6 +2488,74 @@ mod tests {
             },
             notices: Vec::new(),
         }
+    }
+
+    // --- commit_send has no current-conversation panic (#91) -------------
+
+    #[test]
+    fn commit_send_does_not_panic_with_no_current_conversation() {
+        let mut state = WindowState::default().with_open(detail("c1", vec![]));
+        state.current_conversation_id = None;
+        let effects = state.commit_send("c1".to_string(), "hello".to_string(), None);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SendPrompt { conversation_id, .. }] if conversation_id == "c1"
+            ),
+            "commit_send must send using the conversation id it was given, not the \
+             (absent) current conversation: {effects:?}"
+        );
+    }
+
+    // --- Zero-panic production region (#91) -------------------------------
+
+    /// The panic sources this crate must never ship in production: each one
+    /// kills the caller outright, with no way to recover, when it fires.
+    const PANIC_SOURCES: [&str; 5] = ["unwrap(", "expect(", "panic!(", "unreachable!(", "todo!("];
+
+    /// True when `needle` starts at a word boundary inside `line`, so e.g. a
+    /// hypothetical identifier ending in `_unwrap` does not count as a call to
+    /// `unwrap(`.
+    fn contains_panic_source(line: &str, needle: &str) -> bool {
+        line.match_indices(needle).any(|(i, _)| {
+            i == 0
+                || !line.as_bytes()[i - 1].is_ascii_alphanumeric() && line.as_bytes()[i - 1] != b'_'
+        })
+    }
+
+    #[test]
+    fn reducer_production_region_has_no_panic_sources() {
+        // The production region is everything before the top-level test
+        // module. Found by structural marker (the exact two lines that open
+        // `mod tests`), not a hardcoded line number, so the boundary tracks
+        // the file as it grows and does not silently stop scanning the right
+        // span after an unrelated edit shifts every line number below it. If
+        // that module is ever renamed or its `#[cfg(test)]` dropped, the
+        // marker stops matching and this test fails loudly (via `expect`)
+        // rather than quietly scanning the whole file, or none of it.
+        let source = include_str!("reducer.rs");
+        let marker = "#[cfg(test)]\nmod tests {";
+        let boundary = source
+            .find(marker)
+            .expect("reducer.rs must declare `#[cfg(test)]\\nmod tests {` at top level");
+        let production = &source[..boundary];
+
+        let mut offenders = Vec::new();
+        for (i, line) in production.lines().enumerate() {
+            for needle in PANIC_SOURCES {
+                if contains_panic_source(line, needle) {
+                    offenders.push(format!("line {}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "src/reducer.rs production region must stay free of unwrap()/expect()/panic!()/\
+             unreachable!()/todo!() (#91) so a bad state describes itself instead of killing \
+             the client; found:\n{}",
+            offenders.join("\n")
+        );
     }
 
     // --- Idempotency key threading + exact-match dedup (#570) ------------
