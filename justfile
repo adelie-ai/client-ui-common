@@ -8,6 +8,11 @@ default:
 # Full local gate: formatting, lints, tests, wasm-clean reducer, ABI-bump check
 check: fmt-check lint test wasm check-abi-bump
 
+# Put the gate on pre-push. Run once per clone.
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "pre-push hook active -- bypass once with: git push --no-verify"
+
 # Verify formatting without modifying files
 fmt-check:
     cargo fmt --check
