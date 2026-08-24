@@ -53,8 +53,9 @@ every other value is a primitive, a C string, or a callback pointer.
 entry point added, removed, or re-signed with no version bump. Its limits are stated in the
 script itself and must stay stated there, not implied by its passing:
 
-- It runs only when someone runs `just check`. `just install-hooks` does not exist yet
-  (tracked in #88), so nothing forces a contributor to run it.
+- It runs when someone runs `just check`, or on a push once `just install-hooks` has been run in
+  that clone. The hook is opt-in per clone and `git push --no-verify` bypasses it, so a
+  contributor can still reach `main` without it.
 - It compares the generated header against `git show HEAD:...`, the last commit. An un-bumped
   change that is already committed passes on every later run, because the check then compares
   the un-bumped header against itself.
