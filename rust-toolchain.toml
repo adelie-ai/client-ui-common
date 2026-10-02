@@ -1,5 +1,5 @@
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 # Pre-commit step 4 builds the reducer for wasm32. Without the target pinned
 # here a fresh clone fails it with E0463 until someone runs `rustup target add`,

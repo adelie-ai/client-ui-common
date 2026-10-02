@@ -29,6 +29,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "adelie-telemetry"
+version = "0.1.0"
+source = "git+https://github.com/adelie-ai/adelie-telemetry?rev=e6fc14e552ee182efb9061bd87da9a27cdaa1252#e6fc14e552ee182efb9061bd87da9a27cdaa1252"
+dependencies = [
+ "opentelemetry-otlp",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -757,7 +768,7 @@ dependencies = [
 name = "desktop-assistant-core"
 version = "0.1.0"
 dependencies = [
- "adelie-telemetry",
+ "adelie-telemetry 0.1.0 (git+https://github.com/adelie-ai/adelie-telemetry?rev=e6fc14e552ee182efb9061bd87da9a27cdaa1252)",
  "async-trait",
  "backon",
  "chrono",
@@ -1773,7 +1784,7 @@ dependencies = [
 name = "mcp-core"
 version = "0.1.0"
 dependencies = [
- "adelie-telemetry",
+ "adelie-telemetry 0.1.0 (git+https://github.com/adelie-ai/adelie-telemetry?rev=5c762eca14e43295dd27c5d5adaa658924f5f133)",
  "async-trait",
  "clap",
  "serde",
